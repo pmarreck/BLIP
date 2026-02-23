@@ -605,6 +605,12 @@ test "decode L=9 returns Overflow" {
 }
 
 // ---------------------------------------------------------------------------
+// Re-export modules for benchmark access (avoids multi-module file conflicts)
+// ---------------------------------------------------------------------------
+pub const encoding = @import("encoding.zig");
+pub const bignum_mod = @import("bignum.zig");
+
+// ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
 // ---------------------------------------------------------------------------
 test {
