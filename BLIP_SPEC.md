@@ -378,4 +378,4 @@ This check is only needed when the application uses sentinels. Formats that don'
 
 ## License
 
-BLIP is placed in the public domain. Use it however you like.
+MIT License - see [LICENSE](LICENSE).
