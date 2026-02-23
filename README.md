@@ -6,7 +6,7 @@ See [BLIP_SPEC.md](BLIP_SPEC.md) for the full specification.
 
 ## Why BLIP?
 
-Existing variable-length integer encodings (LEB128, VLQ, Protocol Buffers varint) pack 7 data bits per byte and require a **branch on every byte** during decoding. BLIP takes a different approach: the first byte tells you how many raw bytes follow, and those bytes are a plain little-endian integer — decoded with a single load instruction, no per-byte branching, no shift-and-OR reassembly.
+Existing variable-length integer encodings (LEB128, VLQ, Protocol Buffers varint) pack 7 data bits per byte and require a **branch on every byte** during decoding. BLIP takes a different approach: the first byte(s) is either an immediate value or the start of a varint that tells you how many raw bytes follow, and those bytes are a plain little-endian integer — decoded with a single load instruction, no per-byte branching, no shift-and-OR reassembly.
 
 The trade-off is 1 extra byte for values in the 256-16383 range, which is acceptable in distributions where values cluster around "small" (<128) or "large" (>16383).
 
