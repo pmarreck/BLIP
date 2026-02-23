@@ -14,11 +14,8 @@ pub const sqlite = @import("sqlite_varint.zig");
 /// Tuple of all encoding modules that implement the common interface
 /// (name, encode, decode, DecodeResult, Error), for comptime iteration
 /// in benchmarks and cross-encoding tests.
-///
-/// NOTE: blip is excluded until its encode/decode API is implemented.
-/// Once blip.zig exports `name`, `encode`, `decode`, `DecodeResult`,
-/// and `Error`, add it here as the first entry.
 pub const all_encodings = .{
+    blip,
     leb128,
     protobuf,
     asn1,
