@@ -614,4 +614,5 @@ test {
     _ = @import("prefix_varint.zig");
     _ = @import("sqlite_varint.zig");
     _ = @import("encoding.zig");
+    _ = @import("bignum.zig");
 }
