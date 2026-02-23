@@ -27,7 +27,7 @@ First byte:
 
   Bit 7 = 1: LENGTH-PREFIXED MODE
     ┌─┬─┬─────────┐
-    │1│C│  L bits  │  Bit 6 = C (continuation flag for L)
+    │1│C│  L bits │  Bit 6 = C (continuation flag for L)
     └─┴─┴─────────┘  Bits 5-0 = low 6 bits of L
 
     If C = 0: L = bits 5-0 (range 0-63). No more L bytes.
