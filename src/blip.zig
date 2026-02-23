@@ -6,3 +6,8 @@ const std = @import("std");
 test "placeholder" {
     try std.testing.expect(true);
 }
+
+// Pull in tests from other encoding modules
+test {
+    _ = @import("leb128.zig");
+}
