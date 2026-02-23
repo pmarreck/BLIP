@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mode="ReleaseFast"
+for arg in "$@"; do
+	case "$arg" in
+		--test) exec nix develop -c zig build test -Doptimize=Debug;;
+		--debug) mode="Debug";;
+	esac
+done
+exec nix develop -c zig build -Doptimize="$mode"

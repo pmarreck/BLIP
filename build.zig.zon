@@ -1,0 +1,11 @@
+.{
+    .name = .blip,
+    .fingerprint = 0x159c7302186ec3ad,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
