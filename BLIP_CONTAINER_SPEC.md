@@ -215,8 +215,10 @@ A sorted collection of key-value pairs with a trailing index and hash. Keys must
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ INDEX SECTION                                            │   │
 │   │   Pair count: BLIP(N)                                    │   │
-│   │   Key offsets:   BLIP(key_0) ... BLIP(key_N-1)           │   │
-│   │   Value offsets: BLIP(val_0) ... BLIP(val_N-1)           │   │
+│   │   Pair 0: BLIP(key_0) BLIP(val_0)                       │   │
+│   │   Pair 1: BLIP(key_1) BLIP(val_1)                       │   │
+│   │   ...                                                    │   │
+│   │   Pair N-1: BLIP(key_N-1) BLIP(val_N-1)                 │   │
 │   │   All offsets from dictionary container start.            │   │
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ HASH: xxHash64 (8 bytes)                                 │   │
@@ -227,8 +229,9 @@ A sorted collection of key-value pairs with a trailing index and hash. Keys must
 
 **Key lookup:** To find value for a given key:
 1. Jump to index, read N
-2. Binary search key offsets (keys are sorted), dereference to read the key container
-3. When key matches, use corresponding value offset to read the value
+2. Binary search pairs (keys are sorted) — each pair is a (key_offset, value_offset) tuple
+3. For each candidate pair: dereference key_offset, read the key container, compare
+4. When key matches, the value_offset is immediately adjacent — read the value
 
 Keys are either UTF8 (0x81 0x03) or RAW (0x81 0x04) containers. Keys MUST be unique — duplicate keys are a format error.
 

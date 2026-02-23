@@ -17,8 +17,20 @@
 - [x] Fuzz tests ~2026-02-23 01:00 EST
 - [x] Project documentation ~2026-02-23 01:05 EST
 
+## Container Library (Completed 2026-02-23)
+- [x] `encodedSize` public API on blip.zig
+- [x] container_types.zig — ContainerType enum, sentinel mapping
+- [x] container.zig — TLV header, self-referential length solver
+- [x] leaf.zig — UTF8 + RAW container serialize/parse
+- [x] array.zig — ARRAY with fixpoint iteration, index tables, xxHash64
+- [x] dict.zig — DICT/FILE with key ordering, interleaved index
+- [x] mini_blip.zig — high-level archive API (createArchive, ArchiveReader)
+- [x] Container C FFI exports (blip_archive_create, verify, file_count, free)
+- [x] 447 tests total (all passing)
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
-- [ ] Streaming encode/decode (reader/writer interface)
-- [ ] Container format using BLIP for lengths/offsets
+- [ ] Streaming writes with padded BLIPs for containers
+- [ ] MAP container (unsorted dict, same layout)
 - [ ] Cross-language implementations (C, Rust, etc.)
+- [ ] Compression wrapper container type

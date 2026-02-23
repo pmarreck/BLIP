@@ -76,6 +76,33 @@ nix develop -c zig build -Doptimize=ReleaseFast
 nix develop -c zig build bench -Doptimize=ReleaseFast
 ```
 
+## Container Format
+
+BLIP also defines a recursive binary container format (TLV) for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
+
+Container types: ARRAY, DICT, MAP, FILE, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, and canonical key ordering for deterministic output.
+
+### miniBLIP Archive API
+
+The `mini_blip` module provides a high-level API for creating and reading BLIP archives:
+
+```zig
+const mini_blip = @import("mini_blip.zig");
+
+// Create an archive
+const files = [_]mini_blip.FileEntry{
+    .{ .path = "hello.txt", .content = "Hello, world!\n", .metadata = null },
+    .{ .path = "src/main.zig", .content = source_bytes, .metadata = null },
+};
+const archive = try mini_blip.createArchive(allocator, &files);
+defer allocator.free(archive);
+
+// Read an archive
+const reader = try mini_blip.ArchiveReader.init(archive);
+const count = try reader.fileCount();   // 2
+const file = try reader.findFile("hello.txt");  // DictReader for the file
+```
+
 ## C FFI
 
 BLIP is available as a C library. Link against `libblip.a` and include `src/blip.h`:
@@ -83,10 +110,21 @@ BLIP is available as a C library. Link against `libblip.a` and include `src/blip
 ```c
 #include "blip.h"
 
+// Encoding/decoding
 uint8_t buf[16];
 int32_t n = blip_encode(42, buf, sizeof(buf));    // n = 1, buf = {0x2A}
 uint64_t value;
 int32_t consumed = blip_decode(buf, n, &value);   // value = 42, consumed = 1
+
+// Archives
+blip_file_entry files[] = {
+    { "hello.txt", 9, (uint8_t*)"Hello!\n", 7 },
+};
+uint8_t *archive;
+size_t archive_len;
+blip_archive_create(files, 1, &archive, &archive_len);
+bool ok = blip_archive_verify(archive, archive_len);
+blip_free(archive, archive_len);
 ```
 
 ## License

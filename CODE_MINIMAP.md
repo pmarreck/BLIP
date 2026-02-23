@@ -42,12 +42,53 @@ Direct arithmetic on raw little-endian byte slices.
 - `mulLE(a, b, out) !usize` — schoolbook LE multiplication
 - `compareLE(a, b) Order` — LE comparison ignoring trailing zeros
 
+## src/container_types.zig
+Container type tags and sentinel mapping.
+- `ContainerType` — enum(u7): array, dict, utf8, raw, file, map
+- `typeSentinel(ct) [2]u8` — convert type to 2-byte sentinel
+- `parseType(buf) ?ContainerType` — parse sentinel from buffer
+
+## src/container.zig
+Core TLV header read/write and self-referential length solver.
+- `ContainerError` — error set for all container operations
+- `ContainerView` — parsed container header (type, total_length, value_offset, buf)
+- `computeTotalLength(v_size) u64` — solve total = 2 + blip_size(total) + v_size
+- `writeHeader(type, total, buf) !usize` — write type sentinel + BLIP length
+- `parseHeader(buf) !ContainerView` — parse container header from buffer
+
+## src/leaf.zig
+UTF8 and RAW leaf container serialization/parsing.
+- `serializeUtf8(alloc, text) ![]u8` — serialize UTF-8 string container
+- `serializeRaw(alloc, data) ![]u8` — serialize raw binary container
+- `readUtf8(buf) ![]const u8` — zero-copy read of UTF8 container
+- `readRaw(buf) ![]const u8` — zero-copy read of RAW container
+
+## src/array.zig
+ARRAY container with index tables and xxHash64.
+- `serializeArray(alloc, elements) ![]u8` — fixpoint iteration, index, xxHash64
+- `ArrayReader` — zero-copy reader: init, elementCount, elementAt, verifyHash
+
+## src/dict.zig
+DICT and FILE containers with key ordering and interleaved index.
+- `KeyValue` — struct { key, value } (pre-serialized container bytes)
+- `serializeDict(alloc, pairs) ![]u8` — sorted keys, interleaved index, xxHash64
+- `serializeFile(alloc, pairs) ![]u8` — FILE variant, validates required keys
+- `DictReader` — zero-copy reader: init, pairCount, keyAt, valueAt, findKey, verifyHash
+- `extractKeyBytes(key_container) ![]const u8` — extract key value from TLV
+
+## src/mini_blip.zig
+High-level miniBLIP archive API.
+- `FileEntry` — struct { path, content, metadata }
+- `createArchive(alloc, files) ![]u8` — build complete BLIP archive
+- `ArchiveReader` — reader: init, verifyMagic, fileCount, fileAt, findFile, verifyHash
+
 ## src/lib.zig
-C FFI exports for BLIP encoding.
+C FFI exports for BLIP encoding and container operations.
 - `blip_encode`, `blip_decode`, `blip_is_sentinel`, `blip_encoded_size`
+- `blip_archive_create`, `blip_archive_file_count`, `blip_archive_verify`, `blip_free`
 
 ## src/blip.h
-C header for the BLIP FFI.
+C header for the BLIP FFI (encoding + containers).
 
 ## src/main.zig
 CLI entry point calling through C FFI. Supports --about, -h/--help, self-test.

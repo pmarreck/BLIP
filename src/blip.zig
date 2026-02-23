@@ -26,6 +26,13 @@ fn minBytes(value: u64) usize {
     return (bits + 7) / 8;
 }
 
+/// Returns the number of bytes that encode(value) would produce,
+/// without actually writing to a buffer.
+pub fn encodedSize(value: u64) usize {
+    if (value < 128) return 1; // immediate mode
+    return 1 + minBytes(value); // header byte + L value bytes
+}
+
 /// Encode a u64 value in BLIP format. Returns number of bytes written.
 pub fn encode(value: u64, buf: []u8) Error!usize {
     // Immediate mode: values 0-127 fit in a single byte
@@ -605,10 +612,29 @@ test "decode L=9 returns Overflow" {
 }
 
 // ---------------------------------------------------------------------------
+// encodedSize tests
+// ---------------------------------------------------------------------------
+
+test "encodedSize matches actual encode size" {
+    var buf: [16]u8 = undefined;
+    const values = [_]u64{
+        0, 1, 42, 127, 128, 200, 255, 256, 1000,
+        50000, 65535, 65536, 5000000, 0xFFFFFFFF,
+        0x100000000, 0xFFFFFFFFFFFFFFFF,
+    };
+    for (values) |value| {
+        const actual = try encode(value, &buf);
+        try testing.expectEqual(actual, encodedSize(value));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Re-export modules for benchmark access (avoids multi-module file conflicts)
 // ---------------------------------------------------------------------------
 pub const encoding = @import("encoding.zig");
 pub const bignum_mod = @import("bignum.zig");
+pub const mini_blip_mod = @import("mini_blip.zig");
+pub const array_mod = @import("array.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -622,4 +648,10 @@ test {
     _ = @import("encoding.zig");
     _ = @import("bignum.zig");
     _ = @import("fuzz.zig");
+    _ = @import("container_types.zig");
+    _ = @import("container.zig");
+    _ = @import("leaf.zig");
+    _ = @import("array.zig");
+    _ = @import("dict.zig");
+    _ = @import("mini_blip.zig");
 }
