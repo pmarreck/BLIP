@@ -10,4 +10,5 @@ test "placeholder" {
 // Pull in tests from other encoding modules
 test {
     _ = @import("leb128.zig");
+    _ = @import("protobuf_varint.zig");
 }
