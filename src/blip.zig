@@ -11,4 +11,5 @@ test "placeholder" {
 test {
     _ = @import("leb128.zig");
     _ = @import("protobuf_varint.zig");
+    _ = @import("asn1_length.zig");
 }
