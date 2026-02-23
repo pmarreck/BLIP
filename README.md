@@ -12,7 +12,7 @@ The trade-off is 1 extra byte for values in the 256-16383 range, which is accept
 
 ## Benchmark Results
 
-Measured on Apple M1 Max, Zig 0.15.2, ReleaseFast. All timings are best-of-3 runs over 1M values per distribution.
+Measured on Apple M4 Max, Zig 0.15.2, ReleaseFast. All timings are best-of-3 runs over 1M values per distribution.
 
 ### Encode/Decode Throughput (ns/op)
 
