@@ -14,4 +14,5 @@ test {
     _ = @import("asn1_length.zig");
     _ = @import("prefix_varint.zig");
     _ = @import("sqlite_varint.zig");
+    _ = @import("encoding.zig");
 }
