@@ -621,4 +621,5 @@ test {
     _ = @import("sqlite_varint.zig");
     _ = @import("encoding.zig");
     _ = @import("bignum.zig");
+    _ = @import("fuzz.zig");
 }
