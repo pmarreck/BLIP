@@ -37,7 +37,7 @@ First byte:
               bits 6-0 are the next 7 bits of L, accumulated in LE order.
 
     After L is fully decoded:
-      Read L bytes. Interpret as unsigned little-endian integer = value.
+    Read L raw bytes. Interpret as signed (or unsigned- it's up to the application) little-endian integer = value.
 ```
 
 ### Decoding pseudocode
