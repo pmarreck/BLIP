@@ -34,9 +34,23 @@
 - [x] blar C CLI (create/list/extract/verify/info/cat) with progress bar
 - [x] Bash integration tests
 
+## blar/miniblar Split + DIR Container (Completed 2026-02-24)
+- [x] DIR container type (0x81 0x07) in ContainerType enum
+- [x] serializeDir() with path+xh64 required key validation
+- [x] DictReader updated to accept .dir type
+- [x] DirEntry, ArchiveEntry union, computeMerkleHash
+- [x] createFullArchive() with FILE+DIR+metadata support
+- [x] ArchiveReader: entryCount, entryAt, entryTypeAt
+- [x] C FFI: blip_archive_create_full, entry_type, entry_metadata
+- [x] blar_common.h — shared utilities
+- [x] miniblar.c — flat file-only CLI (rejects directories)
+- [x] blar.c — rewritten for full spec (directory recursion, metadata, Merkle hash)
+- [x] build.zig — miniblar target added
+- [x] Integration tests: 18 blar tests + 19 miniblar tests (all passing)
+- [x] Documentation updates (spec, README, CODE_MINIMAP)
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
-- [ ] MAP container (unsorted dict, same layout)
 - [ ] Cross-language implementations (C, Rust, etc.)
 - [ ] Compression wrapper container type

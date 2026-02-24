@@ -77,6 +77,32 @@ pub fn build(b: *std.Build) void {
     const blar_run_step = b.step("blar", "Run the blar archive CLI");
     blar_run_step.dependOn(&blar_run_cmd.step);
 
+    // miniblar CLI executable — C program that links against the static lib
+    const miniblar = b.addExecutable(.{
+        .name = "miniblar",
+        .root_module = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    miniblar.addCSourceFile(.{
+        .file = b.path("src/miniblar.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic" },
+    });
+    miniblar.linkLibrary(static_lib);
+    miniblar.root_module.addIncludePath(b.path("src"));
+    b.installArtifact(miniblar);
+
+    const miniblar_run_cmd = b.addRunArtifact(miniblar);
+    miniblar_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        miniblar_run_cmd.addArgs(args);
+    }
+    const miniblar_run_step = b.step("miniblar", "Run the miniblar archive CLI");
+    miniblar_run_step.dependOn(&miniblar_run_cmd.step);
+
     // Unit tests (exercises blip.zig directly)
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -177,6 +177,30 @@ pub fn serializeFile(allocator: Allocator, pairs: []const KeyValue) (Allocator.E
     return serializeDictLike(allocator, pairs, .file);
 }
 
+/// Serialize an ordered set of key-value pairs as a DIR container (0x81 0x07).
+/// Same as serializeDict but validates required keys: "path", "xh64".
+/// Does NOT require "bina" (directories have no binary content).
+/// Caller owns returned memory.
+pub fn serializeDir(allocator: Allocator, pairs: []const KeyValue) (Allocator.Error || ContainerError)![]u8 {
+    // Validate key ordering and uniqueness
+    try validateKeyOrder(pairs);
+
+    // Check that required keys exist
+    var has_path = false;
+    var has_xh64 = false;
+
+    for (pairs) |pair| {
+        const key_bytes = try extractKeyBytes(pair.key);
+        if (std.mem.eql(u8, key_bytes, "path")) has_path = true;
+        if (std.mem.eql(u8, key_bytes, "xh64")) has_xh64 = true;
+    }
+
+    if (!has_path) return ContainerError.MissingRequiredKey;
+    if (!has_xh64) return ContainerError.MissingRequiredKey;
+
+    return serializeDictLike(allocator, pairs, .dir);
+}
+
 /// Validate that keys in the pairs array are in canonical byte order and unique.
 fn validateKeyOrder(pairs: []const KeyValue) ContainerError!void {
     if (pairs.len < 2) return;
@@ -205,7 +229,7 @@ pub const DictReader = struct {
     pub fn init(buf: []const u8) ContainerError!DictReader {
         // Parse outer header: type + total_length
         const view = try container.parseHeader(buf);
-        if (view.container_type != .dict and view.container_type != .file and view.container_type != .map) {
+        if (view.container_type != .dict and view.container_type != .file and view.container_type != .map and view.container_type != .dir) {
             return ContainerError.InvalidContainerType;
         }
 
@@ -1000,4 +1024,154 @@ test "dict with RAW keys" {
     try testing.expectEqualSlices(u8, &[_]u8{0x01}, try extractKeyBytes(try reader.keyAt(0)));
     try testing.expectEqualSlices(u8, &[_]u8{0x02}, try extractKeyBytes(try reader.keyAt(1)));
     try testing.expectEqualSlices(u8, &[_]u8{0x03}, try extractKeyBytes(try reader.keyAt(2)));
+}
+
+// =============================================================================
+// DIR container tests
+// =============================================================================
+
+test "DIR with path+xh64 round-trip (sentinel 0x81 0x07, hash verifies)" {
+    const allocator = testing.allocator;
+
+    // Keys in canonical byte order: "path" < "xh64"
+    const key_path = try leaf.serializeUtf8(allocator, "path");
+    defer allocator.free(key_path);
+    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
+    defer allocator.free(key_xh64);
+
+    const val_path = try leaf.serializeUtf8(allocator, "src/lib");
+    defer allocator.free(val_path);
+    const hash_bytes = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 };
+    const val_xh64 = try leaf.serializeRaw(allocator, &hash_bytes);
+    defer allocator.free(val_xh64);
+
+    const pairs = [_]KeyValue{
+        .{ .key = key_path, .value = val_path },
+        .{ .key = key_xh64, .value = val_xh64 },
+    };
+    const result = try serializeDir(allocator, &pairs);
+    defer allocator.free(result);
+
+    // Verify DIR sentinel
+    try testing.expectEqual(@as(u8, 0x81), result[0]);
+    try testing.expectEqual(@as(u8, 0x07), result[1]);
+
+    // DictReader should work for DIR type
+    const reader = try DictReader.init(result);
+    try testing.expectEqual(@as(u64, 2), reader.pairCount());
+    try testing.expect(try reader.verifyHash());
+
+    // Verify keys
+    try testing.expect((try reader.findKey("path")) != null);
+    try testing.expect((try reader.findKey("xh64")) != null);
+}
+
+test "DIR missing path -> MissingRequiredKey" {
+    const allocator = testing.allocator;
+
+    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
+    defer allocator.free(key_xh64);
+    const val = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    defer allocator.free(val);
+
+    const pairs = [_]KeyValue{
+        .{ .key = key_xh64, .value = val },
+    };
+    try testing.expectError(ContainerError.MissingRequiredKey, serializeDir(allocator, &pairs));
+}
+
+test "DIR missing xh64 -> MissingRequiredKey" {
+    const allocator = testing.allocator;
+
+    const key_path = try leaf.serializeUtf8(allocator, "path");
+    defer allocator.free(key_path);
+    const val = try leaf.serializeUtf8(allocator, "some/dir");
+    defer allocator.free(val);
+
+    const pairs = [_]KeyValue{
+        .{ .key = key_path, .value = val },
+    };
+    try testing.expectError(ContainerError.MissingRequiredKey, serializeDir(allocator, &pairs));
+}
+
+test "DIR with optional metadata keys (mode, mtime, owner)" {
+    const allocator = testing.allocator;
+
+    // Keys in canonical byte order: "mode" < "mtime" < "owner" < "path" < "xh64"
+    const key_mode = try leaf.serializeUtf8(allocator, "mode");
+    defer allocator.free(key_mode);
+    const key_mtime = try leaf.serializeUtf8(allocator, "mtime");
+    defer allocator.free(key_mtime);
+    const key_owner = try leaf.serializeUtf8(allocator, "owner");
+    defer allocator.free(key_owner);
+    const key_path = try leaf.serializeUtf8(allocator, "path");
+    defer allocator.free(key_path);
+    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
+    defer allocator.free(key_xh64);
+
+    var mode_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &mode_bytes, 0o755, .little);
+    const val_mode = try leaf.serializeRaw(allocator, &mode_bytes);
+    defer allocator.free(val_mode);
+
+    var mtime_bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &mtime_bytes, 1708787200_000_000_000, .little);
+    const val_mtime = try leaf.serializeRaw(allocator, &mtime_bytes);
+    defer allocator.free(val_mtime);
+
+    const val_owner = try leaf.serializeUtf8(allocator, "peter");
+    defer allocator.free(val_owner);
+    const val_path = try leaf.serializeUtf8(allocator, "src/lib");
+    defer allocator.free(val_path);
+    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 });
+    defer allocator.free(val_xh64);
+
+    const pairs = [_]KeyValue{
+        .{ .key = key_mode, .value = val_mode },
+        .{ .key = key_mtime, .value = val_mtime },
+        .{ .key = key_owner, .value = val_owner },
+        .{ .key = key_path, .value = val_path },
+        .{ .key = key_xh64, .value = val_xh64 },
+    };
+    const result = try serializeDir(allocator, &pairs);
+    defer allocator.free(result);
+
+    const reader = try DictReader.init(result);
+    try testing.expectEqual(@as(u64, 5), reader.pairCount());
+    try testing.expect(try reader.verifyHash());
+
+    // Verify optional metadata is accessible
+    const mode_idx = (try reader.findKey("mode")).?;
+    const mode_val = try leaf.readRaw(try reader.valueAt(mode_idx));
+    try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, mode_val[0..2], .little));
+
+    const owner_idx = (try reader.findKey("owner")).?;
+    const owner_val = try leaf.readUtf8(try reader.valueAt(owner_idx));
+    try testing.expectEqualSlices(u8, "peter", owner_val);
+}
+
+test "DIR does NOT require bina" {
+    const allocator = testing.allocator;
+
+    // DIR with just path + xh64 (no bina) should succeed
+    const key_path = try leaf.serializeUtf8(allocator, "path");
+    defer allocator.free(key_path);
+    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
+    defer allocator.free(key_xh64);
+
+    const val_path = try leaf.serializeUtf8(allocator, "mydir");
+    defer allocator.free(val_path);
+    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    defer allocator.free(val_xh64);
+
+    const pairs = [_]KeyValue{
+        .{ .key = key_path, .value = val_path },
+        .{ .key = key_xh64, .value = val_xh64 },
+    };
+    // This should NOT return MissingRequiredKey (bina is NOT required for DIR)
+    const result = try serializeDir(allocator, &pairs);
+    defer allocator.free(result);
+
+    try testing.expectEqual(@as(u8, 0x81), result[0]);
+    try testing.expectEqual(@as(u8, 0x07), result[1]);
 }

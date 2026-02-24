@@ -86,9 +86,43 @@ int32_t blip_archive_file_content_by_path(const uint8_t *buf, size_t buf_len,
                                            const char *path, size_t path_len,
                                            const uint8_t **out_data, size_t *out_data_len);
 
-/* Verify a single file's xh64 hash within archive. */
+/* Verify a single file's xh64 hash within archive.
+ * For DIR entries, verifies the container hash only (no bina check). */
 int32_t blip_archive_file_verify(const uint8_t *buf, size_t buf_len,
                                   uint64_t index);
+
+/* --- Full archive (DIR + metadata) support --- */
+
+typedef struct {
+    const char *path;
+    size_t path_len;
+    const uint8_t *content;  /* NULL for directories */
+    size_t content_len;      /* 0 for directories */
+    uint8_t is_dir;          /* 1 for directory, 0 for file */
+    uint16_t mode;           /* permission bits (LE uint16), 0 = not set */
+    int64_t mtime_ns;        /* nanoseconds since epoch (LE int64), 0 = not set */
+    const char *owner;       /* NULL = not set */
+    size_t owner_len;        /* 0 = not set */
+    uint8_t xh64[8];         /* Merkle hash for dirs (pre-computed), ignored for files */
+} blip_archive_entry;
+
+/* Create a full BLIP archive with FILE + DIR entries and metadata.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free the output buffer with blip_free(). */
+int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
+                                  uint8_t **out_buf, size_t *out_len);
+
+/* Get the container type of an entry (0x05 = FILE, 0x07 = DIR). */
+int32_t blip_archive_entry_type(const uint8_t *buf, size_t buf_len,
+                                 uint64_t index, uint8_t *out_type);
+
+/* Extract metadata from an entry. Fields not present are set to 0/NULL. */
+int32_t blip_archive_entry_metadata(const uint8_t *buf, size_t buf_len,
+                                     uint64_t index,
+                                     uint16_t *out_mode,
+                                     int64_t *out_mtime_ns,
+                                     const char **out_owner,
+                                     size_t *out_owner_len);
 
 #ifdef __cplusplus
 }

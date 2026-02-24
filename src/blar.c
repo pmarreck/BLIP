@@ -1,46 +1,37 @@
 /*
- * blar -- BLIP Archive CLI
+ * blar -- Full BLIP Archive CLI
  *
- * A tar-like command-line tool for creating and manipulating BLIP archives.
- * Calls through the C FFI surface of libblip.
+ * A tar-like command-line tool for creating and manipulating BLIP archives
+ * with directory support and file metadata (mode, mtime, owner).
  *
  * Usage:
- *   blar create -o archive.blar file1 file2 ...
- *   blar list archive.blar
- *   blar extract archive.blar [-C dir]
- *   blar verify archive.blar
- *   blar info archive.blar
- *   blar cat archive.blar path/in/archive
+ *   blar create [-o <archive>] <files/dirs...>
+ *   blar list <archive>
+ *   blar extract <archive> [-C dir]
+ *   blar verify <archive>
+ *   blar info <archive>
+ *   blar cat <archive> <path>
  *
  * Tar-style shorthand (hyphen optional):
- *   blar cf archive.blar file1 file2 ...
- *   blar tf archive.blar
- *   blar xf archive.blar [-C dir]
- *   blar Vf archive.blar
- *   blar If archive.blar
- *   blar pf archive.blar path/in/archive
+ *   blar cf  <archive> <files/dirs...>
+ *   blar tf  <archive>
+ *   blar xf  <archive> [-C <dir>]
+ *   blar Vf  <archive>
+ *   blar If  <archive>
+ *   blar pf  <archive> <path>
  */
 
-#include "blip.h"
+#include "blar_common.h"
 
-#include <errno.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/types.h>
+#include <time.h>
 
-/* ── Exit codes ───────────────────────────────────────────────────────── */
-
-#define EXIT_OK       0
-#define EXIT_USAGE    1
-#define EXIT_IO       2
-#define EXIT_VERIFY   3
-
-/* ── Version ──────────────────────────────────────────────────────────── */
-
-#define BLAR_VERSION "0.1.0"
+#if defined(__APPLE__)
+#include <sys/time.h>
+#endif
 
 /* ── Forward declarations ─────────────────────────────────────────────── */
 
@@ -53,169 +44,214 @@ static int cmd_cat(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
-/* ── Utility: read entire file into malloc'd buffer ──────────────────── */
+/* ── Entry collection for create ──────────────────────────────────────── */
 
-static uint8_t *read_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+typedef struct {
+    blip_archive_entry *entries;
+    size_t count;
+    size_t capacity;
+    uint8_t **content_bufs; /* owned content buffers to free */
+    size_t content_count;
+    size_t content_capacity;
+} entry_list_t;
 
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long len = ftell(f);
-    if (len < 0) { fclose(f); return NULL; }
-    rewind(f);
+static void entry_list_init(entry_list_t *el) {
+    el->entries = NULL;
+    el->count = 0;
+    el->capacity = 0;
+    el->content_bufs = NULL;
+    el->content_count = 0;
+    el->content_capacity = 0;
+}
 
-    uint8_t *buf = malloc((size_t)len);
-    if (!buf) { fclose(f); return NULL; }
+static bool entry_list_add(entry_list_t *el, blip_archive_entry entry) {
+    if (el->count >= el->capacity) {
+        size_t new_cap = el->capacity == 0 ? 64 : el->capacity * 2;
+        blip_archive_entry *new_entries = realloc(el->entries, new_cap * sizeof(blip_archive_entry));
+        if (!new_entries) return false;
+        el->entries = new_entries;
+        el->capacity = new_cap;
+    }
+    el->entries[el->count++] = entry;
+    return true;
+}
 
-    if (len > 0 && fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        free(buf);
-        fclose(f);
+static bool entry_list_add_content(entry_list_t *el, uint8_t *buf) {
+    if (el->content_count >= el->content_capacity) {
+        size_t new_cap = el->content_capacity == 0 ? 64 : el->content_capacity * 2;
+        uint8_t **new_bufs = realloc(el->content_bufs, new_cap * sizeof(uint8_t *));
+        if (!new_bufs) return false;
+        el->content_bufs = new_bufs;
+        el->content_capacity = new_cap;
+    }
+    el->content_bufs[el->content_count++] = buf;
+    return true;
+}
+
+static void entry_list_free(entry_list_t *el) {
+    for (size_t i = 0; i < el->content_count; i++) {
+        free(el->content_bufs[i]);
+    }
+    free(el->content_bufs);
+    free(el->entries);
+    el->entries = NULL;
+    el->count = 0;
+    el->capacity = 0;
+    el->content_bufs = NULL;
+    el->content_count = 0;
+    el->content_capacity = 0;
+}
+
+/* ── Path normalization ───────────────────────────────────────────────── */
+
+/* Strip leading "./" and "/" from a path, and trailing slashes, tar-style. */
+static const char *normalize_path(const char *path) {
+    while (path[0] == '.' && path[1] == '/') path += 2;
+    while (path[0] == '/') path++;
+    return path;
+}
+
+/* ── Get owner name from uid ──────────────────────────────────────────── */
+
+static const char *get_owner_name(uid_t uid) {
+    struct passwd *pw = getpwuid(uid);
+    return pw ? pw->pw_name : NULL;
+}
+
+/* ── Get mtime in nanoseconds ─────────────────────────────────────────── */
+
+static int64_t get_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(__linux__)
+    return (int64_t)st->st_mtim.tv_sec * 1000000000LL +
+           (int64_t)st->st_mtim.tv_nsec;
+#else
+    return (int64_t)st->st_mtime * 1000000000LL;
+#endif
+}
+
+/* ── Recursive directory walker ───────────────────────────────────────── */
+
+/* Add a strdup'd path to the content list so it gets freed with entry_list_free. */
+static char *entry_list_strdup(entry_list_t *el, const char *s) {
+    char *dup = strdup(s);
+    if (!dup) return NULL;
+    if (!entry_list_add_content(el, (uint8_t *)dup)) {
+        free(dup);
         return NULL;
     }
-    fclose(f);
-    *out_len = (size_t)len;
-    return buf;
+    return dup;
 }
 
-/* ── Utility: write buffer to file ───────────────────────────────────── */
+static bool collect_entries_recurse(const char *path, entry_list_t *el);
 
-static bool write_file(const char *path, const uint8_t *data, size_t len) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
-    if (len > 0 && fwrite(data, 1, len, f) != len) {
-        fclose(f);
+static bool collect_dir_children(const char *path, entry_list_t *el) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        fprintf(stderr, "blar: create: cannot open directory '%s': %s\n",
+                path, strerror(errno));
         return false;
     }
-    fclose(f);
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+
+        char child_path[4096];
+        /* Strip trailing slashes from parent to avoid "dir//child" */
+        size_t plen = strlen(path);
+        while (plen > 0 && path[plen - 1] == '/') plen--;
+        int n = snprintf(child_path, sizeof(child_path), "%.*s/%s", (int)plen, path, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child_path)) {
+            fprintf(stderr, "blar: create: path too long: %s/%s\n", path, de->d_name);
+            closedir(dir);
+            return false;
+        }
+
+        if (!collect_entries_recurse(child_path, el)) {
+            closedir(dir);
+            return false;
+        }
+    }
+    closedir(dir);
     return true;
 }
 
-/* ── Utility: mkdir -p ───────────────────────────────────────────────── */
-
-static bool mkdirp(const char *path) {
-    char tmp[4096];
-    size_t len = strlen(path);
-    if (len == 0 || len >= sizeof(tmp)) return false;
-    memcpy(tmp, path, len + 1);
-
-    for (size_t i = 1; i < len; i++) {
-        if (tmp[i] == '/') {
-            tmp[i] = '\0';
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
-            tmp[i] = '/';
-        }
+static bool collect_entries_recurse(const char *path, entry_list_t *el) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        fprintf(stderr, "blar: create: cannot stat '%s': %s\n",
+                path, strerror(errno));
+        return false;
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
+
+    const char *norm = normalize_path(path);
+    if (norm[0] == '\0') {
+        /* Root "." — skip entry but recurse */
+        if (S_ISDIR(st.st_mode)) return collect_dir_children(path, el);
+        return true;
+    }
+
+    /* Duplicate the normalized path so it survives stack unwinding */
+    char *owned_path = entry_list_strdup(el, norm);
+    if (!owned_path) return false;
+    /* Strip trailing slashes from stored path */
+    size_t op_len = strlen(owned_path);
+    while (op_len > 0 && owned_path[op_len - 1] == '/') owned_path[--op_len] = '\0';
+
+    const char *owner = get_owner_name(st.st_uid);
+    int64_t mtime_ns = get_mtime_ns(&st);
+    uint16_t mode = (uint16_t)(st.st_mode & 07777);
+
+    if (S_ISDIR(st.st_mode)) {
+        blip_archive_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.path = owned_path;
+        entry.path_len = strlen(owned_path);
+        entry.is_dir = 1;
+        entry.mode = mode;
+        entry.mtime_ns = mtime_ns;
+        if (owner) {
+            entry.owner = owner;
+            entry.owner_len = strlen(owner);
+        }
+        memset(entry.xh64, 0, 8);
+        if (!entry_list_add(el, entry)) return false;
+
+        return collect_dir_children(path, el);
+    } else if (S_ISREG(st.st_mode)) {
+        size_t content_len = 0;
+        uint8_t *content = read_file(path, &content_len);
+        if (!content) {
+            fprintf(stderr, "blar: create: cannot read '%s': %s\n",
+                    path, strerror(errno));
+            return false;
+        }
+        if (!entry_list_add_content(el, content)) {
+            free(content);
+            return false;
+        }
+
+        blip_archive_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.path = owned_path;
+        entry.path_len = strlen(owned_path);
+        entry.content = content;
+        entry.content_len = content_len;
+        entry.is_dir = 0;
+        entry.mode = mode;
+        entry.mtime_ns = mtime_ns;
+        if (owner) {
+            entry.owner = owner;
+            entry.owner_len = strlen(owner);
+        }
+        if (!entry_list_add(el, entry)) return false;
+    }
+
     return true;
-}
-
-/* Ensure the parent directory of a file path exists. */
-static bool ensure_parent_dir(const char *filepath) {
-    char tmp[4096];
-    size_t len = strlen(filepath);
-    if (len >= sizeof(tmp)) return false;
-    memcpy(tmp, filepath, len + 1);
-
-    /* Find the last slash. */
-    char *last_slash = strrchr(tmp, '/');
-    if (!last_slash) return true; /* no directory component */
-    *last_slash = '\0';
-    return mkdirp(tmp);
-}
-
-/* ── Progress bar ─────────────────────────────────────────────────────── */
-
-static void progress_bar(FILE *out, uint64_t current, uint64_t total,
-                         uint64_t bytes_done, uint64_t bytes_total) {
-    const int bar_width = 16;
-    int filled = (total > 0) ? (int)((current * (uint64_t)bar_width) / total) : 0;
-    if (filled > bar_width) filled = bar_width;
-    int empty = bar_width - filled;
-
-    fprintf(out, "\r[");
-    for (int i = 0; i < filled; i++) fprintf(out, "\xe2\x96\x88");
-    for (int i = 0; i < empty; i++) fprintf(out, "\xe2\x96\x91");
-    fprintf(out, "]  %llu/%llu files", (unsigned long long)current,
-            (unsigned long long)total);
-
-    /* Show bytes in human-readable form. */
-    double done_mb = (double)bytes_done / (1024.0 * 1024.0);
-    double total_mb = (double)bytes_total / (1024.0 * 1024.0);
-    if (bytes_total >= 1024 * 1024) {
-        fprintf(out, "   %.1f MB / %.1f MB", done_mb, total_mb);
-    } else {
-        fprintf(out, "   %llu B / %llu B", (unsigned long long)bytes_done,
-                (unsigned long long)bytes_total);
-    }
-
-    /* If this is the last update, end with newline. */
-    if (current == total) {
-        fprintf(out, "\n");
-    }
-    fflush(out);
-}
-
-/* ── Argument parsing ─────────────────────────────────────────────────── */
-
-/*
- * We support two styles:
- *   Subcommand: blar create -o out.blar file1 file2
- *   Tar-style:  blar cf out.blar file1 file2
- *               blar -cf out.blar file1 file2
- *
- * Tar flag mapping:
- *   c = create, t = list, x = extract, V = verify, I = info, p = cat
- *   f = file (archive path follows)
- */
-
-typedef enum {
-    OP_NONE,
-    OP_CREATE,
-    OP_LIST,
-    OP_EXTRACT,
-    OP_VERIFY,
-    OP_INFO,
-    OP_CAT,
-} operation_t;
-
-static operation_t parse_tar_flags(const char *flags, bool *has_f) {
-    operation_t op = OP_NONE;
-    *has_f = false;
-    for (const char *p = flags; *p; p++) {
-        switch (*p) {
-        case '-': break; /* skip leading hyphen */
-        case 'c':
-            if (op != OP_NONE) return OP_NONE; /* conflict */
-            op = OP_CREATE;
-            break;
-        case 't':
-            if (op != OP_NONE) return OP_NONE;
-            op = OP_LIST;
-            break;
-        case 'x':
-            if (op != OP_NONE) return OP_NONE;
-            op = OP_EXTRACT;
-            break;
-        case 'V':
-            if (op != OP_NONE) return OP_NONE;
-            op = OP_VERIFY;
-            break;
-        case 'I':
-            if (op != OP_NONE) return OP_NONE;
-            op = OP_INFO;
-            break;
-        case 'p':
-            if (op != OP_NONE) return OP_NONE;
-            op = OP_CAT;
-            break;
-        case 'f':
-            *has_f = true;
-            break;
-        default:
-            return OP_NONE; /* unknown flag */
-        }
-    }
-    return op;
 }
 
 /* ── Main ─────────────────────────────────────────────────────────────── */
@@ -228,19 +264,16 @@ int main(int argc, char **argv) {
 
     const char *arg1 = argv[1];
 
-    /* --help / -h */
     if (strcmp(arg1, "--help") == 0 || strcmp(arg1, "-h") == 0) {
         print_usage(stdout);
         return EXIT_OK;
     }
 
-    /* --version */
     if (strcmp(arg1, "--version") == 0) {
         print_version();
         return EXIT_OK;
     }
 
-    /* Subcommand style? */
     if (strcmp(arg1, "create") == 0) return cmd_create(argc - 2, argv + 2);
     if (strcmp(arg1, "list") == 0)   return cmd_list(argc - 2, argv + 2);
     if (strcmp(arg1, "extract") == 0) return cmd_extract(argc - 2, argv + 2);
@@ -248,11 +281,9 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "info") == 0)   return cmd_info(argc - 2, argv + 2);
     if (strcmp(arg1, "cat") == 0)    return cmd_cat(argc - 2, argv + 2);
 
-    /* Tar-style flags? e.g. "cf", "-cf", "tf", etc. */
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
     if (op != OP_NONE && has_f) {
-        /* argv[2] is the archive file, rest depends on operation */
         switch (op) {
         case OP_CREATE:  return cmd_create(argc - 2, argv + 2);
         case OP_LIST:    return cmd_list(argc - 2, argv + 2);
@@ -260,7 +291,7 @@ int main(int argc, char **argv) {
         case OP_VERIFY:  return cmd_verify(argc - 2, argv + 2);
         case OP_INFO:    return cmd_info(argc - 2, argv + 2);
         case OP_CAT:     return cmd_cat(argc - 2, argv + 2);
-        case OP_NONE:    break; /* unreachable */
+        case OP_NONE:    break;
         }
     }
 
@@ -275,21 +306,24 @@ static void print_usage(FILE *out) {
     fprintf(out,
         "Usage: blar <command> [options] [arguments]\n"
         "\n"
+        "Full BLIP archive tool with directory and metadata support.\n"
+        "For flat file-only archives, use 'miniblar'.\n"
+        "\n"
         "Commands:\n"
-        "  create -o <archive> <files...>    Create a BLIP archive\n"
-        "  list <archive>                    List files in archive\n"
-        "  extract <archive> [-C <dir>]      Extract files from archive\n"
-        "  verify <archive>                  Verify archive integrity\n"
-        "  info <archive>                    Show archive information\n"
-        "  cat <archive> <path>              Print file contents to stdout\n"
+        "  create [-o <archive>] <files/dirs...>  Create a BLIP archive\n"
+        "  list <archive>                         List entries in archive\n"
+        "  extract <archive> [-C <dir>]           Extract archive contents\n"
+        "  verify <archive>                       Verify archive integrity\n"
+        "  info <archive>                         Show archive information\n"
+        "  cat <archive> <path>                   Print file contents to stdout\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
-        "  blar cf  <archive> <files...>     Create\n"
-        "  blar tf  <archive>                List\n"
-        "  blar xf  <archive> [-C <dir>]     Extract\n"
-        "  blar Vf  <archive>                Verify\n"
-        "  blar If  <archive>                Info\n"
-        "  blar pf  <archive> <path>         Cat\n"
+        "  blar cf  <archive> <files/dirs...>     Create\n"
+        "  blar tf  <archive>                     List\n"
+        "  blar xf  <archive> [-C <dir>]          Extract\n"
+        "  blar Vf  <archive>                     Verify\n"
+        "  blar If  <archive>                     Info\n"
+        "  blar pf  <archive> <path>              Cat\n"
         "\n"
         "Options:\n"
         "  -h, --help       Show this help\n"
@@ -303,18 +337,9 @@ static void print_version(void) {
 
 /* ── cmd_create ───────────────────────────────────────────────────────── */
 
-/*
- * Subcommand form:  create -o <archive> file1 file2 ...
- * Tar-style form:   (entered as) cf <archive> file1 file2 ...
- *   In tar-style, argv[0] is the archive path, argv[1..] are files.
- *   In subcommand form, we parse -o <archive> and the rest are files.
- *
- * We detect which form by checking for "-o" in argv.
- */
-
 static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
-    int file_start = 0;
+    int input_start = 0;
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
@@ -324,84 +349,78 @@ static int cmd_create(int argc, char **argv) {
     /* Check for -o flag (subcommand style) */
     if (argc >= 2 && strcmp(argv[0], "-o") == 0) {
         out_path = argv[1];
-        file_start = 2;
+        input_start = 2;
     } else {
         /* Tar-style: first arg is the archive path */
         out_path = argv[0];
-        file_start = 1;
+        input_start = 1;
     }
 
-    int file_count = argc - file_start;
-    if (file_count <= 0) {
-        fprintf(stderr, "blar: create: no input files specified\n");
+    int input_count = argc - input_start;
+
+    /* Default output: single input with no -o -> <basename>.blar
+     * Handles: blar create mydir (1 arg, no -o) */
+    char default_out[4096];
+    if (input_count <= 0 && input_start == 1) {
+        /* Tar-style with single arg: check if it's a real file/dir */
+        struct stat st_check;
+        if (stat(out_path, &st_check) == 0) {
+            const char *input = out_path;
+            if (!default_output_name(input, default_out, sizeof(default_out))) {
+                fprintf(stderr, "blar: create: cannot generate output name\n");
+                return EXIT_USAGE;
+            }
+            out_path = default_out;
+            input_start = 0;
+            input_count = 1;
+        }
+    }
+
+    if (input_count <= 0) {
+        fprintf(stderr, "blar: create: no input files/directories specified\n");
         return EXIT_USAGE;
     }
 
-    /* Read all input files. */
-    blip_file_entry *entries = calloc((size_t)file_count, sizeof(blip_file_entry));
-    if (!entries) {
-        fprintf(stderr, "blar: create: out of memory\n");
-        return EXIT_IO;
-    }
+    /* Collect all entries (files and directories, recursively) */
+    entry_list_t el;
+    entry_list_init(&el);
 
     bool show_progress = isatty(STDERR_FILENO);
-    uint64_t total_bytes = 0;
-    uint64_t bytes_done = 0;
 
-    /* First pass: get total size for progress bar. */
-    if (show_progress) {
-        for (int i = 0; i < file_count; i++) {
-            struct stat st;
-            if (stat(argv[file_start + i], &st) == 0) {
-                total_bytes += (uint64_t)st.st_size;
-            }
-        }
-    }
-
-    for (int i = 0; i < file_count; i++) {
-        const char *path = argv[file_start + i];
-        size_t content_len = 0;
-        uint8_t *content = read_file(path, &content_len);
-        if (!content) {
-            fprintf(stderr, "blar: create: cannot open '%s': %s\n",
-                    path, strerror(errno));
-            /* Clean up already-read entries. */
-            for (int j = 0; j < i; j++) {
-                free((void *)entries[j].content);
-            }
-            free(entries);
+    for (int i = 0; i < input_count; i++) {
+        if (!collect_entries_recurse(argv[input_start + i], &el)) {
+            entry_list_free(&el);
             return EXIT_IO;
         }
-        entries[i].path = path;
-        entries[i].path_len = strlen(path);
-        entries[i].content = content;
-        entries[i].content_len = content_len;
-
-        if (show_progress) {
-            bytes_done += content_len;
-            progress_bar(stderr, (uint64_t)(i + 1), (uint64_t)file_count,
-                         bytes_done, total_bytes);
-        }
     }
 
-    /* Create the archive. */
+    if (el.count == 0) {
+        fprintf(stderr, "blar: create: no entries to archive\n");
+        entry_list_free(&el);
+        return EXIT_USAGE;
+    }
+
+    if (show_progress) {
+        uint64_t total_bytes = 0;
+        for (size_t i = 0; i < el.count; i++) {
+            total_bytes += el.entries[i].content_len;
+        }
+        progress_bar(stderr, (uint64_t)el.count, (uint64_t)el.count,
+                     total_bytes, total_bytes);
+    }
+
+    /* Create the archive via FFI */
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
-    int32_t rc = blip_archive_create(entries, (size_t)file_count,
-                                      &archive_buf, &archive_len);
-
-    /* Free input file buffers. */
-    for (int i = 0; i < file_count; i++) {
-        free((void *)entries[i].content);
-    }
-    free(entries);
+    int32_t rc = blip_archive_create_full(el.entries, el.count,
+                                           &archive_buf, &archive_len);
+    entry_list_free(&el);
 
     if (rc != BLIP_OK) {
         fprintf(stderr, "blar: create: %s\n", blip_error_string(rc));
         return EXIT_IO;
     }
 
-    /* Write the archive to disk. */
     if (!write_file(out_path, archive_buf, archive_len)) {
         fprintf(stderr, "blar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
@@ -439,17 +458,21 @@ static int cmd_list(int argc, char **argv) {
     }
 
     for (uint64_t i = 0; i < count; i++) {
+        /* Get entry type */
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+        char type_char = (entry_type == 0x07) ? 'd' : '-';
+
         const char *path = NULL;
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
-            fprintf(stderr, "blar: list: file %llu: %s\n",
+            fprintf(stderr, "blar: list: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
             return EXIT_IO;
         }
-        fwrite(path, 1, path_len, stdout);
-        fputc('\n', stdout);
+        printf("%c %.*s\n", type_char, (int)path_len, path);
     }
 
     free(buf);
@@ -467,7 +490,6 @@ static int cmd_extract(int argc, char **argv) {
     const char *archive_path = argv[0];
     const char *output_dir = NULL;
 
-    /* Parse optional -C <dir> */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-C") == 0) {
             if (i + 1 >= argc) {
@@ -499,39 +521,21 @@ static int cmd_extract(int argc, char **argv) {
     uint64_t total_bytes = 0;
     uint64_t bytes_done = 0;
 
-    /* First pass to get total bytes for progress bar. */
-    if (show_progress) {
-        for (uint64_t i = 0; i < count; i++) {
-            const uint8_t *data = NULL;
-            size_t data_len = 0;
-            if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
-                total_bytes += data_len;
-            }
-        }
-    }
-
+    /* First pass: create directories, count bytes for progress */
     for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+
         const char *path = NULL;
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
-            fprintf(stderr, "blar: extract: file %llu: %s\n",
+            fprintf(stderr, "blar: extract: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
             return EXIT_IO;
         }
 
-        const uint8_t *data = NULL;
-        size_t data_len = 0;
-        rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
-        if (rc != BLIP_OK) {
-            fprintf(stderr, "blar: extract: file %llu: %s\n",
-                    (unsigned long long)i, blip_error_string(rc));
-            free(buf);
-            return EXIT_IO;
-        }
-
-        /* Build the output path. */
         char out_path[4096];
         if (output_dir) {
             int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
@@ -551,7 +555,80 @@ static int cmd_extract(int argc, char **argv) {
             out_path[path_len] = '\0';
         }
 
-        /* Ensure parent directories exist. */
+        if (entry_type == 0x07) {
+            /* DIR entry: create directory */
+            uint16_t mode = 0;
+            int64_t mtime_ns = 0;
+            const char *owner = NULL;
+            size_t owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+            if (!mkdirp(out_path)) {
+                fprintf(stderr, "blar: extract: cannot create directory '%s': %s\n",
+                        out_path, strerror(errno));
+                free(buf);
+                return EXIT_IO;
+            }
+            if (mode != 0) {
+                chmod(out_path, mode);
+            }
+            /* mtime for directories is set after all files are extracted */
+        } else {
+            /* FILE entry: count bytes for progress */
+            const uint8_t *data = NULL;
+            size_t data_len = 0;
+            if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
+                total_bytes += data_len;
+            }
+        }
+    }
+
+    /* Second pass: extract files */
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+        if (entry_type == 0x07) continue; /* skip DIR entries */
+
+        const char *path = NULL;
+        size_t path_len = 0;
+        rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: extract: entry %llu: %s\n",
+                    (unsigned long long)i, blip_error_string(rc));
+            free(buf);
+            return EXIT_IO;
+        }
+
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: extract: entry %llu: %s\n",
+                    (unsigned long long)i, blip_error_string(rc));
+            free(buf);
+            return EXIT_IO;
+        }
+
+        char out_path[4096];
+        if (output_dir) {
+            int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                             output_dir, (int)path_len, path);
+            if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                fprintf(stderr, "blar: extract: path too long\n");
+                free(buf);
+                return EXIT_IO;
+            }
+        } else {
+            if (path_len >= sizeof(out_path)) {
+                fprintf(stderr, "blar: extract: path too long\n");
+                free(buf);
+                return EXIT_IO;
+            }
+            memcpy(out_path, path, path_len);
+            out_path[path_len] = '\0';
+        }
+
+        /* Ensure parent dirs exist (for implicit directories) */
         if (!ensure_parent_dir(out_path)) {
             fprintf(stderr, "blar: extract: cannot create directory for '%s': %s\n",
                     out_path, strerror(errno));
@@ -564,6 +641,26 @@ static int cmd_extract(int argc, char **argv) {
                     out_path, strerror(errno));
             free(buf);
             return EXIT_IO;
+        }
+
+        /* Restore file mode and mtime */
+        uint16_t mode = 0;
+        int64_t mtime_ns = 0;
+        const char *owner = NULL;
+        size_t owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+        if (mode != 0) {
+            chmod(out_path, mode);
+        }
+
+        if (mtime_ns != 0) {
+            struct timespec times[2];
+            times[0].tv_sec = 0;
+            times[0].tv_nsec = UTIME_OMIT; /* don't change atime */
+            times[1].tv_sec = (time_t)(mtime_ns / 1000000000LL);
+            times[1].tv_nsec = (long)(mtime_ns % 1000000000LL);
+            utimensat(AT_FDCWD, out_path, times, 0);
         }
 
         if (show_progress) {
@@ -593,14 +690,12 @@ static int cmd_verify(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    /* Verify outer archive hash. */
     if (!blip_archive_verify(buf, buf_len)) {
         fprintf(stderr, "blar: verify: archive hash mismatch\n");
         free(buf);
         return EXIT_VERIFY;
     }
 
-    /* Verify each file's individual hash. */
     uint64_t count = 0;
     int32_t rc = blip_archive_file_count(buf, buf_len, &count);
     if (rc != BLIP_OK) {
@@ -609,13 +704,16 @@ static int cmd_verify(int argc, char **argv) {
         return EXIT_VERIFY;
     }
 
+    uint64_t file_count = 0;
+    uint64_t dir_count = 0;
+
     for (uint64_t i = 0; i < count; i++) {
         rc = blip_archive_file_verify(buf, buf_len, i);
         if (rc != BLIP_OK) {
             const char *path = NULL;
             size_t path_len = 0;
             blip_archive_file_path(buf, buf_len, i, &path, &path_len);
-            fprintf(stderr, "blar: verify: file %llu", (unsigned long long)i);
+            fprintf(stderr, "blar: verify: entry %llu", (unsigned long long)i);
             if (path) {
                 fprintf(stderr, " ('%.*s')", (int)path_len, path);
             }
@@ -623,9 +721,15 @@ static int cmd_verify(int argc, char **argv) {
             free(buf);
             return EXIT_VERIFY;
         }
+
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+        if (entry_type == 0x07) dir_count++;
+        else file_count++;
     }
 
-    printf("OK: %llu files verified\n", (unsigned long long)count);
+    printf("OK: %llu files, %llu directories verified\n",
+           (unsigned long long)file_count, (unsigned long long)dir_count);
     free(buf);
     return EXIT_OK;
 }
@@ -655,45 +759,73 @@ static int cmd_info(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    printf("Archive: %s\n", archive_path);
-    printf("Size:    %llu bytes\n", (unsigned long long)buf_len);
-    printf("Files:   %llu\n", (unsigned long long)count);
+    uint64_t file_count = 0;
+    uint64_t dir_count = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+        if (entry_type == 0x07) dir_count++;
+        else file_count++;
+    }
+
+    printf("Archive:     %s\n", archive_path);
+    printf("Size:        %llu bytes\n", (unsigned long long)buf_len);
+    printf("Files:       %llu\n", (unsigned long long)file_count);
+    printf("Directories: %llu\n", (unsigned long long)dir_count);
     printf("\n");
 
     uint64_t total_content = 0;
     for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+        char type_char = (entry_type == 0x07) ? 'd' : '-';
+
         const char *path = NULL;
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
-            fprintf(stderr, "blar: info: file %llu: %s\n",
+            fprintf(stderr, "blar: info: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
             return EXIT_IO;
         }
 
-        const uint8_t *data = NULL;
-        size_t data_len = 0;
-        rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
-        if (rc != BLIP_OK) {
-            fprintf(stderr, "blar: info: file %llu: %s\n",
-                    (unsigned long long)i, blip_error_string(rc));
-            free(buf);
-            return EXIT_IO;
-        }
+        if (entry_type == 0x07) {
+            /* DIR: show metadata */
+            uint16_t mode = 0;
+            int64_t mtime_ns = 0;
+            const char *owner = NULL;
+            size_t owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+            const char *trail = (path_len > 0 && path[path_len - 1] == '/') ? "" : "/";
+            printf("%c %04o  %.*s%s\n", type_char, mode, (int)path_len, path, trail);
+        } else {
+            const uint8_t *data = NULL;
+            size_t data_len = 0;
+            rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "blar: info: entry %llu: %s\n",
+                        (unsigned long long)i, blip_error_string(rc));
+                free(buf);
+                return EXIT_IO;
+            }
 
-        printf("  %8llu  %.*s\n", (unsigned long long)data_len,
-               (int)path_len, path);
-        total_content += data_len;
+            uint16_t mode = 0;
+            int64_t mtime_ns = 0;
+            const char *owner = NULL;
+            size_t owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+            printf("%c %04o  %8llu  %.*s\n", type_char, mode,
+                   (unsigned long long)data_len, (int)path_len, path);
+            total_content += data_len;
+        }
     }
 
     printf("\n");
     printf("Total content: %llu bytes\n", (unsigned long long)total_content);
 
-    /* Integrity check. */
     bool ok = blip_archive_verify(buf, buf_len);
     if (ok) {
-        /* Also check individual files. */
         for (uint64_t i = 0; i < count; i++) {
             if (blip_archive_file_verify(buf, buf_len, i) != BLIP_OK) {
                 ok = false;
@@ -716,7 +848,7 @@ static int cmd_cat(int argc, char **argv) {
     }
 
     const char *archive_path = argv[0];
-    const char *file_path = argv[1];
+    const char *file_path = normalize_path(argv[1]);
 
     size_t buf_len = 0;
     uint8_t *buf = read_file(archive_path, &buf_len);

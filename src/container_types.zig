@@ -11,6 +11,7 @@ pub const ContainerType = enum(u7) {
     raw = 0x04,
     file = 0x05,
     map = 0x06,
+    dir = 0x07,
 };
 
 /// Sentinel byte constants for each container type.
@@ -41,6 +42,7 @@ test "typeSentinel produces correct bytes" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x04 }, &typeSentinel(.raw));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x05 }, &typeSentinel(.file));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x06 }, &typeSentinel(.map));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x07 }, &typeSentinel(.dir));
 }
 
 test "parseType round-trips all container types" {

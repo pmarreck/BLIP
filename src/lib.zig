@@ -40,11 +40,31 @@ export fn blip_encoded_size(value: u64) callconv(.c) i32 {
 // ---------------------------------------------------------------------------
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const page_allocator = std.heap.page_allocator;
 const mini_blip = blip.mini_blip_mod;
 const ContainerError = mini_blip.ContainerError;
 const leaf = mini_blip.leaf;
 const dict_mod = mini_blip.dict_mod;
+
+/// Map a full archive error (ContainerError | OutOfMemory) to a C FFI error code.
+fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
+    return switch (err) {
+        error.OutOfMemory => -13,
+        error.InvalidContainerType => -1,
+        error.InvalidLength => -2,
+        error.LengthExceedsBounds => -3,
+        error.MissingRequiredKey => -4,
+        error.DuplicateKey => -5,
+        error.KeysNotSorted => -6,
+        error.HashMismatch => -7,
+        error.IndexOutOfBounds => -8,
+        error.InvalidMagic => -9,
+        error.BufferTooSmall => -10,
+        error.UnexpectedEndOfInput => -11,
+        error.Overflow => -12,
+    };
+}
 
 /// Map a ContainerError to a C FFI error code.
 fn containerErrorCode(err: ContainerError) i32 {
@@ -213,7 +233,18 @@ export fn blip_archive_file_verify(
     const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
 
-    // Get stored xh64 hash
+    // Verify the dict/file/dir container hash
+    const dict_hash_ok = file_reader.verifyHash() catch |e| return containerErrorCode(e);
+    if (!dict_hash_ok) return -7;
+
+    // Check if this is a DIR entry (no bina required)
+    const entry_type = reader.entryTypeAt(index) catch |e| return containerErrorCode(e);
+    if (entry_type == .dir) {
+        // For DIR entries, we verify the container hash (done above) but skip bina content check
+        return 0;
+    }
+
+    // For FILE entries, verify xh64 matches content hash
     const xh64_idx = (file_reader.findKey("xh64") catch |e| return containerErrorCode(e)) orelse return -4;
     const xh64_container = file_reader.valueAt(xh64_idx) catch |e| return containerErrorCode(e);
     const xh64_val = leaf.readRaw(xh64_container) catch |e| return containerErrorCode(e);
@@ -232,7 +263,186 @@ export fn blip_archive_file_verify(
     return 0;
 }
 
-/// Free a buffer allocated by blip_archive_create.
+/// A full archive entry passed from C (supports both files and directories with metadata).
+const CArchiveEntry = extern struct {
+    path: [*]const u8,
+    path_len: usize,
+    content: ?[*]const u8, // NULL for dirs
+    content_len: usize, // 0 for dirs
+    is_dir: u8, // 1 for directory, 0 for file
+    mode: u16, // permission bits (LE uint16), 0 = not set
+    mtime_ns: i64, // nanoseconds since epoch (LE int64), 0 = not set
+    owner: ?[*]const u8, // NULL = not set
+    owner_len: usize, // 0 = not set
+    xh64: [8]u8, // Merkle hash for dirs (pre-computed by caller), ignored for files
+};
+
+/// Create a full BLIP archive from archive entries (files + directories + metadata).
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free the output buffer with blip_free().
+export fn blip_archive_create_full(
+    entries: [*]const CArchiveEntry,
+    entry_count: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    // We need to build ArchiveEntry array with optional metadata
+    var archive_entries = page_allocator.alloc(mini_blip.ArchiveEntry, entry_count) catch return -13;
+    defer page_allocator.free(archive_entries);
+
+    // Track metadata allocations
+    var meta_allocs: std.ArrayList([]u8) = .{};
+    defer {
+        for (meta_allocs.items) |item| page_allocator.free(item);
+        meta_allocs.deinit(page_allocator);
+    }
+
+    for (0..entry_count) |i| {
+        const e = entries[i];
+        const path = e.path[0..e.path_len];
+
+        // Build metadata pairs if any non-zero fields
+        const has_mode = e.mode != 0;
+        const has_mtime = e.mtime_ns != 0;
+        const has_owner = e.owner != null and e.owner_len > 0;
+        const meta_count: usize = (if (has_mode) @as(usize, 1) else 0) +
+            (if (has_mtime) @as(usize, 1) else 0) +
+            (if (has_owner) @as(usize, 1) else 0);
+
+        var metadata: ?[]dict_mod.KeyValue = null;
+        if (meta_count > 0) {
+            const meta = page_allocator.alloc(dict_mod.KeyValue, meta_count) catch return -13;
+            // We need a wrapper to track as []u8 for freeing
+            const meta_bytes: []u8 = @as([*]u8, @ptrCast(meta.ptr))[0 .. meta_count * @sizeOf(dict_mod.KeyValue)];
+            meta_allocs.append(page_allocator,meta_bytes) catch return -13;
+
+            var mi: usize = 0;
+
+            if (has_mode) {
+                // "mode" sorts before "mtime", "owner", "path", "xh64"
+                const key_mode = leaf.serializeUtf8(page_allocator, "mode") catch return -13;
+                meta_allocs.append(page_allocator,key_mode) catch return -13;
+                var mode_bytes: [2]u8 = undefined;
+                std.mem.writeInt(u16, &mode_bytes, e.mode, .little);
+                const val_mode = leaf.serializeRaw(page_allocator, &mode_bytes) catch return -13;
+                meta_allocs.append(page_allocator,val_mode) catch return -13;
+                meta[mi] = .{ .key = key_mode, .value = val_mode };
+                mi += 1;
+            }
+            if (has_mtime) {
+                const key_mtime = leaf.serializeUtf8(page_allocator, "mtime") catch return -13;
+                meta_allocs.append(page_allocator,key_mtime) catch return -13;
+                var mtime_bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &mtime_bytes, e.mtime_ns, .little);
+                const val_mtime = leaf.serializeRaw(page_allocator, &mtime_bytes) catch return -13;
+                meta_allocs.append(page_allocator,val_mtime) catch return -13;
+                meta[mi] = .{ .key = key_mtime, .value = val_mtime };
+                mi += 1;
+            }
+            if (has_owner) {
+                const key_owner = leaf.serializeUtf8(page_allocator, "owner") catch return -13;
+                meta_allocs.append(page_allocator,key_owner) catch return -13;
+                const val_owner = leaf.serializeUtf8(page_allocator, e.owner.?[0..e.owner_len]) catch return -13;
+                meta_allocs.append(page_allocator,val_owner) catch return -13;
+                meta[mi] = .{ .key = key_owner, .value = val_owner };
+                mi += 1;
+            }
+
+            metadata = meta;
+        }
+
+        if (e.is_dir != 0) {
+            archive_entries[i] = .{
+                .dir = .{
+                    .path = path,
+                    .xh64 = e.xh64,
+                    .metadata = metadata,
+                },
+            };
+        } else {
+            const content = if (e.content) |c| c[0..e.content_len] else &[_]u8{};
+            archive_entries[i] = .{
+                .file = .{
+                    .path = path,
+                    .content = content,
+                    .metadata = metadata,
+                },
+            };
+        }
+    }
+
+    const result = mini_blip.createFullArchive(page_allocator, archive_entries) catch |e| {
+        return fullArchiveErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Get the container type of an entry at the given index.
+/// Returns 0 on success. out_type will be 0x05 (FILE) or 0x07 (DIR).
+export fn blip_archive_entry_type(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_type: *u8,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const entry_type = reader.entryTypeAt(index) catch |e| return containerErrorCode(e);
+    out_type.* = @intFromEnum(entry_type);
+    return 0;
+}
+
+/// Extract metadata (mode, mtime, owner) from an archive entry.
+/// Returns 0 on success. Fields not present in the entry are set to 0/NULL.
+export fn blip_archive_entry_metadata(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_mode: *u16,
+    out_mtime_ns: *i64,
+    out_owner: *[*]const u8,
+    out_owner_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const entry = reader.entryAt(index) catch |e| return containerErrorCode(e);
+
+    // Default to zero/null
+    out_mode.* = 0;
+    out_mtime_ns.* = 0;
+    out_owner.* = @as([*]const u8, "");
+    out_owner_len.* = 0;
+
+    // Try to read mode
+    if (entry.findKey("mode") catch |e| return containerErrorCode(e)) |mode_idx| {
+        const mode_container = entry.valueAt(mode_idx) catch |e| return containerErrorCode(e);
+        const mode_val = leaf.readRaw(mode_container) catch |e| return containerErrorCode(e);
+        if (mode_val.len >= 2) {
+            out_mode.* = std.mem.readInt(u16, mode_val[0..2], .little);
+        }
+    }
+
+    // Try to read mtime
+    if (entry.findKey("mtime") catch |e| return containerErrorCode(e)) |mtime_idx| {
+        const mtime_container = entry.valueAt(mtime_idx) catch |e| return containerErrorCode(e);
+        const mtime_val = leaf.readRaw(mtime_container) catch |e| return containerErrorCode(e);
+        if (mtime_val.len >= 8) {
+            out_mtime_ns.* = std.mem.readInt(i64, mtime_val[0..8], .little);
+        }
+    }
+
+    // Try to read owner
+    if (entry.findKey("owner") catch |e| return containerErrorCode(e)) |owner_idx| {
+        const owner_container = entry.valueAt(owner_idx) catch |e| return containerErrorCode(e);
+        const owner_val = leaf.readUtf8(owner_container) catch |e| return containerErrorCode(e);
+        out_owner.* = owner_val.ptr;
+        out_owner_len.* = owner_val.len;
+    }
+
+    return 0;
+}
+
+/// Free a buffer allocated by blip_archive_create or blip_archive_create_full.
 export fn blip_free(ptr: [*]u8, len: usize) callconv(.c) void {
     page_allocator.free(ptr[0..len]);
 }
@@ -401,4 +611,92 @@ test "C FFI: blip_archive_file_verify checks per-file hash" {
 
     try std.testing.expectEqual(@as(i32, 0), blip_archive_file_verify(out_buf, out_len, 0));
     try std.testing.expectEqual(@as(i32, -8), blip_archive_file_verify(out_buf, out_len, 1));
+}
+
+test "C FFI: blip_archive_create_full with FILE + DIR entries" {
+    const entries = [_]CArchiveEntry{
+        .{
+            .path = "mydir", .path_len = 5,
+            .content = null, .content_len = 0,
+            .is_dir = 1,
+            .mode = 0o755, .mtime_ns = 0, .owner = null, .owner_len = 0,
+            .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        },
+        .{
+            .path = "mydir/file.txt", .path_len = 14,
+            .content = "hello", .content_len = 5,
+            .is_dir = 0,
+            .mode = 0o644, .mtime_ns = 0, .owner = null, .owner_len = 0,
+            .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, // ignored for files (computed by Zig)
+        },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    // Verify count
+    var count: u64 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_count(out_buf, out_len, &count));
+    try std.testing.expectEqual(@as(u64, 2), count);
+
+    // Verify hash
+    try std.testing.expect(blip_archive_verify(out_buf, out_len));
+}
+
+test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
+    const entries = [_]CArchiveEntry{
+        .{
+            .path = "adir", .path_len = 4,
+            .content = null, .content_len = 0,
+            .is_dir = 1,
+            .mode = 0, .mtime_ns = 0, .owner = null, .owner_len = 0,
+            .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        },
+        .{
+            .path = "bfile.txt", .path_len = 9,
+            .content = "data", .content_len = 4,
+            .is_dir = 0,
+            .mode = 0, .mtime_ns = 0, .owner = null, .owner_len = 0,
+            .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var out_type: u8 = undefined;
+    // adir sorts first
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_entry_type(out_buf, out_len, 0, &out_type));
+    try std.testing.expectEqual(@as(u8, 0x07), out_type); // DIR
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_entry_type(out_buf, out_len, 1, &out_type));
+    try std.testing.expectEqual(@as(u8, 0x05), out_type); // FILE
+}
+
+test "C FFI: blip_archive_entry_metadata returns metadata" {
+    const entries = [_]CArchiveEntry{
+        .{
+            .path = "script.sh", .path_len = 9,
+            .content = "#!/bin/bash\n", .content_len = 12,
+            .is_dir = 0,
+            .mode = 0o755, .mtime_ns = 1708787200_000_000_000, .owner = "peter", .owner_len = 5,
+            .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var out_mode: u16 = undefined;
+    var out_mtime_ns: i64 = undefined;
+    var out_owner: [*]const u8 = undefined;
+    var out_owner_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_entry_metadata(
+        out_buf, out_len, 0, &out_mode, &out_mtime_ns, &out_owner, &out_owner_len,
+    ));
+    try std.testing.expectEqual(@as(u16, 0o755), out_mode);
+    try std.testing.expectEqual(@as(i64, 1708787200_000_000_000), out_mtime_ns);
+    try std.testing.expectEqualSlices(u8, "peter", out_owner[0..out_owner_len]);
 }

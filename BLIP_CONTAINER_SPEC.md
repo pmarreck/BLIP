@@ -57,7 +57,8 @@ Sentinel        Type            Description
 0x81 0x04       RAW             Raw binary data (untyped)
 0x81 0x05       FILE            Specialized sorted dictionary (required keys: path, xh64, bina)
 0x81 0x06       MAP             Unsorted key-value pairs, indexed + hashed (insertion order)
-0x81 0x07 - 0x81 0x0F          Reserved (future container types)
+0x81 0x07       DIR             Specialized sorted dictionary (required keys: path, xh64; no bina)
+0x81 0x08 - 0x81 0x0F          Reserved (future container types)
 0x81 0x10 - 0x81 0x7F          Application-defined types
 ```
 
@@ -69,7 +70,7 @@ Offsets MAY be negative (signed two's complement) when pointing into a scratch p
 
 ## Key Ordering
 
-Dictionary (DICT) and File (FILE) containers store key-value pairs in a canonical sort order. Map (MAP) containers are exempt — they preserve insertion order. For DICT and FILE, keys MUST be sorted in **lexicographic byte order** — the same ordering as `memcmp`.
+Dictionary (DICT), File (FILE), and Directory (DIR) containers store key-value pairs in a canonical sort order. Map (MAP) containers are exempt — they preserve insertion order. For DICT, FILE, and DIR, keys MUST be sorted in **lexicographic byte order** — the same ordering as `memcmp`.
 
 **Rules:**
 1. Compare keys byte-by-byte using unsigned byte values (0x00 < 0x01 < ... < 0xFF)
@@ -93,7 +94,7 @@ Dictionary (DICT) and File (FILE) containers store key-value pairs in a canonica
 
 **Rationale:** Byte ordering is unambiguous, locale-independent, trivial to implement, and works identically for UTF8 and RAW keys. It also means that keys in the index section are in a known order, enabling binary search for key lookup in dictionaries with many keys.
 
-Encoders MUST emit key-value pairs in canonical key order for DICT and FILE containers. Decoders SHOULD reject DICT/FILE containers with out-of-order keys as malformed. MAP containers are exempt from ordering requirements.
+Encoders MUST emit key-value pairs in canonical key order for DICT, FILE, and DIR containers. Decoders SHOULD reject DICT/FILE/DIR containers with out-of-order keys as malformed. MAP containers are exempt from ordering requirements.
 
 ## Container Types
 
@@ -239,6 +240,44 @@ Keys are either UTF8 (0x81 0x03) or RAW (0x81 0x04) containers. Keys MUST be uni
 
 **Key ordering enables binary search:** Because keys are sorted, lookup is O(log N) via binary search on the key offsets in the index section, rather than O(N) sequential scan. This is significant for dictionaries with many keys (e.g., extended attributes, large metadata sets).
 
+### Directory (0x81 0x07)
+
+A specialized dictionary representing a directory in an archive. Like FILE, has required keys but does NOT contain file content (`bina`).
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ Type:    0x81 0x07                                         │
+│ Length:  BLIP(total)                                       │
+│ Value:   (dictionary structure — index, data, hash)        │
+│                                                            │
+│ Required keys:                                             │
+│   "path"  → UTF8: relative path, forward-slash separated,  │
+│              normalized, no leading slash, UTF-8            │
+│   "xh64"  → RAW: 8-byte Merkle hash (see below)           │
+│                                                            │
+│ Optional keys (examples):                                  │
+│   "mtime" → RAW: modification time (8-byte LE int64 ns)   │
+│   "mode"  → RAW: POSIX permissions (2-byte LE uint16)     │
+│   "owner" → UTF8: owner name                               │
+│                                                            │
+│ DIR containers follow dictionary layout (index + hash).    │
+│ DIR containers do NOT have a "bina" key.                   │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Merkle hash algorithm:** The `xh64` value for a DIR entry is a Merkle hash computed from its direct children:
+
+1. Collect the `xh64` values of all direct children (files and subdirectories) sorted by path
+2. Concatenate these 8-byte hashes in sorted-path order
+3. Compute `xxHash64(child_0_xh64 || child_1_xh64 || ... || child_N_xh64)` with seed 0
+
+This produces a bottom-up hash tree: leaf files have `xh64 = xxHash64(file_content)`, leaf directories (empty or containing only files) hash their children's xh64 values, and parent directories hash their children's (already-computed) xh64 values.
+
+**Merkle hash properties:**
+- Changing any file's content changes its xh64, which propagates up through all ancestor directory hashes to the root
+- Verifying the root directory's Merkle hash transitively verifies every file and subdirectory in the tree
+- Individual subtrees can be verified independently
+
 ### Map (0x81 0x06)
 
 An unsorted collection of key-value pairs with a trailing index and hash. Identical layout to Dictionary (0x81 0x02), but keys are stored in **insertion order** rather than canonical key order.
@@ -308,11 +347,14 @@ A complete archive (the "tar replacement") is a top-level **Array** container:
 Archive (ARRAY):
   Element 0: RAW containing magic bytes: "BLIP" + version byte (0x01)
   Element 1: ARRAY (body) containing:
-    Element 0: FILE { path: "src/main.zig", xh64: ..., bina: ... }
-    Element 1: FILE { path: "src/lib.zig",  xh64: ..., bina: ... }
+    Element 0: DIR  { path: "src",          xh64: [Merkle hash] }
+    Element 1: FILE { path: "src/main.zig", xh64: ..., bina: ... }
+    Element 2: FILE { path: "src/lib.zig",  xh64: ..., bina: ... }
     ...
-    Element N-1: FILE { ... }
+    Element N-1: FILE or DIR { ... }
 ```
+
+The body array may contain both FILE (0x81 0x05) and DIR (0x81 0x07) entries. DIR entries represent directories explicitly, enabling storage of directory metadata (permissions, mtime, owner). Archives without DIR entries are valid — directories are then implicit from file paths.
 
 **Magic identification:** The first bytes of any archive are:
 ```
@@ -326,7 +368,7 @@ BLIP(idx_off)   ← index offset (padded BLIP for streaming, normal otherwise)
 
 A parser can identify a BLIP archive by checking for the ARRAY sentinel at byte 0, then verifying the first element is a RAW container starting with `"BLIP"`.
 
-**Body element ordering:** Files in the body array SHOULD be sorted lexicographically by path for deterministic archives. Parsers MUST NOT assume sorted order — use the index for random access.
+**Body element ordering:** Entries (FILE and DIR) in the body array SHOULD be sorted lexicographically by path for deterministic archives. Parsers MUST NOT assume sorted order — use the index for random access.
 
 **Integrity verification of entire archive:** The outer ARRAY's trailing xxHash64 covers the entire archive contents (all files, all metadata, the index). A single 8-byte comparison verifies the whole thing.
 
@@ -343,6 +385,29 @@ ARRAY                                           ← top-level archive
         ├── "path" → UTF8 "hello.txt"
         └── "xh64" → RAW [8 bytes xxHash64]
 ```
+
+### Archive with directories
+
+```
+ARRAY                                           ← top-level archive
+├── RAW "BLIP\x01"
+└── ARRAY                                       ← body
+    ├── DIR                                     ← directory entry
+    │   ├── "mode"  → RAW [2 bytes, 0o755]
+    │   ├── "mtime" → RAW [8 bytes, nanoseconds]
+    │   ├── "path"  → UTF8 "src"
+    │   └── "xh64"  → RAW [8 bytes, Merkle hash of children]
+    ├── FILE
+    │   ├── "bina"  → RAW [file contents]
+    │   ├── "path"  → UTF8 "src/lib.zig"
+    │   └── "xh64"  → RAW [8 bytes]
+    └── FILE
+        ├── "bina"  → RAW [file contents]
+        ├── "path"  → UTF8 "src/main.zig"
+        └── "xh64"  → RAW [8 bytes]
+```
+
+The DIR entry's `xh64` is `xxHash64(xh64_of_lib.zig || xh64_of_main.zig)` — a Merkle hash of its children's hashes, concatenated in path-sorted order.
 
 ### Archive with metadata
 
@@ -559,7 +624,7 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 | Streaming write | Yes (append elements, finalize) | Yes (padded BLIP backfill) |
 | Streaming read | Yes (sequential headers) | Yes (ignore index, read TLVs) |
 | Platform encoding | ASCII (POSIX) or UTF-8 (pax) | UTF-8 only |
-| Typed values | No (everything is byte ranges) | Yes (UTF8, RAW, ARRAY, DICT, MAP, FILE) |
+| Typed values | No (everything is byte ranges) | Yes (UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR) |
 | Ecosystem | Universal | New (requires BLIP decoder) |
 | Compression | External (tar.gz, tar.zst) | External (same — wrap in compression) |
 
@@ -583,7 +648,7 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 
 2. **Symbolic links:** Should FILE containers support a "link" key (target path as UTF8) as an alternative to "bina"? Or are symlinks out of scope?
 
-3. **Empty directories:** Should the format represent empty directories? (tar does via a special header type.) Or are directories implicit from file paths?
+3. ~~**Empty directories:** Should the format represent empty directories?~~ **Resolved:** The DIR container type (0x81 0x07) explicitly represents directories, including empty ones. Directories can also be implicit from file paths in archives that omit DIR entries.
 
 4. **Maximum container size:** The format is theoretically unlimited (BLIP integers are unbounded). Should we define a practical maximum (e.g., 2^63 bytes) for interoperability?
 

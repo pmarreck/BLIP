@@ -80,7 +80,7 @@ nix develop -c zig build bench -Doptimize=ReleaseFast
 
 BLIP also defines a recursive binary container format (TLV) for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
 
-Container types: ARRAY, DICT, MAP, FILE, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, and canonical key ordering for deterministic output.
+Container types: ARRAY, DICT, MAP, FILE, DIR, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, Merkle hash trees for directories, and canonical key ordering for deterministic output.
 
 ### miniBLIP Archive API
 
@@ -129,24 +129,30 @@ blip_free(archive, archive_len);
 
 ## blar: BLIP Archive Tool
 
-`blar` is a CLI for creating, inspecting, and extracting BLIP archives — similar to `tar`.
+`blar` is a full-featured CLI for creating, inspecting, and extracting BLIP archives — similar to `tar`. It supports directory recursion, metadata preservation (permissions, mtime, owner), and Merkle hash integrity for directory trees.
 
 ### Usage
 
 ```bash
-# Create an archive
-blar create -o archive.blar file1.txt file2.txt dir/file3.txt
+# Create an archive from a directory tree (recurses automatically)
+blar create -o archive.blar myproject/
 
-# List files
+# Default output name: blar create mydir -> mydir.blar
+blar create myproject
+
+# Create from individual files
+blar create -o archive.blar file1.txt file2.txt
+
+# List entries (d=directory, -=file)
 blar list archive.blar
 
-# Extract all files
+# Extract all files, restoring directory structure + permissions
 blar extract archive.blar -C output_dir/
 
-# Verify integrity (outer + per-file xxHash64)
+# Verify integrity (outer + per-file xxHash64 + Merkle hashes)
 blar verify archive.blar
 
-# Show metadata
+# Show metadata (file count, directory count, sizes)
 blar info archive.blar
 
 # Print single file to stdout
@@ -156,13 +162,34 @@ blar cat archive.blar path/to/file.txt
 ### Tar-style shortcuts (hyphen optional)
 
 ```bash
-blar cf archive.blar file1.txt    # create
+blar cf archive.blar myproject/   # create
 blar tf archive.blar              # list
 blar xf archive.blar              # extract
 blar Vf archive.blar              # verify
 blar If archive.blar              # info
 blar pf archive.blar file.txt     # cat (print)
 ```
+
+## miniblar: Minimal BLIP Archive Tool
+
+`miniblar` creates flat file-only archives (no directory entries, no metadata). Use it when you need a simple archive of individual files.
+
+### Usage
+
+```bash
+# Create archive from files (directories rejected)
+miniblar create -o archive.blip file1.txt file2.txt
+
+# Same subcommands as blar: list, extract, verify, info, cat
+miniblar list archive.blip
+miniblar verify archive.blip
+
+# Tar-style shortcuts work too
+miniblar cf archive.blip file1.txt
+miniblar tf archive.blip
+```
+
+`miniblar` rejects directory arguments — use `blar` for directory support.
 
 ## License
 
