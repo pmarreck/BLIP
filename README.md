@@ -192,8 +192,16 @@ blar peek archive.blar "[1][0][0][md]"          # 0644 (semantic: mode as octal)
 blar peek archive.blar "[1][0][0][mt]"          # 2026-02-24T10:30:00.123456789Z
 blar peek archive.blar "[1][0][0].keys" --json  # ["bt","ct","gi","gn","md","mt","pa","ui","un"]
 blar peek archive.blar "[1][0][1]" --raw        # raw bytes to stdout
+blar peek archive.blar "[1][0][1]" --hex        # 0x68656c6c6f (hex-encoded payload)
 blar peek archive.blar "[1][0]" --type          # FILE (shorthand for .type)
 ```
+
+**Output flags:**
+
+- `--raw` — Output raw payload bytes. When stdout is a terminal, data is automatically piped through printable-binary encoding for safety, with a warning on stderr. When piped to a file or another command, raw bytes are emitted directly.
+- `--hex` — Output payload bytes as `0x`-prefixed hex string. For leaf containers (UTF8, RAW, DATA), shows the payload hex. For aggregate containers (ARRAY, DICT, FILE, DIR), shows the container's xxHash64 as hex.
+- `--json` — JSON output. Strings use printable-binary identity check: if the value contains only printable bytes it appears as-is; if it contains non-printable bytes, it is encoded via printable-binary and a warning is emitted on stderr.
+- `--type` — Shorthand for the `.type` accessor.
 
 Archive structure: `ARRAY[RAW magic, ARRAY[FILE[DICT{metadata}, DATA{content}], ...]]`. So `[0]` is the magic, `[1]` is the body array, `[1][0]` is the first file entry, `[1][0][0]` is its metadata dict, and `[1][0][1]` is its content. Known metadata keys (md, mt, ct, bt, ui, gi, xh) get semantic display (octal, ISO 8601, decimal, hex).
 

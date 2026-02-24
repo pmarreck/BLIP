@@ -165,6 +165,21 @@ int32_t blip_container_hash(const uint8_t *buf, size_t len, uint8_t out_hash[8])
 int32_t blip_container_key_at(const uint8_t *buf, size_t len, uint64_t index,
                                const uint8_t **out_key, size_t *out_key_len);
 
+/* --- Peek display flags --- */
+#define BLIP_PEEK_JSON   0x01u
+#define BLIP_PEEK_RAW    0x02u
+#define BLIP_PEEK_HEX    0x04u
+#define BLIP_PEEK_IS_TTY 0x08u
+
+/* Full peek display: navigate + format output in Zig core.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free stdout/stderr buffers with blip_free(). */
+int32_t blip_peek_display(const uint8_t *buf, size_t buf_len,
+                           const char *path, size_t path_len,
+                           uint32_t flags,
+                           const uint8_t **out_stdout, size_t *out_stdout_len,
+                           const uint8_t **out_stderr, size_t *out_stderr_len);
+
 /* Encode binary data as printable-binary UTF-8.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_encode_printable_binary(const uint8_t *input, size_t input_len,

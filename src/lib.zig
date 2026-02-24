@@ -510,6 +510,41 @@ export fn blip_container_key_at(
     return 0;
 }
 
+/// Full peek display: navigate + format output in Zig core.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free stdout/stderr buffers with blip_free().
+export fn blip_peek_display(
+    buf_ptr: [*]const u8,
+    buf_len: usize,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    flags: u32,
+    out_stdout_ptr: *[*]const u8,
+    out_stdout_len: *usize,
+    out_stderr_ptr: *[*]const u8,
+    out_stderr_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf_ptr[0..buf_len];
+    const path_str = path_ptr[0..path_len];
+    const peek_flags: peek_mod.PeekFlags = @bitCast(flags);
+
+    var result = peek_mod.peekDisplay(page_allocator, slice, path_str, peek_flags) catch return -13;
+
+    // Transfer ownership to caller
+    out_stdout_ptr.* = result.stdout_buf.ptr;
+    out_stdout_len.* = result.stdout_buf.len;
+    out_stderr_ptr.* = result.stderr_buf.ptr;
+    out_stderr_len.* = result.stderr_buf.len;
+
+    const had_error = result.is_error;
+
+    // Prevent deinit from freeing the buffers we just handed off
+    result.stdout_buf = &.{};
+    result.stderr_buf = &.{};
+
+    return if (had_error) @as(i32, -1) else @as(i32, 0);
+}
+
 /// Encode binary data as printable-binary UTF-8.
 /// Caller must free the output buffer with blip_free().
 export fn blip_encode_printable_binary(
@@ -964,6 +999,102 @@ test "C FFI: blip_encode_printable_binary round-trips" {
     // Encoded should be valid UTF-8 and non-empty
     try std.testing.expect(encoded_len > 0);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded_buf[0..encoded_len]));
+}
+
+// ---------------------------------------------------------------------------
+// blip_peek_display FFI tests
+// ---------------------------------------------------------------------------
+
+test "C FFI: blip_peek_display returns type for .type accessor" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "hello", .content_len = 5 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var stdout_ptr: [*]const u8 = undefined;
+    var stdout_len: usize = undefined;
+    var stderr_ptr: [*]const u8 = undefined;
+    var stderr_len: usize = undefined;
+    const rc = blip_peek_display(out_buf, out_len, ".type", 5, 0, &stdout_ptr, &stdout_len, &stderr_ptr, &stderr_len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer {
+        if (stdout_len > 0) blip_free(@constCast(stdout_ptr), stdout_len);
+        if (stderr_len > 0) blip_free(@constCast(stderr_ptr), stderr_len);
+    }
+    try std.testing.expectEqualSlices(u8, "ARRAY\n", stdout_ptr[0..stdout_len]);
+}
+
+test "C FFI: blip_peek_display with json flag" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "hello", .content_len = 5 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var stdout_ptr: [*]const u8 = undefined;
+    var stdout_len: usize = undefined;
+    var stderr_ptr: [*]const u8 = undefined;
+    var stderr_len: usize = undefined;
+    // BLIP_PEEK_JSON = 0x01
+    const rc = blip_peek_display(out_buf, out_len, ".type", 5, 0x01, &stdout_ptr, &stdout_len, &stderr_ptr, &stderr_len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer {
+        if (stdout_len > 0) blip_free(@constCast(stdout_ptr), stdout_len);
+        if (stderr_len > 0) blip_free(@constCast(stderr_ptr), stderr_len);
+    }
+    try std.testing.expectEqualSlices(u8, "\"ARRAY\"\n", stdout_ptr[0..stdout_len]);
+}
+
+test "C FFI: blip_peek_display returns error for invalid path" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "data", .content_len = 4 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var stdout_ptr: [*]const u8 = undefined;
+    var stdout_len: usize = undefined;
+    var stderr_ptr: [*]const u8 = undefined;
+    var stderr_len: usize = undefined;
+    const rc = blip_peek_display(out_buf, out_len, "[abc", 4, 0, &stdout_ptr, &stdout_len, &stderr_ptr, &stderr_len);
+    try std.testing.expectEqual(@as(i32, -1), rc);
+    defer {
+        if (stdout_len > 0) blip_free(@constCast(stdout_ptr), stdout_len);
+        if (stderr_len > 0) blip_free(@constCast(stderr_ptr), stderr_len);
+    }
+    try std.testing.expect(stderr_len > 0);
+}
+
+test "C FFI: blip_peek_display hex flag" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "AB", .content_len = 2 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    // Navigate to [1][0][1] (DATA content), hex mode (0x04)
+    var stdout_ptr: [*]const u8 = undefined;
+    var stdout_len: usize = undefined;
+    var stderr_ptr: [*]const u8 = undefined;
+    var stderr_len: usize = undefined;
+    const rc = blip_peek_display(out_buf, out_len, "[1][0][1]", 9, 0x04, &stdout_ptr, &stdout_len, &stderr_ptr, &stderr_len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer {
+        if (stdout_len > 0) blip_free(@constCast(stdout_ptr), stdout_len);
+        if (stderr_len > 0) blip_free(@constCast(stderr_ptr), stderr_len);
+    }
+    // Should start with 0x
+    try std.testing.expect(stdout_len >= 2);
+    try std.testing.expectEqualSlices(u8, "0x", stdout_ptr[0..2]);
 }
 
 test "C FFI: blip_peek returns error for invalid path" {

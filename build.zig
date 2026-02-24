@@ -8,18 +8,22 @@ pub fn build(b: *std.Build) void {
         "Optimization mode",
     ) orelse .ReleaseFast;
 
+    // printable-binary module (vendored) — needed by static lib for peek FFI
+    // NOTE: must be defined before blip_module so it can be imported
+    const pb_module = b.createModule(.{
+        .root_source_file = b.path("vendor/printable_binary/printable_binary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
         .target = target,
         .optimize = optimize,
-    });
-
-    // printable-binary module (vendored) — needed by static lib for peek FFI
-    const pb_module = b.createModule(.{
-        .root_source_file = b.path("vendor/printable_binary/printable_binary.zig"),
-        .target = target,
-        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "printable_binary", .module = pb_module },
+        },
     });
 
     // Static library (C FFI surface)
@@ -131,6 +135,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/blip.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "printable_binary", .module = pb_module },
+            },
         }),
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
