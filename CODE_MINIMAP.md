@@ -98,3 +98,16 @@ Benchmark suite: throughput, bignum math, random-access jumping.
 
 ## src/fuzz.zig
 Fuzz roundtrip tests for all encodings (100K random values each).
+
+## src/blar.c
+C CLI for BLIP archives (calls through C FFI).
+- `do_create` — read files, call `blip_archive_create`, write archive
+- `do_list` — print file paths from archive
+- `do_extract` — extract files to disk with directory creation
+- `do_verify` — verify outer hash + per-file xh64
+- `do_info` — print archive metadata (file count, sizes, integrity)
+- `do_cat` — print single file content to stdout
+- Progress bar on stderr when connected to interactive terminal
+
+## tests/blar_test.sh
+Bash integration tests for blar CLI.

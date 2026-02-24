@@ -127,6 +127,43 @@ bool ok = blip_archive_verify(archive, archive_len);
 blip_free(archive, archive_len);
 ```
 
+## blar: BLIP Archive Tool
+
+`blar` is a CLI for creating, inspecting, and extracting BLIP archives — similar to `tar`.
+
+### Usage
+
+```bash
+# Create an archive
+blar create -o archive.blar file1.txt file2.txt dir/file3.txt
+
+# List files
+blar list archive.blar
+
+# Extract all files
+blar extract archive.blar -C output_dir/
+
+# Verify integrity (outer + per-file xxHash64)
+blar verify archive.blar
+
+# Show metadata
+blar info archive.blar
+
+# Print single file to stdout
+blar cat archive.blar path/to/file.txt
+```
+
+### Tar-style shortcuts (hyphen optional)
+
+```bash
+blar cf archive.blar file1.txt    # create
+blar tf archive.blar              # list
+blar xf archive.blar              # extract
+blar Vf archive.blar              # verify
+blar If archive.blar              # info
+blar pf archive.blar file.txt     # cat (print)
+```
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

@@ -42,6 +42,49 @@ export fn blip_encoded_size(value: u64) callconv(.c) i32 {
 const std = @import("std");
 const page_allocator = std.heap.page_allocator;
 const mini_blip = blip.mini_blip_mod;
+const ContainerError = mini_blip.ContainerError;
+const leaf = mini_blip.leaf;
+const dict_mod = mini_blip.dict_mod;
+
+/// Map a ContainerError to a C FFI error code.
+fn containerErrorCode(err: ContainerError) i32 {
+    return switch (err) {
+        error.InvalidContainerType => -1,
+        error.InvalidLength => -2,
+        error.LengthExceedsBounds => -3,
+        error.MissingRequiredKey => -4,
+        error.DuplicateKey => -5,
+        error.KeysNotSorted => -6,
+        error.HashMismatch => -7,
+        error.IndexOutOfBounds => -8,
+        error.InvalidMagic => -9,
+        error.BufferTooSmall => -10,
+        error.UnexpectedEndOfInput => -11,
+        error.Overflow => -12,
+    };
+}
+
+/// Get a human-readable error string for an error code.
+export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
+    return switch (error_code) {
+        0 => "success",
+        -1 => "invalid container type",
+        -2 => "invalid length",
+        -3 => "length exceeds bounds",
+        -4 => "missing required key",
+        -5 => "duplicate key",
+        -6 => "keys not sorted",
+        -7 => "hash mismatch",
+        -8 => "index out of bounds",
+        -9 => "invalid magic",
+        -10 => "buffer too small",
+        -11 => "unexpected end of input",
+        -12 => "overflow",
+        -13 => "allocation failure",
+        -14 => "not found",
+        else => "unknown error",
+    };
+}
 
 /// A file entry passed from C for archive creation.
 const CFileEntry = extern struct {
@@ -99,6 +142,94 @@ export fn blip_archive_verify(
 ) callconv(.c) bool {
     const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch return false;
     return reader.verifyHash() catch false;
+}
+
+/// Get the file path at the given index (zero-copy pointer into buf).
+/// Returns 0 on success, negative error code on failure.
+export fn blip_archive_file_path(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_path: *[*]const u8,
+    out_path_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
+    const path_idx = (file_reader.findKey("path") catch |e| return containerErrorCode(e)) orelse return -4;
+    const path_container = file_reader.valueAt(path_idx) catch |e| return containerErrorCode(e);
+    const path_val = leaf.readUtf8(path_container) catch |e| return containerErrorCode(e);
+    out_path.* = path_val.ptr;
+    out_path_len.* = path_val.len;
+    return 0;
+}
+
+/// Get the file content at the given index (zero-copy pointer into buf).
+/// Returns 0 on success, negative error code on failure.
+export fn blip_archive_file_content(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_data: *[*]const u8,
+    out_data_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
+    const bina_idx = (file_reader.findKey("bina") catch |e| return containerErrorCode(e)) orelse return -4;
+    const bina_container = file_reader.valueAt(bina_idx) catch |e| return containerErrorCode(e);
+    const bina_val = leaf.readRaw(bina_container) catch |e| return containerErrorCode(e);
+    out_data.* = bina_val.ptr;
+    out_data_len.* = bina_val.len;
+    return 0;
+}
+
+/// Get file content by path (zero-copy pointer into buf).
+/// Returns 0 on success, -14 if not found, other negative codes on error.
+export fn blip_archive_file_content_by_path(
+    buf: [*]const u8,
+    buf_len: usize,
+    path: [*]const u8,
+    path_len: usize,
+    out_data: *[*]const u8,
+    out_data_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const file_reader_opt = reader.findFile(path[0..path_len]) catch |e| return containerErrorCode(e);
+    const file_reader = file_reader_opt orelse return -14;
+    const bina_idx = (file_reader.findKey("bina") catch |e| return containerErrorCode(e)) orelse return -4;
+    const bina_container = file_reader.valueAt(bina_idx) catch |e| return containerErrorCode(e);
+    const bina_val = leaf.readRaw(bina_container) catch |e| return containerErrorCode(e);
+    out_data.* = bina_val.ptr;
+    out_data_len.* = bina_val.len;
+    return 0;
+}
+
+/// Verify a single file's xh64 hash within an archive.
+/// Returns 0 if hash matches, -7 on mismatch, -8 on index out of bounds, other negatives on error.
+export fn blip_archive_file_verify(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+) callconv(.c) i32 {
+    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
+
+    // Get stored xh64 hash
+    const xh64_idx = (file_reader.findKey("xh64") catch |e| return containerErrorCode(e)) orelse return -4;
+    const xh64_container = file_reader.valueAt(xh64_idx) catch |e| return containerErrorCode(e);
+    const xh64_val = leaf.readRaw(xh64_container) catch |e| return containerErrorCode(e);
+    if (xh64_val.len != 8) return -2; // InvalidLength
+
+    const stored_hash = std.mem.readInt(u64, xh64_val[0..8], .little);
+
+    // Get file content and recompute hash
+    const bina_idx = (file_reader.findKey("bina") catch |e| return containerErrorCode(e)) orelse return -4;
+    const bina_container = file_reader.valueAt(bina_idx) catch |e| return containerErrorCode(e);
+    const bina_val = leaf.readRaw(bina_container) catch |e| return containerErrorCode(e);
+
+    const computed_hash = std.hash.XxHash64.hash(0, bina_val);
+
+    if (stored_hash != computed_hash) return -7; // HashMismatch
+    return 0;
 }
 
 /// Free a buffer allocated by blip_archive_create.
@@ -174,4 +305,100 @@ test "C FFI: blip_free frees allocated memory" {
     const result = blip_archive_create(&c_files, 0, &out_buf, &out_len);
     try std.testing.expectEqual(@as(i32, 0), result);
     blip_free(out_buf, out_len);
+}
+
+test "C FFI: blip_error_string returns correct strings" {
+    const ok_str = std.mem.span(blip_error_string(0));
+    try std.testing.expectEqualSlices(u8, "success", ok_str);
+
+    const hash_str = std.mem.span(blip_error_string(-7));
+    try std.testing.expectEqualSlices(u8, "hash mismatch", hash_str);
+
+    const unknown_str = std.mem.span(blip_error_string(-50));
+    try std.testing.expectEqualSlices(u8, "unknown error", unknown_str);
+}
+
+test "C FFI: containerErrorCode maps all ContainerError variants" {
+    // Verify the mapping function covers all error variants correctly
+    try std.testing.expectEqual(@as(i32, -1), containerErrorCode(error.InvalidContainerType));
+    try std.testing.expectEqual(@as(i32, -2), containerErrorCode(error.InvalidLength));
+    try std.testing.expectEqual(@as(i32, -3), containerErrorCode(error.LengthExceedsBounds));
+    try std.testing.expectEqual(@as(i32, -4), containerErrorCode(error.MissingRequiredKey));
+    try std.testing.expectEqual(@as(i32, -5), containerErrorCode(error.DuplicateKey));
+    try std.testing.expectEqual(@as(i32, -6), containerErrorCode(error.KeysNotSorted));
+    try std.testing.expectEqual(@as(i32, -7), containerErrorCode(error.HashMismatch));
+    try std.testing.expectEqual(@as(i32, -8), containerErrorCode(error.IndexOutOfBounds));
+    try std.testing.expectEqual(@as(i32, -9), containerErrorCode(error.InvalidMagic));
+    try std.testing.expectEqual(@as(i32, -10), containerErrorCode(error.BufferTooSmall));
+    try std.testing.expectEqual(@as(i32, -11), containerErrorCode(error.UnexpectedEndOfInput));
+    try std.testing.expectEqual(@as(i32, -12), containerErrorCode(error.Overflow));
+}
+
+test "C FFI: blip_archive_file_path returns correct paths" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "alpha.txt", .path_len = 9, .content = "aaa", .content_len = 3 },
+        .{ .path = "beta.txt", .path_len = 8, .content = "bbb", .content_len = 3 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 2, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var path_ptr: [*]const u8 = undefined;
+    var path_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_path(out_buf, out_len, 0, &path_ptr, &path_len));
+    try std.testing.expectEqualSlices(u8, "alpha.txt", path_ptr[0..path_len]);
+
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_path(out_buf, out_len, 1, &path_ptr, &path_len));
+    try std.testing.expectEqualSlices(u8, "beta.txt", path_ptr[0..path_len]);
+
+    // Out of bounds
+    try std.testing.expectEqual(@as(i32, -8), blip_archive_file_path(out_buf, out_len, 2, &path_ptr, &path_len));
+}
+
+test "C FFI: blip_archive_file_content returns correct data" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "hello world", .content_len = 11 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var data_ptr: [*]const u8 = undefined;
+    var data_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_content(out_buf, out_len, 0, &data_ptr, &data_len));
+    try std.testing.expectEqualSlices(u8, "hello world", data_ptr[0..data_len]);
+}
+
+test "C FFI: blip_archive_file_content_by_path finds file" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "a.txt", .path_len = 5, .content = "aaa", .content_len = 3 },
+        .{ .path = "b.txt", .path_len = 5, .content = "bbb", .content_len = 3 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 2, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    var data_ptr: [*]const u8 = undefined;
+    var data_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_content_by_path(out_buf, out_len, "b.txt", 5, &data_ptr, &data_len));
+    try std.testing.expectEqualSlices(u8, "bbb", data_ptr[0..data_len]);
+
+    // Not found
+    try std.testing.expectEqual(@as(i32, -14), blip_archive_file_content_by_path(out_buf, out_len, "nope", 4, &data_ptr, &data_len));
+}
+
+test "C FFI: blip_archive_file_verify checks per-file hash" {
+    const c_files = [_]CFileEntry{
+        .{ .path = "test.txt", .path_len = 8, .content = "data", .content_len = 4 },
+    };
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, &out_buf, &out_len));
+    defer blip_free(out_buf, out_len);
+
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_file_verify(out_buf, out_len, 0));
+    try std.testing.expectEqual(@as(i32, -8), blip_archive_file_verify(out_buf, out_len, 1));
 }

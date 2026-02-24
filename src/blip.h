@@ -5,6 +5,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Error codes for new archive access functions.
+ * Legacy functions (blip_encode, blip_decode, etc.) still return -1 on error. */
+#define BLIP_OK                    0
+#define BLIP_ERR_INVALID_TYPE     -1
+#define BLIP_ERR_INVALID_LENGTH   -2
+#define BLIP_ERR_BOUNDS           -3
+#define BLIP_ERR_MISSING_KEY      -4
+#define BLIP_ERR_DUPLICATE_KEY    -5
+#define BLIP_ERR_KEYS_NOT_SORTED  -6
+#define BLIP_ERR_HASH_MISMATCH   -7
+#define BLIP_ERR_INDEX_OOB        -8
+#define BLIP_ERR_INVALID_MAGIC    -9
+#define BLIP_ERR_BUFFER_TOO_SMALL -10
+#define BLIP_ERR_UNEXPECTED_EOF   -11
+#define BLIP_ERR_OVERFLOW         -12
+#define BLIP_ERR_ALLOC            -13
+#define BLIP_ERR_NOT_FOUND        -14
+#define BLIP_ERR_UNKNOWN          -99
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +67,28 @@ bool blip_archive_verify(const uint8_t *buf, size_t buf_len);
 
 /* Free a buffer allocated by blip_archive_create. */
 void blip_free(uint8_t *ptr, size_t len);
+
+/* Get a human-readable error string for an error code. */
+const char *blip_error_string(int32_t error_code);
+
+/* Get file path from archive by index (zero-copy pointer into buf). */
+int32_t blip_archive_file_path(const uint8_t *buf, size_t buf_len,
+                                uint64_t index,
+                                const char **out_path, size_t *out_path_len);
+
+/* Get file content from archive by index (zero-copy pointer into buf). */
+int32_t blip_archive_file_content(const uint8_t *buf, size_t buf_len,
+                                   uint64_t index,
+                                   const uint8_t **out_data, size_t *out_data_len);
+
+/* Get file content by path (zero-copy pointer into buf). */
+int32_t blip_archive_file_content_by_path(const uint8_t *buf, size_t buf_len,
+                                           const char *path, size_t path_len,
+                                           const uint8_t **out_data, size_t *out_data_len);
+
+/* Verify a single file's xh64 hash within archive. */
+int32_t blip_archive_file_verify(const uint8_t *buf, size_t buf_len,
+                                  uint64_t index);
 
 #ifdef __cplusplus
 }

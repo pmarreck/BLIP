@@ -3,12 +3,12 @@ const Allocator = std.mem.Allocator;
 const blip = @import("blip.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
-const leaf = @import("leaf.zig");
-const array_mod = @import("array.zig");
-const dict_mod = @import("dict.zig");
+pub const leaf = @import("leaf.zig");
+pub const array_mod = @import("array.zig");
+pub const dict_mod = @import("dict.zig");
 const testing = std.testing;
 
-const ContainerError = container.ContainerError;
+pub const ContainerError = container.ContainerError;
 const ContainerType = ct.ContainerType;
 const XxHash64 = std.hash.XxHash64;
 

@@ -51,6 +51,32 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the benchmark CLI");
     run_step.dependOn(&run_cmd.step);
 
+    // blar CLI executable — C program that links against the static lib
+    const blar = b.addExecutable(.{
+        .name = "blar",
+        .root_module = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    blar.addCSourceFile(.{
+        .file = b.path("src/blar.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic" },
+    });
+    blar.linkLibrary(static_lib);
+    blar.root_module.addIncludePath(b.path("src"));
+    b.installArtifact(blar);
+
+    const blar_run_cmd = b.addRunArtifact(blar);
+    blar_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        blar_run_cmd.addArgs(args);
+    }
+    const blar_run_step = b.step("blar", "Run the blar archive CLI");
+    blar_run_step.dependOn(&blar_run_cmd.step);
+
     // Unit tests (exercises blip.zig directly)
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -60,8 +86,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    // FFI tests (exercises lib.zig C FFI surface)
+    const ffi_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "blip", .module = blip_module },
+            },
+        }),
+    });
+    const run_ffi_tests = b.addRunArtifact(ffi_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_ffi_tests.step);
 
     // Benchmark step — direct Zig access to all encodings
     const bench = b.addExecutable(.{

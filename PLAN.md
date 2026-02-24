@@ -28,6 +28,12 @@
 - [x] Container C FFI exports (blip_archive_create, verify, file_count, free)
 - [x] 447 tests total (all passing)
 
+## blar CLI (Completed 2026-02-23)
+- [x] Typed FFI error codes and blip_error_string
+- [x] FFI archive access: file_path, file_content, file_content_by_path, file_verify
+- [x] blar C CLI (create/list/extract/verify/info/cat) with progress bar
+- [x] Bash integration tests
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
