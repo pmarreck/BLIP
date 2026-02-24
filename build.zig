@@ -15,6 +15,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // printable-binary module (vendored) — needed by static lib for peek FFI
+    const pb_module = b.createModule(.{
+        .root_source_file = b.path("vendor/printable_binary/printable_binary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
         .name = "blip",
@@ -25,6 +32,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "blip", .module = blip_module },
+                .{ .name = "printable_binary", .module = pb_module },
             },
         }),
     });
@@ -103,6 +111,20 @@ pub fn build(b: *std.Build) void {
     const miniblar_run_step = b.step("miniblar", "Run the miniblar archive CLI");
     miniblar_run_step.dependOn(&miniblar_run_cmd.step);
 
+    // printable-binary CLI executable (vendored)
+    const pb_exe = b.addExecutable(.{
+        .name = "printable-binary",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("vendor/printable_binary/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "printable_binary", .module = pb_module },
+            },
+        }),
+    });
+    b.installArtifact(pb_exe);
+
     // Unit tests (exercises blip.zig directly)
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -121,6 +143,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "blip", .module = blip_module },
+                .{ .name = "printable_binary", .module = pb_module },
             },
         }),
     });

@@ -23,6 +23,13 @@
 
 #include "blar_common.h"
 
+#include <fcntl.h>
+#include <time.h>
+
+/* ── Module-scoped state ──────────────────────────────────────────────── */
+
+static bool g_absolute_names = false;
+
 /* ── Forward declarations ─────────────────────────────────────────────── */
 
 static int cmd_create(int argc, char **argv);
@@ -31,6 +38,7 @@ static int cmd_extract(int argc, char **argv);
 static int cmd_verify(int argc, char **argv);
 static int cmd_info(int argc, char **argv);
 static int cmd_cat(int argc, char **argv);
+static int cmd_peek(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -60,10 +68,12 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "verify") == 0) return cmd_verify(argc - 2, argv + 2);
     if (strcmp(arg1, "info") == 0)   return cmd_info(argc - 2, argv + 2);
     if (strcmp(arg1, "cat") == 0)    return cmd_cat(argc - 2, argv + 2);
+    if (strcmp(arg1, "peek") == 0)   return cmd_peek(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
     if (op != OP_NONE && has_f) {
+        if (tar_flags_has_P(arg1)) g_absolute_names = true;
         switch (op) {
         case OP_CREATE:  return cmd_create(argc - 2, argv + 2);
         case OP_LIST:    return cmd_list(argc - 2, argv + 2);
@@ -71,6 +81,7 @@ int main(int argc, char **argv) {
         case OP_VERIFY:  return cmd_verify(argc - 2, argv + 2);
         case OP_INFO:    return cmd_info(argc - 2, argv + 2);
         case OP_CAT:     return cmd_cat(argc - 2, argv + 2);
+        case OP_PEEK:    return cmd_peek(argc - 2, argv + 2);
         case OP_NONE:    break;
         }
     }
@@ -96,6 +107,7 @@ static void print_usage(FILE *out) {
         "  verify <archive>                   Verify archive integrity\n"
         "  info <archive>                     Show archive information\n"
         "  cat <archive> <path>               Print file contents to stdout\n"
+        "  peek <archive> [<path>] [flags]    Inspect archive structure\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  miniblar cf  <archive> <files...>  Create\n"
@@ -104,8 +116,13 @@ static void print_usage(FILE *out) {
         "  miniblar Vf  <archive>             Verify\n"
         "  miniblar If  <archive>             Info\n"
         "  miniblar pf  <archive> <path>      Cat\n"
+        "  miniblar kf  <archive> [<path>]    Peek\n"
+        "\n"
+        "Tar-style flags:\n"
+        "  P                              Absolute names (preserve leading /)\n"
         "\n"
         "Options:\n"
+        "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
     );
@@ -120,10 +137,21 @@ static void print_version(void) {
 static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
     int file_start = 0;
+    bool absolute_names = g_absolute_names;
 
     if (argc < 1) {
         fprintf(stderr, "miniblar: create: missing arguments\n");
         return EXIT_USAGE;
+    }
+
+    /* Scan for --absolute-names before positional parsing */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--absolute-names") == 0) {
+            absolute_names = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        }
     }
 
     /* Check for -o flag (subcommand style) */
@@ -157,7 +185,7 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
-    /* Default output: single input file -> <basename>.blar */
+    /* Default output: single input file -> <basename>.mblar */
     if (file_count == 1 && file_start == 1) {
         /* Tar-style with single file: argv[0] was treated as archive path.
          * We need to check if it's actually a file and use default naming. */
@@ -166,7 +194,7 @@ static int cmd_create(int argc, char **argv) {
             /* out_path exists as a file, so this is likely: miniblar create file.txt
              * Treat it as single input, generate default output */
             const char *input = out_path;
-            if (!default_output_name(input, default_out, sizeof(default_out))) {
+            if (!default_output_name(input, ".mblar", default_out, sizeof(default_out))) {
                 fprintf(stderr, "miniblar: create: cannot generate output name\n");
                 return EXIT_USAGE;
             }
@@ -177,8 +205,8 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
-    /* Read all input files. */
-    blip_file_entry *entries = calloc((size_t)file_count, sizeof(blip_file_entry));
+    /* Read all input files and collect metadata. */
+    blip_archive_entry *entries = calloc((size_t)file_count, sizeof(blip_archive_entry));
     if (!entries) {
         fprintf(stderr, "miniblar: create: out of memory\n");
         return EXIT_IO;
@@ -210,10 +238,19 @@ static int cmd_create(int argc, char **argv) {
             free(entries);
             return EXIT_IO;
         }
+
+        memset(&entries[i], 0, sizeof(entries[i]));
         entries[i].path = path;
         entries[i].path_len = strlen(path);
         entries[i].content = content;
         entries[i].content_len = content_len;
+        entries[i].is_dir = 0;
+
+        /* Collect file metadata */
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            fill_entry_metadata(&entries[i], &st);
+        }
 
         if (show_progress) {
             bytes_done += content_len;
@@ -224,8 +261,9 @@ static int cmd_create(int argc, char **argv) {
 
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
-    int32_t rc = blip_archive_create(entries, (size_t)file_count,
-                                      &archive_buf, &archive_len);
+    uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
+    int32_t rc = blip_archive_create_full(entries, (size_t)file_count, create_flags,
+                                           &archive_buf, &archive_len);
 
     for (int i = 0; i < file_count; i++) {
         free((void *)entries[i].content);
@@ -395,6 +433,26 @@ static int cmd_extract(int argc, char **argv) {
                     out_path, strerror(errno));
             free(buf);
             return EXIT_IO;
+        }
+
+        /* Restore file mode and mtime from archive metadata */
+        uint16_t mode = 0;
+        int64_t mtime_ns = 0;
+        const char *owner = NULL;
+        size_t owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+        if (mode != 0) {
+            chmod(out_path, mode);
+        }
+
+        if (mtime_ns != 0) {
+            struct timespec times[2];
+            times[0].tv_sec = 0;
+            times[0].tv_nsec = UTIME_OMIT; /* don't change atime */
+            times[1].tv_sec = (time_t)(mtime_ns / 1000000000LL);
+            times[1].tv_nsec = (long)(mtime_ns % 1000000000LL);
+            utimensat(AT_FDCWD, out_path, times, 0);
         }
 
         if (show_progress) {
@@ -574,4 +632,10 @@ static int cmd_cat(int argc, char **argv) {
 
     free(buf);
     return EXIT_OK;
+}
+
+/* ── cmd_peek ─────────────────────────────────────────────────────────── */
+
+static int cmd_peek(int argc, char **argv) {
+    return cmd_peek_common("miniblar", argc, argv);
 }

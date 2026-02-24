@@ -151,52 +151,28 @@ pub fn serializeDict(allocator: Allocator, pairs: []const KeyValue) (Allocator.E
     return serializeDictLike(allocator, pairs, .dict);
 }
 
-/// Serialize an ordered set of key-value pairs as a FILE container (0x81 0x05).
-/// Same as serializeDict but validates required keys: "bina", "path", "xh64".
-/// Caller owns returned memory.
-pub fn serializeFile(allocator: Allocator, pairs: []const KeyValue) (Allocator.Error || ContainerError)![]u8 {
-    // Validate key ordering and uniqueness
-    try validateKeyOrder(pairs);
-
-    // Check that required keys exist
-    var has_bina = false;
-    var has_path = false;
-    var has_xh64 = false;
-
-    for (pairs) |pair| {
-        const key_bytes = try extractKeyBytes(pair.key);
-        if (std.mem.eql(u8, key_bytes, "bina")) has_bina = true;
-        if (std.mem.eql(u8, key_bytes, "path")) has_path = true;
-        if (std.mem.eql(u8, key_bytes, "xh64")) has_xh64 = true;
-    }
-
-    if (!has_bina) return ContainerError.MissingRequiredKey;
-    if (!has_path) return ContainerError.MissingRequiredKey;
-    if (!has_xh64) return ContainerError.MissingRequiredKey;
-
-    return serializeDictLike(allocator, pairs, .file);
-}
+// serializeFile removed: FILE is now ARRAY-based (see mini_blip.zig serializeFileV2)
 
 /// Serialize an ordered set of key-value pairs as a DIR container (0x81 0x07).
-/// Same as serializeDict but validates required keys: "path", "xh64".
-/// Does NOT require "bina" (directories have no binary content).
+/// Same as serializeDict but validates required keys: "pa" and "xh".
+/// Does NOT require content (directories have no binary content).
 /// Caller owns returned memory.
 pub fn serializeDir(allocator: Allocator, pairs: []const KeyValue) (Allocator.Error || ContainerError)![]u8 {
     // Validate key ordering and uniqueness
     try validateKeyOrder(pairs);
 
     // Check that required keys exist
-    var has_path = false;
-    var has_xh64 = false;
+    var has_pa = false;
+    var has_xh = false;
 
     for (pairs) |pair| {
         const key_bytes = try extractKeyBytes(pair.key);
-        if (std.mem.eql(u8, key_bytes, "path")) has_path = true;
-        if (std.mem.eql(u8, key_bytes, "xh64")) has_xh64 = true;
+        if (std.mem.eql(u8, key_bytes, "pa")) has_pa = true;
+        if (std.mem.eql(u8, key_bytes, "xh")) has_xh = true;
     }
 
-    if (!has_path) return ContainerError.MissingRequiredKey;
-    if (!has_xh64) return ContainerError.MissingRequiredKey;
+    if (!has_pa) return ContainerError.MissingRequiredKey;
+    if (!has_xh) return ContainerError.MissingRequiredKey;
 
     return serializeDictLike(allocator, pairs, .dir);
 }
@@ -229,7 +205,7 @@ pub const DictReader = struct {
     pub fn init(buf: []const u8) ContainerError!DictReader {
         // Parse outer header: type + total_length
         const view = try container.parseHeader(buf);
-        if (view.container_type != .dict and view.container_type != .file and view.container_type != .map and view.container_type != .dir) {
+        if (view.container_type != .dict and view.container_type != .map and view.container_type != .dir) {
             return ContainerError.InvalidContainerType;
         }
 
@@ -594,100 +570,7 @@ test "valueAt out of bounds -> IndexOutOfBounds" {
     try testing.expectError(ContainerError.IndexOutOfBounds, reader.valueAt(100));
 }
 
-test "FILE with all 3 required keys - successful round-trip" {
-    const allocator = testing.allocator;
-
-    // Keys in canonical byte order: "bina" < "path" < "xh64"
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    defer allocator.free(key_bina);
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
-
-    const val_bina = try leaf.serializeRaw(allocator, "Hello, world!\n");
-    defer allocator.free(val_bina);
-    const val_path = try leaf.serializeUtf8(allocator, "hello.txt");
-    defer allocator.free(val_path);
-    const hash_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
-    const val_xh64 = try leaf.serializeRaw(allocator, &hash_bytes);
-    defer allocator.free(val_xh64);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_bina, .value = val_bina },
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
-    };
-    const result = try serializeFile(allocator, &pairs);
-    defer allocator.free(result);
-
-    // Verify FILE sentinel
-    try testing.expectEqual(@as(u8, 0x81), result[0]);
-    try testing.expectEqual(@as(u8, 0x05), result[1]);
-
-    const reader = try DictReader.init(result);
-    try testing.expectEqual(@as(u64, 3), reader.pairCount());
-    try testing.expect(try reader.verifyHash());
-
-    // Verify we can find all required keys
-    try testing.expect((try reader.findKey("bina")) != null);
-    try testing.expect((try reader.findKey("path")) != null);
-    try testing.expect((try reader.findKey("xh64")) != null);
-}
-
-test "FILE missing 'path' -> MissingRequiredKey" {
-    const allocator = testing.allocator;
-
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    defer allocator.free(key_bina);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
-
-    const val = try leaf.serializeRaw(allocator, "data");
-    defer allocator.free(val);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_bina, .value = val },
-        .{ .key = key_xh64, .value = val },
-    };
-    try testing.expectError(ContainerError.MissingRequiredKey, serializeFile(allocator, &pairs));
-}
-
-test "FILE missing 'bina' -> MissingRequiredKey" {
-    const allocator = testing.allocator;
-
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
-
-    const val = try leaf.serializeRaw(allocator, "data");
-    defer allocator.free(val);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_path, .value = val },
-        .{ .key = key_xh64, .value = val },
-    };
-    try testing.expectError(ContainerError.MissingRequiredKey, serializeFile(allocator, &pairs));
-}
-
-test "FILE missing 'xh64' -> MissingRequiredKey" {
-    const allocator = testing.allocator;
-
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    defer allocator.free(key_bina);
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-
-    const val = try leaf.serializeRaw(allocator, "data");
-    defer allocator.free(val);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_bina, .value = val },
-        .{ .key = key_path, .value = val },
-    };
-    try testing.expectError(ContainerError.MissingRequiredKey, serializeFile(allocator, &pairs));
-}
+// FILE is now ARRAY-based (see mini_blip.zig). FILE-specific tests moved there.
 
 test "verifyHash valid for dict" {
     const allocator = testing.allocator;
@@ -822,41 +705,7 @@ test "extractKeyBytes for RAW key" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, bytes);
 }
 
-test "DictReader works for FILE containers" {
-    const allocator = testing.allocator;
-
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    defer allocator.free(key_bina);
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
-
-    const val_bina = try leaf.serializeRaw(allocator, "file content");
-    defer allocator.free(val_bina);
-    const val_path = try leaf.serializeUtf8(allocator, "src/main.zig");
-    defer allocator.free(val_path);
-    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 });
-    defer allocator.free(val_xh64);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_bina, .value = val_bina },
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
-    };
-    const result = try serializeFile(allocator, &pairs);
-    defer allocator.free(result);
-
-    // DictReader should work for FILE type
-    const reader = try DictReader.init(result);
-    try testing.expectEqual(@as(u64, 3), reader.pairCount());
-    try testing.expect(try reader.verifyHash());
-
-    // Find and verify the path value
-    const path_idx = (try reader.findKey("path")).?;
-    const path_val = try reader.valueAt(path_idx);
-    try testing.expectEqualSlices(u8, "src/main.zig", try leaf.readUtf8(path_val));
-}
+// DictReader no longer accepts FILE type (FILE is now ARRAY-based)
 
 test "dict with many pairs (10+) verifying all are accessible" {
     const allocator = testing.allocator;
@@ -934,46 +783,7 @@ test "empty dict: total length matches buffer length" {
     try testing.expectEqual(@as(u64, result.len), reader.total_length);
 }
 
-test "FILE with additional optional keys" {
-    const allocator = testing.allocator;
-
-    // Keys in canonical byte order: "bina" < "mode" < "path" < "xh64"
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    defer allocator.free(key_bina);
-    const key_mode = try leaf.serializeUtf8(allocator, "mode");
-    defer allocator.free(key_mode);
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
-
-    const val_bina = try leaf.serializeRaw(allocator, "content");
-    defer allocator.free(val_bina);
-    const val_mode = try leaf.serializeRaw(allocator, &[_]u8{ 0x01, 0xA4 }); // 0o644
-    defer allocator.free(val_mode);
-    const val_path = try leaf.serializeUtf8(allocator, "README.md");
-    defer allocator.free(val_path);
-    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
-    defer allocator.free(val_xh64);
-
-    const pairs = [_]KeyValue{
-        .{ .key = key_bina, .value = val_bina },
-        .{ .key = key_mode, .value = val_mode },
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
-    };
-    const result = try serializeFile(allocator, &pairs);
-    defer allocator.free(result);
-
-    const reader = try DictReader.init(result);
-    try testing.expectEqual(@as(u64, 4), reader.pairCount());
-    try testing.expect(try reader.verifyHash());
-
-    // Verify optional key "mode" is accessible
-    const mode_idx = (try reader.findKey("mode")).?;
-    const mode_val = try reader.valueAt(mode_idx);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0xA4 }, try leaf.readRaw(mode_val));
-}
+// FILE with optional keys tests moved to mini_blip.zig (FILE is now ARRAY-based)
 
 test "verifyHash with corrupted hash bytes in dict" {
     const allocator = testing.allocator;
@@ -1030,24 +840,24 @@ test "dict with RAW keys" {
 // DIR container tests
 // =============================================================================
 
-test "DIR with path+xh64 round-trip (sentinel 0x81 0x07, hash verifies)" {
+test "DIR with pa+xh round-trip (sentinel 0x81 0x07, hash verifies)" {
     const allocator = testing.allocator;
 
-    // Keys in canonical byte order: "path" < "xh64"
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
+    // Keys in canonical byte order: "pa" < "xh"
+    const key_pa = try leaf.serializeUtf8(allocator, "pa");
+    defer allocator.free(key_pa);
+    const key_xh = try leaf.serializeUtf8(allocator, "xh");
+    defer allocator.free(key_xh);
 
-    const val_path = try leaf.serializeUtf8(allocator, "src/lib");
-    defer allocator.free(val_path);
+    const val_pa = try leaf.serializeUtf8(allocator, "src/lib");
+    defer allocator.free(val_pa);
     const hash_bytes = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 };
-    const val_xh64 = try leaf.serializeRaw(allocator, &hash_bytes);
-    defer allocator.free(val_xh64);
+    const val_xh = try leaf.serializeRaw(allocator, &hash_bytes);
+    defer allocator.free(val_xh);
 
     const pairs = [_]KeyValue{
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
+        .{ .key = key_pa, .value = val_pa },
+        .{ .key = key_xh, .value = val_xh },
     };
     const result = try serializeDir(allocator, &pairs);
     defer allocator.free(result);
@@ -1062,76 +872,76 @@ test "DIR with path+xh64 round-trip (sentinel 0x81 0x07, hash verifies)" {
     try testing.expect(try reader.verifyHash());
 
     // Verify keys
-    try testing.expect((try reader.findKey("path")) != null);
-    try testing.expect((try reader.findKey("xh64")) != null);
+    try testing.expect((try reader.findKey("pa")) != null);
+    try testing.expect((try reader.findKey("xh")) != null);
 }
 
-test "DIR missing path -> MissingRequiredKey" {
+test "DIR missing pa -> MissingRequiredKey" {
     const allocator = testing.allocator;
 
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
+    const key_xh = try leaf.serializeUtf8(allocator, "xh");
+    defer allocator.free(key_xh);
     const val = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
     defer allocator.free(val);
 
     const pairs = [_]KeyValue{
-        .{ .key = key_xh64, .value = val },
+        .{ .key = key_xh, .value = val },
     };
     try testing.expectError(ContainerError.MissingRequiredKey, serializeDir(allocator, &pairs));
 }
 
-test "DIR missing xh64 -> MissingRequiredKey" {
+test "DIR missing xh -> MissingRequiredKey" {
     const allocator = testing.allocator;
 
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
+    const key_pa = try leaf.serializeUtf8(allocator, "pa");
+    defer allocator.free(key_pa);
     const val = try leaf.serializeUtf8(allocator, "some/dir");
     defer allocator.free(val);
 
     const pairs = [_]KeyValue{
-        .{ .key = key_path, .value = val },
+        .{ .key = key_pa, .value = val },
     };
     try testing.expectError(ContainerError.MissingRequiredKey, serializeDir(allocator, &pairs));
 }
 
-test "DIR with optional metadata keys (mode, mtime, owner)" {
+test "DIR with optional 2-char metadata keys (md, mt, un)" {
     const allocator = testing.allocator;
 
-    // Keys in canonical byte order: "mode" < "mtime" < "owner" < "path" < "xh64"
-    const key_mode = try leaf.serializeUtf8(allocator, "mode");
-    defer allocator.free(key_mode);
-    const key_mtime = try leaf.serializeUtf8(allocator, "mtime");
-    defer allocator.free(key_mtime);
-    const key_owner = try leaf.serializeUtf8(allocator, "owner");
-    defer allocator.free(key_owner);
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
+    // Keys in canonical byte order: "md" < "mt" < "pa" < "un" < "xh"
+    const key_md = try leaf.serializeUtf8(allocator, "md");
+    defer allocator.free(key_md);
+    const key_mt = try leaf.serializeUtf8(allocator, "mt");
+    defer allocator.free(key_mt);
+    const key_pa = try leaf.serializeUtf8(allocator, "pa");
+    defer allocator.free(key_pa);
+    const key_un = try leaf.serializeUtf8(allocator, "un");
+    defer allocator.free(key_un);
+    const key_xh = try leaf.serializeUtf8(allocator, "xh");
+    defer allocator.free(key_xh);
 
     var mode_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &mode_bytes, 0o755, .little);
-    const val_mode = try leaf.serializeRaw(allocator, &mode_bytes);
-    defer allocator.free(val_mode);
+    const val_md = try leaf.serializeRaw(allocator, &mode_bytes);
+    defer allocator.free(val_md);
 
     var mtime_bytes: [8]u8 = undefined;
     std.mem.writeInt(i64, &mtime_bytes, 1708787200_000_000_000, .little);
-    const val_mtime = try leaf.serializeRaw(allocator, &mtime_bytes);
-    defer allocator.free(val_mtime);
+    const val_mt = try leaf.serializeRaw(allocator, &mtime_bytes);
+    defer allocator.free(val_mt);
 
-    const val_owner = try leaf.serializeUtf8(allocator, "peter");
-    defer allocator.free(val_owner);
-    const val_path = try leaf.serializeUtf8(allocator, "src/lib");
-    defer allocator.free(val_path);
-    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 });
-    defer allocator.free(val_xh64);
+    const val_pa = try leaf.serializeUtf8(allocator, "src/lib");
+    defer allocator.free(val_pa);
+    const val_un = try leaf.serializeUtf8(allocator, "peter");
+    defer allocator.free(val_un);
+    const val_xh = try leaf.serializeRaw(allocator, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 });
+    defer allocator.free(val_xh);
 
     const pairs = [_]KeyValue{
-        .{ .key = key_mode, .value = val_mode },
-        .{ .key = key_mtime, .value = val_mtime },
-        .{ .key = key_owner, .value = val_owner },
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
+        .{ .key = key_md, .value = val_md },
+        .{ .key = key_mt, .value = val_mt },
+        .{ .key = key_pa, .value = val_pa },
+        .{ .key = key_un, .value = val_un },
+        .{ .key = key_xh, .value = val_xh },
     };
     const result = try serializeDir(allocator, &pairs);
     defer allocator.free(result);
@@ -1141,34 +951,33 @@ test "DIR with optional metadata keys (mode, mtime, owner)" {
     try testing.expect(try reader.verifyHash());
 
     // Verify optional metadata is accessible
-    const mode_idx = (try reader.findKey("mode")).?;
-    const mode_val = try leaf.readRaw(try reader.valueAt(mode_idx));
-    try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, mode_val[0..2], .little));
+    const md_idx = (try reader.findKey("md")).?;
+    const md_val = try leaf.readRaw(try reader.valueAt(md_idx));
+    try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, md_val[0..2], .little));
 
-    const owner_idx = (try reader.findKey("owner")).?;
-    const owner_val = try leaf.readUtf8(try reader.valueAt(owner_idx));
-    try testing.expectEqualSlices(u8, "peter", owner_val);
+    const un_idx = (try reader.findKey("un")).?;
+    const un_val = try leaf.readUtf8(try reader.valueAt(un_idx));
+    try testing.expectEqualSlices(u8, "peter", un_val);
 }
 
-test "DIR does NOT require bina" {
+test "DIR does NOT require content" {
     const allocator = testing.allocator;
 
-    // DIR with just path + xh64 (no bina) should succeed
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    defer allocator.free(key_path);
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    defer allocator.free(key_xh64);
+    // DIR with just pa + xh should succeed
+    const key_pa = try leaf.serializeUtf8(allocator, "pa");
+    defer allocator.free(key_pa);
+    const key_xh = try leaf.serializeUtf8(allocator, "xh");
+    defer allocator.free(key_xh);
 
-    const val_path = try leaf.serializeUtf8(allocator, "mydir");
-    defer allocator.free(val_path);
-    const val_xh64 = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
-    defer allocator.free(val_xh64);
+    const val_pa = try leaf.serializeUtf8(allocator, "mydir");
+    defer allocator.free(val_pa);
+    const val_xh = try leaf.serializeRaw(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    defer allocator.free(val_xh);
 
     const pairs = [_]KeyValue{
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
+        .{ .key = key_pa, .value = val_pa },
+        .{ .key = key_xh, .value = val_xh },
     };
-    // This should NOT return MissingRequiredKey (bina is NOT required for DIR)
     const result = try serializeDir(allocator, &pairs);
     defer allocator.free(result);
 

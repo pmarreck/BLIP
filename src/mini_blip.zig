@@ -6,24 +6,49 @@ const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");
 pub const dict_mod = @import("dict.zig");
+pub const data_mod = @import("data.zig");
 const testing = std.testing;
 
 pub const ContainerError = container.ContainerError;
 const ContainerType = ct.ContainerType;
 const XxHash64 = std.hash.XxHash64;
 
-/// A file to be included in a miniBLIP archive.
+/// A file to be included in a BLIP archive.
+/// FILE containers are now ARRAY-based: [metadata DICT, DATA content, optional forks DICT].
 pub const FileEntry = struct {
     path: []const u8, // file path (UTF-8)
     content: []const u8, // file content bytes
-    metadata: ?[]const dict_mod.KeyValue, // optional extra k-v pairs (pre-serialized)
+    mode: u16 = 0, // POSIX permission bits, 0 = not set
+    mtime_ns: i64 = 0, // nanoseconds since epoch, 0 = not set
+    ctime_ns: i64 = 0, // ctime nanoseconds since epoch, 0 = not set
+    birthtime_ns: i64 = 0, // birthtime nanoseconds since epoch, 0 = not set
+    uid: u32 = 0, // numeric user ID, 0 = not set
+    gid: u32 = 0, // numeric group ID, 0 = not set
+    username: []const u8 = &.{}, // username string
+    groupname: []const u8 = &.{}, // group name string
+    xattrs: []const XattrEntry = &.{}, // extended attributes
+    resource_fork: []const u8 = &.{}, // resource fork data (macOS)
+};
+
+/// An xattr key-value pair.
+pub const XattrEntry = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 /// A directory entry to be included in a full BLIP archive.
 pub const DirEntry = struct {
     path: []const u8, // directory path (UTF-8)
     xh64: [8]u8, // pre-computed Merkle hash
-    metadata: ?[]const dict_mod.KeyValue, // optional extra k-v pairs (pre-serialized)
+    mode: u16 = 0,
+    mtime_ns: i64 = 0,
+    ctime_ns: i64 = 0,
+    birthtime_ns: i64 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    username: []const u8 = &.{},
+    groupname: []const u8 = &.{},
+    xattrs: []const XattrEntry = &.{},
 };
 
 /// A unified archive entry: either a file or a directory.
@@ -40,11 +65,10 @@ pub const ArchiveEntry = union(enum) {
     }
 };
 
-/// Compute a Merkle hash from an array of child xh64 hashes.
+/// Compute a Merkle hash from an array of child FILE ARRAY hashes.
 /// The children should already be sorted by path before calling this.
 /// Returns xxHash64 of the concatenation of all child hashes.
 pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
-    // Concatenate all child hashes
     var hasher = XxHash64.init(0);
     for (child_hashes) |h| {
         hasher.update(&h);
@@ -58,11 +82,340 @@ pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
 /// The magic bytes identifying a miniBLIP archive: "BLIP" + version 1.
 const MAGIC: *const [5]u8 = "BLIP\x01";
 
+/// Serialize a FILE entry as an ARRAY-based container.
+/// Layout: FILE (0x81 0x05, ARRAY layout)
+///   [0]: DICT — metadata (required keys: pa, md, mt)
+///   [1]: DATA — content + embedded xxHash64
+///   [2]: DICT — forks (optional, only if xattrs or resource fork present)
+/// Caller owns returned memory.
+pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
+    // --- Element 0: metadata DICT ---
+    // Build metadata key-value pairs with 2-char keys in canonical order:
+    // bt < ct < gi < gn < md < mt < pa < ui < un
+    var meta_pairs_buf: [9]dict_mod.KeyValue = undefined;
+    var meta_count: usize = 0;
+
+    // bt (birthtime)
+    if (file.birthtime_ns != 0) {
+        const key = try leaf.serializeUtf8(allocator, "bt");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, file.birthtime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // ct (ctime)
+    if (file.ctime_ns != 0) {
+        const key = try leaf.serializeUtf8(allocator, "ct");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, file.ctime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // gi (gid)
+    if (file.gid != 0) {
+        const key = try leaf.serializeUtf8(allocator, "gi");
+        try to_free.append(allocator, key);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, file.gid, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // gn (groupname)
+    if (file.groupname.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "gn");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, file.groupname);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // md (mode) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "md");
+        try to_free.append(allocator, key);
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, file.mode, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // mt (mtime) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "mt");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, file.mtime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // pa (path) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "pa");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, file.path);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // ui (uid)
+    if (file.uid != 0) {
+        const key = try leaf.serializeUtf8(allocator, "ui");
+        try to_free.append(allocator, key);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, file.uid, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // un (username)
+    if (file.username.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "un");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, file.username);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    const metadata_dict = try dict_mod.serializeDict(allocator, meta_pairs_buf[0..meta_count]);
+    try to_free.append(allocator, metadata_dict);
+
+    // --- Element 1: DATA container ---
+    const data_container = try data_mod.serializeData(allocator, file.content);
+    try to_free.append(allocator, data_container);
+
+    // --- Element 2: forks DICT (optional) ---
+    const has_forks = file.resource_fork.len > 0 or file.xattrs.len > 0;
+
+    if (has_forks) {
+        // Build forks dict: xattr names as keys, "rf" for resource fork
+        // Count pairs
+        const fork_pair_count = file.xattrs.len + @as(usize, if (file.resource_fork.len > 0) 1 else 0);
+
+        const fork_pairs = try allocator.alloc(dict_mod.KeyValue, fork_pair_count);
+        defer allocator.free(fork_pairs);
+        var fi: usize = 0;
+
+        // We need to sort all fork keys. Build them all then sort.
+        // First build all pairs
+        for (file.xattrs) |xa| {
+            const key = try leaf.serializeUtf8(allocator, xa.name);
+            try to_free.append(allocator, key);
+            const val = try leaf.serializeRaw(allocator, xa.value);
+            try to_free.append(allocator, val);
+            fork_pairs[fi] = .{ .key = key, .value = val };
+            fi += 1;
+        }
+        if (file.resource_fork.len > 0) {
+            const key = try leaf.serializeUtf8(allocator, "rf");
+            try to_free.append(allocator, key);
+            const val = try leaf.serializeRaw(allocator, file.resource_fork);
+            try to_free.append(allocator, val);
+            fork_pairs[fi] = .{ .key = key, .value = val };
+            fi += 1;
+        }
+
+        // Sort by key bytes
+        std.mem.sort(dict_mod.KeyValue, fork_pairs, {}, struct {
+            fn lessThan(_: void, a: dict_mod.KeyValue, b: dict_mod.KeyValue) bool {
+                const a_bytes = dict_mod.extractKeyBytes(a.key) catch return false;
+                const b_bytes = dict_mod.extractKeyBytes(b.key) catch return false;
+                return std.mem.order(u8, a_bytes, b_bytes) == .lt;
+            }
+        }.lessThan);
+
+        const forks_dict = try dict_mod.serializeDict(allocator, fork_pairs);
+        try to_free.append(allocator, forks_dict);
+
+        const elements = [_][]const u8{ metadata_dict, data_container, forks_dict };
+        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file);
+        try to_free.append(allocator, file_bytes);
+        return file_bytes;
+    } else {
+        const elements = [_][]const u8{ metadata_dict, data_container };
+        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file);
+        try to_free.append(allocator, file_bytes);
+        return file_bytes;
+    }
+}
+
+/// Serialize a single DirEntry into a DIR container with 2-char keys.
+fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
+    // Build key-value pairs with 2-char keys in canonical order:
+    // bt < ct < gi < gn < md < mt < pa < ui < un < xa < xh
+    var pairs_buf: [11]dict_mod.KeyValue = undefined;
+    var pair_count: usize = 0;
+
+    // bt (birthtime)
+    if (dir.birthtime_ns != 0) {
+        const key = try leaf.serializeUtf8(allocator, "bt");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, dir.birthtime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // ct (ctime)
+    if (dir.ctime_ns != 0) {
+        const key = try leaf.serializeUtf8(allocator, "ct");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, dir.ctime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // gi (gid)
+    if (dir.gid != 0) {
+        const key = try leaf.serializeUtf8(allocator, "gi");
+        try to_free.append(allocator, key);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, dir.gid, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // gn (groupname)
+    if (dir.groupname.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "gn");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, dir.groupname);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // md (mode) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "md");
+        try to_free.append(allocator, key);
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, dir.mode, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // mt (mtime) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "mt");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, dir.mtime_ns, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // pa (path) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "pa");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, dir.path);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // ui (uid)
+    if (dir.uid != 0) {
+        const key = try leaf.serializeUtf8(allocator, "ui");
+        try to_free.append(allocator, key);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, dir.uid, .little);
+        const val = try leaf.serializeRaw(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // un (username)
+    if (dir.username.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "un");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, dir.username);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // xa (xattrs dict)
+    if (dir.xattrs.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "xa");
+        try to_free.append(allocator, key);
+
+        const xa_pairs = try allocator.alloc(dict_mod.KeyValue, dir.xattrs.len);
+        defer allocator.free(xa_pairs);
+        for (dir.xattrs, 0..) |xa, xi| {
+            const xa_key = try leaf.serializeUtf8(allocator, xa.name);
+            try to_free.append(allocator, xa_key);
+            const xa_val = try leaf.serializeRaw(allocator, xa.value);
+            try to_free.append(allocator, xa_val);
+            xa_pairs[xi] = .{ .key = xa_key, .value = xa_val };
+        }
+        // Sort xattr pairs by key
+        std.mem.sort(dict_mod.KeyValue, xa_pairs, {}, struct {
+            fn lessThan(_: void, a: dict_mod.KeyValue, b: dict_mod.KeyValue) bool {
+                const a_bytes = dict_mod.extractKeyBytes(a.key) catch return false;
+                const b_bytes = dict_mod.extractKeyBytes(b.key) catch return false;
+                return std.mem.order(u8, a_bytes, b_bytes) == .lt;
+            }
+        }.lessThan);
+        const xa_dict = try dict_mod.serializeDict(allocator, xa_pairs);
+        try to_free.append(allocator, xa_dict);
+
+        pairs_buf[pair_count] = .{ .key = key, .value = xa_dict };
+        pair_count += 1;
+    }
+
+    // xh (Merkle hash) — required
+    {
+        const key = try leaf.serializeUtf8(allocator, "xh");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeRaw(allocator, &dir.xh64);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    const dir_bytes = try dict_mod.serializeDir(allocator, pairs_buf[0..pair_count]);
+    try to_free.append(allocator, dir_bytes);
+    return dir_bytes;
+}
+
 /// Create a miniBLIP archive from a list of file entries.
 /// Files are sorted by path in canonical byte order.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.Error || ContainerError)![]u8 {
-    // We need to track all intermediate allocations so we can free them
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
@@ -80,85 +433,12 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
         }
     }.lessThan);
 
-    // Serialize each file into a FILE container
+    // Serialize each file into a FILE container (ARRAY-based)
     var file_elements: std.ArrayList([]const u8) = .{};
     defer file_elements.deinit(allocator);
 
     for (sorted_files) |file| {
-        // Serialize the 3 required key-value pairs
-        const key_bina = try leaf.serializeUtf8(allocator, "bina");
-        try to_free.append(allocator, key_bina);
-        const val_bina = try leaf.serializeRaw(allocator, file.content);
-        try to_free.append(allocator, val_bina);
-
-        const key_path = try leaf.serializeUtf8(allocator, "path");
-        try to_free.append(allocator, key_path);
-        const val_path = try leaf.serializeUtf8(allocator, file.path);
-        try to_free.append(allocator, val_path);
-
-        const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-        try to_free.append(allocator, key_xh64);
-
-        // Compute xxHash64 of file content
-        const hash_value = XxHash64.hash(0, file.content);
-        var hash_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &hash_bytes, hash_value, .little);
-        const val_xh64 = try leaf.serializeRaw(allocator, &hash_bytes);
-        try to_free.append(allocator, val_xh64);
-
-        // Build the pairs list (keys already in canonical order: "bina" < "path" < "xh64")
-        const base_pair_count: usize = 3;
-        const meta_count: usize = if (file.metadata) |m| m.len else 0;
-        const total_pairs = base_pair_count + meta_count;
-
-        const pairs = try allocator.alloc(dict_mod.KeyValue, total_pairs);
-        defer allocator.free(pairs);
-
-        // We need to merge the base pairs with metadata pairs, keeping canonical key order.
-        // Base keys: "bina", "path", "xh64"
-        // Metadata keys could be anything, so we need to merge-sort them in.
-        const base_pairs = [3]dict_mod.KeyValue{
-            .{ .key = key_bina, .value = val_bina },
-            .{ .key = key_path, .value = val_path },
-            .{ .key = key_xh64, .value = val_xh64 },
-        };
-
-        if (meta_count == 0) {
-            @memcpy(pairs, &base_pairs);
-        } else {
-            // Merge base pairs and metadata pairs into sorted order
-            const meta = file.metadata.?;
-            var bi: usize = 0;
-            var mi: usize = 0;
-            var pi: usize = 0;
-
-            while (bi < base_pairs.len and mi < meta.len) {
-                const base_key_bytes = try dict_mod.extractKeyBytes(base_pairs[bi].key);
-                const meta_key_bytes = try dict_mod.extractKeyBytes(meta[mi].key);
-                const ord = std.mem.order(u8, base_key_bytes, meta_key_bytes);
-                if (ord == .lt or ord == .eq) {
-                    pairs[pi] = base_pairs[bi];
-                    bi += 1;
-                } else {
-                    pairs[pi] = meta[mi];
-                    mi += 1;
-                }
-                pi += 1;
-            }
-            while (bi < base_pairs.len) {
-                pairs[pi] = base_pairs[bi];
-                bi += 1;
-                pi += 1;
-            }
-            while (mi < meta.len) {
-                pairs[pi] = meta[mi];
-                mi += 1;
-                pi += 1;
-            }
-        }
-
-        const file_bytes = try dict_mod.serializeFile(allocator, pairs);
-        try to_free.append(allocator, file_bytes);
+        const file_bytes = try serializeFileEntry(allocator, file, &to_free);
         try file_elements.append(allocator, file_bytes);
     }
 
@@ -181,7 +461,6 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
 /// Entries are sorted by path in canonical byte order.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (Allocator.Error || ContainerError)![]u8 {
-    // Track all intermediate allocations
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
@@ -231,119 +510,12 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
     return result;
 }
 
-/// Serialize a single FileEntry into a FILE container.
-fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
-    const key_bina = try leaf.serializeUtf8(allocator, "bina");
-    try to_free.append(allocator, key_bina);
-    const val_bina = try leaf.serializeRaw(allocator, file.content);
-    try to_free.append(allocator, val_bina);
-
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    try to_free.append(allocator, key_path);
-    const val_path = try leaf.serializeUtf8(allocator, file.path);
-    try to_free.append(allocator, val_path);
-
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    try to_free.append(allocator, key_xh64);
-
-    const hash_value = XxHash64.hash(0, file.content);
-    var hash_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &hash_bytes, hash_value, .little);
-    const val_xh64 = try leaf.serializeRaw(allocator, &hash_bytes);
-    try to_free.append(allocator, val_xh64);
-
-    const base_pairs = [3]dict_mod.KeyValue{
-        .{ .key = key_bina, .value = val_bina },
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
-    };
-
-    const meta_count: usize = if (file.metadata) |m| m.len else 0;
-    const total_pairs = 3 + meta_count;
-    const pairs = try allocator.alloc(dict_mod.KeyValue, total_pairs);
-    defer allocator.free(pairs);
-
-    if (meta_count == 0) {
-        @memcpy(pairs, &base_pairs);
-    } else {
-        mergePairs(pairs, &base_pairs, file.metadata.?);
-    }
-
-    const file_bytes = try dict_mod.serializeFile(allocator, pairs);
-    try to_free.append(allocator, file_bytes);
-    return file_bytes;
-}
-
-/// Serialize a single DirEntry into a DIR container.
-fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
-    const key_path = try leaf.serializeUtf8(allocator, "path");
-    try to_free.append(allocator, key_path);
-    const val_path = try leaf.serializeUtf8(allocator, dir.path);
-    try to_free.append(allocator, val_path);
-
-    const key_xh64 = try leaf.serializeUtf8(allocator, "xh64");
-    try to_free.append(allocator, key_xh64);
-    const val_xh64 = try leaf.serializeRaw(allocator, &dir.xh64);
-    try to_free.append(allocator, val_xh64);
-
-    const base_pairs = [2]dict_mod.KeyValue{
-        .{ .key = key_path, .value = val_path },
-        .{ .key = key_xh64, .value = val_xh64 },
-    };
-
-    const meta_count: usize = if (dir.metadata) |m| m.len else 0;
-    const total_pairs = 2 + meta_count;
-    const pairs = try allocator.alloc(dict_mod.KeyValue, total_pairs);
-    defer allocator.free(pairs);
-
-    if (meta_count == 0) {
-        @memcpy(pairs, &base_pairs);
-    } else {
-        mergePairs(pairs, &base_pairs, dir.metadata.?);
-    }
-
-    const dir_bytes = try dict_mod.serializeDir(allocator, pairs);
-    try to_free.append(allocator, dir_bytes);
-    return dir_bytes;
-}
-
-/// Merge base pairs and metadata pairs into sorted order (canonical key order).
-fn mergePairs(output: []dict_mod.KeyValue, base: []const dict_mod.KeyValue, meta: []const dict_mod.KeyValue) void {
-    var bi: usize = 0;
-    var mi: usize = 0;
-    var pi: usize = 0;
-
-    while (bi < base.len and mi < meta.len) {
-        const base_key_bytes = dict_mod.extractKeyBytes(base[bi].key) catch unreachable;
-        const meta_key_bytes = dict_mod.extractKeyBytes(meta[mi].key) catch unreachable;
-        const ord = std.mem.order(u8, base_key_bytes, meta_key_bytes);
-        if (ord == .lt or ord == .eq) {
-            output[pi] = base[bi];
-            bi += 1;
-        } else {
-            output[pi] = meta[mi];
-            mi += 1;
-        }
-        pi += 1;
-    }
-    while (bi < base.len) {
-        output[pi] = base[bi];
-        bi += 1;
-        pi += 1;
-    }
-    while (mi < meta.len) {
-        output[pi] = meta[mi];
-        mi += 1;
-        pi += 1;
-    }
-}
-
-/// Reader for a miniBLIP archive.
+/// Reader for a BLIP archive. Handles both ARRAY-based FILE and DICT-based DIR entries.
 pub const ArchiveReader = struct {
     buf: []const u8,
     outer: array_mod.ArrayReader,
 
-    /// Parse a miniBLIP archive from a buffer.
+    /// Parse a BLIP archive from a buffer.
     pub fn init(buf: []const u8) ContainerError!ArchiveReader {
         const outer = try array_mod.ArrayReader.init(buf);
         return ArchiveReader{
@@ -353,7 +525,6 @@ pub const ArchiveReader = struct {
     }
 
     /// Verify the magic bytes at element 0.
-    /// Returns true if element 0 is RAW("BLIP\x01").
     pub fn verifyMagic(self: ArchiveReader) ContainerError!bool {
         if (self.outer.elementCount() < 1) return false;
         const view = try self.outer.elementAt(0);
@@ -362,12 +533,10 @@ pub const ArchiveReader = struct {
         return std.mem.eql(u8, value, MAGIC);
     }
 
-    /// Returns the number of files in the archive.
-    pub fn fileCount(self: ArchiveReader) ContainerError!u64 {
+    /// Returns the number of entries in the archive.
+    pub fn entryCount(self: ArchiveReader) ContainerError!u64 {
         if (self.outer.elementCount() < 2) return 0;
         const body_view = try self.outer.elementAt(1);
-        // body_view gives us a ContainerView; we need to init an ArrayReader on it.
-        // The buf in body_view starts at the body's position in the outer buffer.
         const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
         const body_end = body_start + @as(usize, @intCast(body_view.total_length));
         const body_buf = self.buf[body_start..body_end];
@@ -375,57 +544,12 @@ pub const ArchiveReader = struct {
         return body_reader.elementCount();
     }
 
-    /// Get a DictReader for the file at the given index in the body array.
-    pub fn fileAt(self: ArchiveReader, index: u64) ContainerError!dict_mod.DictReader {
-        const body_view = try self.outer.elementAt(1);
-        const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const body_end = body_start + @as(usize, @intCast(body_view.total_length));
-        const body_buf = self.buf[body_start..body_end];
-        const body_reader = try array_mod.ArrayReader.init(body_buf);
-
-        const file_view = try body_reader.elementAt(index);
-        const file_start = @intFromPtr(file_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const file_end = file_start + @as(usize, @intCast(file_view.total_length));
-        const file_buf = self.buf[file_start..file_end];
-        return dict_mod.DictReader.init(file_buf);
+    /// Alias for entryCount.
+    pub fn fileCount(self: ArchiveReader) ContainerError!u64 {
+        return self.entryCount();
     }
 
-    /// Verify the outer array's xxHash64 integrity check.
-    pub fn verifyHash(self: ArchiveReader) ContainerError!bool {
-        return self.outer.verifyHash();
-    }
-
-    /// Find a file by its path. Returns a DictReader for the matching FILE, or null.
-    pub fn findFile(self: ArchiveReader, path: []const u8) ContainerError!?dict_mod.DictReader {
-        const count = try self.fileCount();
-        for (0..count) |i| {
-            const file_reader = try self.fileAt(i);
-            // Look for "path" key
-            const path_idx = try file_reader.findKey("path");
-            if (path_idx) |idx| {
-                const path_val_container = try file_reader.valueAt(idx);
-                const path_val = try leaf.readUtf8(path_val_container);
-                if (std.mem.eql(u8, path_val, path)) {
-                    return file_reader;
-                }
-            }
-        }
-        return null;
-    }
-
-    /// Returns the total number of entries (files + directories) in the archive.
-    /// Alias for fileCount() since the body array stores both FILE and DIR entries.
-    pub fn entryCount(self: ArchiveReader) ContainerError!u64 {
-        return self.fileCount();
-    }
-
-    /// Get a DictReader for the entry (FILE or DIR) at the given index.
-    /// Alias for fileAt() since DictReader handles both types.
-    pub fn entryAt(self: ArchiveReader, index: u64) ContainerError!dict_mod.DictReader {
-        return self.fileAt(index);
-    }
-
-    /// Get the container type (FILE or DIR) of the entry at the given index.
+    /// Get the container type of an entry at the given index.
     pub fn entryTypeAt(self: ArchiveReader, index: u64) ContainerError!ct.ContainerType {
         const body_view = try self.outer.elementAt(1);
         const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
@@ -435,6 +559,118 @@ pub const ArchiveReader = struct {
 
         const entry_view = try body_reader.elementAt(index);
         return entry_view.container_type;
+    }
+
+    /// Get raw bytes of the entry at the given index.
+    fn entryBufAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
+        const body_view = try self.outer.elementAt(1);
+        const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
+        const body_end = body_start + @as(usize, @intCast(body_view.total_length));
+        const body_buf = self.buf[body_start..body_end];
+        const body_reader = try array_mod.ArrayReader.init(body_buf);
+
+        const entry_view = try body_reader.elementAt(index);
+        const entry_start = @intFromPtr(entry_view.buf.ptr) - @intFromPtr(self.buf.ptr);
+        const entry_end = entry_start + @as(usize, @intCast(entry_view.total_length));
+        return self.buf[entry_start..entry_end];
+    }
+
+    /// For FILE entries (ARRAY-based): get an ArrayReader for the entry.
+    pub fn fileArrayAt(self: ArchiveReader, index: u64) ContainerError!array_mod.ArrayReader {
+        const entry_buf = try self.entryBufAt(index);
+        return array_mod.ArrayReader.init(entry_buf);
+    }
+
+    /// For DIR entries (DICT-based): get a DictReader for the entry.
+    pub fn dirDictAt(self: ArchiveReader, index: u64) ContainerError!dict_mod.DictReader {
+        const entry_buf = try self.entryBufAt(index);
+        return dict_mod.DictReader.init(entry_buf);
+    }
+
+    /// For backward compat: get a DictReader. Only works for DIR entries now.
+    pub fn entryAt(self: ArchiveReader, index: u64) ContainerError!dict_mod.DictReader {
+        return self.dirDictAt(index);
+    }
+
+    /// For backward compat: alias for entryAt. Only works for DIR entries.
+    pub fn fileAt(self: ArchiveReader, index: u64) ContainerError!dict_mod.DictReader {
+        return self.dirDictAt(index);
+    }
+
+    /// Get the path of an entry at the given index.
+    /// Works for both FILE (ARRAY-based) and DIR (DICT-based) entries.
+    pub fn entryPathAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
+        const entry_type = try self.entryTypeAt(index);
+        if (entry_type == .file) {
+            // FILE: ARRAY[0] is metadata DICT, look for "pa" key
+            const arr = try self.fileArrayAt(index);
+            const meta_view = try arr.elementAt(0);
+            const meta_start = @intFromPtr(meta_view.buf.ptr) - @intFromPtr(self.buf.ptr);
+            const meta_end = meta_start + @as(usize, @intCast(meta_view.total_length));
+            const meta_buf = self.buf[meta_start..meta_end];
+            const meta_reader = try dict_mod.DictReader.init(meta_buf);
+            const pa_idx = (try meta_reader.findKey("pa")) orelse return ContainerError.MissingRequiredKey;
+            const pa_container = try meta_reader.valueAt(pa_idx);
+            return leaf.readUtf8(pa_container);
+        } else {
+            // DIR: DICT with "pa" key
+            const dict_reader = try self.dirDictAt(index);
+            const pa_idx = (try dict_reader.findKey("pa")) orelse return ContainerError.MissingRequiredKey;
+            const pa_container = try dict_reader.valueAt(pa_idx);
+            return leaf.readUtf8(pa_container);
+        }
+    }
+
+    /// Get the content of a FILE entry at the given index.
+    /// Reads the DATA container (element 1 of the FILE ARRAY) and returns data minus hash.
+    pub fn fileContentAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
+        const arr = try self.fileArrayAt(index);
+        const data_view = try arr.elementAt(1);
+        const data_start = @intFromPtr(data_view.buf.ptr) - @intFromPtr(self.buf.ptr);
+        const data_end = data_start + @as(usize, @intCast(data_view.total_length));
+        const data_buf = self.buf[data_start..data_end];
+        return data_mod.readDataContent(data_buf);
+    }
+
+    /// Verify a FILE entry's DATA hash and ARRAY hash.
+    pub fn verifyFileAt(self: ArchiveReader, index: u64) ContainerError!bool {
+        const entry_buf = try self.entryBufAt(index);
+        const entry_type = try self.entryTypeAt(index);
+
+        if (entry_type == .dir) {
+            // For DIR entries, verify the container hash
+            const dict_reader = try dict_mod.DictReader.init(entry_buf);
+            return dict_reader.verifyHash();
+        }
+
+        // FILE: verify both ARRAY hash and DATA hash
+        const arr = try array_mod.ArrayReader.init(entry_buf);
+        const arr_hash_ok = try arr.verifyHash();
+        if (!arr_hash_ok) return false;
+
+        // Verify the DATA container's embedded hash
+        const data_view = try arr.elementAt(1);
+        const data_start = @intFromPtr(data_view.buf.ptr) - @intFromPtr(self.buf.ptr);
+        const data_end = data_start + @as(usize, @intCast(data_view.total_length));
+        const data_buf = self.buf[data_start..data_end];
+        return data_mod.verifyDataHash(data_buf);
+    }
+
+    /// Verify the outer array's xxHash64 integrity check.
+    pub fn verifyHash(self: ArchiveReader) ContainerError!bool {
+        return self.outer.verifyHash();
+    }
+
+    /// Find a file by its path.
+    pub fn findFile(self: ArchiveReader, path: []const u8) ContainerError!?u64 {
+        const count = try self.entryCount();
+        for (0..count) |i| {
+            const entry_path = try self.entryPathAt(i);
+            if (std.mem.eql(u8, entry_path, path)) {
+                return i;
+            }
+        }
+        return null;
     }
 };
 
@@ -454,10 +690,10 @@ test "empty archive (0 files) creates valid archive with magic + empty body" {
     try testing.expect(try reader.verifyHash());
 }
 
-test "single file archive round-trip" {
+test "single file archive round-trip with ARRAY-based FILE" {
     const allocator = testing.allocator;
     const files = [_]FileEntry{
-        .{ .path = "hello.txt", .content = "Hello, world!\n", .metadata = null },
+        .{ .path = "hello.txt", .content = "Hello, world!\n", .mode = 0o644, .mtime_ns = 1000000 },
     };
     const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
@@ -467,24 +703,27 @@ test "single file archive round-trip" {
     try testing.expectEqual(@as(u64, 1), try reader.fileCount());
     try testing.expect(try reader.verifyHash());
 
-    // Read back file
-    const file_reader = try reader.fileAt(0);
-    const path_idx = (try file_reader.findKey("path")).?;
-    const path_val = try leaf.readUtf8(try file_reader.valueAt(path_idx));
-    try testing.expectEqualSlices(u8, "hello.txt", path_val);
+    // Verify entry type is FILE
+    try testing.expectEqual(ContainerType.file, try reader.entryTypeAt(0));
 
-    const bina_idx = (try file_reader.findKey("bina")).?;
-    const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-    try testing.expectEqualSlices(u8, "Hello, world!\n", bina_val);
+    // Read back path
+    const path = try reader.entryPathAt(0);
+    try testing.expectEqualSlices(u8, "hello.txt", path);
+
+    // Read back content
+    const content = try reader.fileContentAt(0);
+    try testing.expectEqualSlices(u8, "Hello, world!\n", content);
+
+    // Verify hashes
+    try testing.expect(try reader.verifyFileAt(0));
 }
 
-test "multi-file archive (3 files) path sorting" {
+test "multi-file archive: path sorting preserved" {
     const allocator = testing.allocator;
-    // Add files out of order; they should be sorted by path in the archive
     const files = [_]FileEntry{
-        .{ .path = "src/c.zig", .content = "c content", .metadata = null },
-        .{ .path = "src/a.zig", .content = "a content", .metadata = null },
-        .{ .path = "src/b.zig", .content = "b content", .metadata = null },
+        .{ .path = "src/c.zig", .content = "c content" },
+        .{ .path = "src/a.zig", .content = "a content" },
+        .{ .path = "src/b.zig", .content = "b content" },
     };
     const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
@@ -493,332 +732,93 @@ test "multi-file archive (3 files) path sorting" {
     try testing.expectEqual(@as(u64, 3), try reader.fileCount());
 
     // Verify sorted order: a, b, c
-    const expected_paths = [_][]const u8{ "src/a.zig", "src/b.zig", "src/c.zig" };
-    const expected_contents = [_][]const u8{ "a content", "b content", "c content" };
+    try testing.expectEqualSlices(u8, "src/a.zig", try reader.entryPathAt(0));
+    try testing.expectEqualSlices(u8, "src/b.zig", try reader.entryPathAt(1));
+    try testing.expectEqualSlices(u8, "src/c.zig", try reader.entryPathAt(2));
 
-    for (expected_paths, expected_contents, 0..) |expected_path, expected_content, i| {
-        const file_reader = try reader.fileAt(i);
-        const path_idx = (try file_reader.findKey("path")).?;
-        const path_val = try leaf.readUtf8(try file_reader.valueAt(path_idx));
-        try testing.expectEqualSlices(u8, expected_path, path_val);
-
-        const bina_idx = (try file_reader.findKey("bina")).?;
-        const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-        try testing.expectEqualSlices(u8, expected_content, bina_val);
-    }
+    try testing.expectEqualSlices(u8, "a content", try reader.fileContentAt(0));
+    try testing.expectEqualSlices(u8, "b content", try reader.fileContentAt(1));
+    try testing.expectEqualSlices(u8, "c content", try reader.fileContentAt(2));
 }
 
-test "round-trip: createArchive -> ArchiveReader -> extract each file" {
+test "FILE contains dual checksums: DATA hash + ARRAY hash" {
     const allocator = testing.allocator;
     const files = [_]FileEntry{
-        .{ .path = "README.md", .content = "# Hello", .metadata = null },
-        .{ .path = "src/main.zig", .content = "pub fn main() void {}", .metadata = null },
+        .{ .path = "test.txt", .content = "test content", .mode = 0o644 },
     };
     const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
-    try testing.expectEqual(@as(u64, 2), try reader.fileCount());
-
-    // Files should be sorted: "README.md" < "src/main.zig"
-    {
-        const fr = try reader.fileAt(0);
-        const path_idx = (try fr.findKey("path")).?;
-        try testing.expectEqualSlices(u8, "README.md", try leaf.readUtf8(try fr.valueAt(path_idx)));
-        const bina_idx = (try fr.findKey("bina")).?;
-        try testing.expectEqualSlices(u8, "# Hello", try leaf.readRaw(try fr.valueAt(bina_idx)));
-    }
-    {
-        const fr = try reader.fileAt(1);
-        const path_idx = (try fr.findKey("path")).?;
-        try testing.expectEqualSlices(u8, "src/main.zig", try leaf.readUtf8(try fr.valueAt(path_idx)));
-        const bina_idx = (try fr.findKey("bina")).?;
-        try testing.expectEqualSlices(u8, "pub fn main() void {}", try leaf.readRaw(try fr.valueAt(bina_idx)));
-    }
-}
-
-test "verifyMagic on valid archive returns true" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{};
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyMagic());
-}
-
-test "verifyHash on valid archive returns true" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{
-        .{ .path = "test.txt", .content = "test content", .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyHash());
-}
-
-test "findFile by path returns correct DictReader" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{
-        .{ .path = "alpha.txt", .content = "alpha data", .metadata = null },
-        .{ .path = "beta.txt", .content = "beta data", .metadata = null },
-        .{ .path = "gamma.txt", .content = "gamma data", .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    const found = (try reader.findFile("beta.txt")).?;
-    const bina_idx = (try found.findKey("bina")).?;
-    const bina_val = try leaf.readRaw(try found.valueAt(bina_idx));
-    try testing.expectEqualSlices(u8, "beta data", bina_val);
-}
-
-test "findFile nonexistent path returns null" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{
-        .{ .path = "exists.txt", .content = "data", .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    const found = try reader.findFile("nonexistent.txt");
-    try testing.expectEqual(@as(?dict_mod.DictReader, null), found);
-}
-
-test "file content xxHash64 matches stored xh64 value" {
-    const allocator = testing.allocator;
-    const content = "The quick brown fox jumps over the lazy dog";
-    const files = [_]FileEntry{
-        .{ .path = "fox.txt", .content = content, .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    const file_reader = try reader.fileAt(0);
-
-    // Extract stored xh64 value
-    const xh64_idx = (try file_reader.findKey("xh64")).?;
-    const xh64_val = try leaf.readRaw(try file_reader.valueAt(xh64_idx));
-    try testing.expectEqual(@as(usize, 8), xh64_val.len);
-    const stored_hash = std.mem.readInt(u64, xh64_val[0..8], .little);
-
-    // Compute expected hash
-    const expected_hash = XxHash64.hash(0, content);
-    try testing.expectEqual(expected_hash, stored_hash);
-
-    // Also verify by extracting the content and re-hashing
-    const bina_idx = (try file_reader.findKey("bina")).?;
-    const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-    const recomputed_hash = XxHash64.hash(0, bina_val);
-    try testing.expectEqual(stored_hash, recomputed_hash);
-}
-
-test "archive with metadata preserves extra key-value pairs" {
-    const allocator = testing.allocator;
-
-    // Create metadata: "mode" key with a RAW value
-    // "mode" sorts between "bina" and "path" canonically: "bina" < "mode" < "path" < "xh64"
-    const meta_key = try leaf.serializeUtf8(allocator, "mode");
-    defer allocator.free(meta_key);
-    const meta_val = try leaf.serializeRaw(allocator, &[_]u8{ 0x01, 0xA4 }); // 0o644
-    defer allocator.free(meta_val);
-
-    const metadata = [_]dict_mod.KeyValue{
-        .{ .key = meta_key, .value = meta_val },
-    };
-
-    const files = [_]FileEntry{
-        .{ .path = "script.sh", .content = "#!/bin/bash\n", .metadata = &metadata },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    const file_reader = try reader.fileAt(0);
-
-    // Should have 4 pairs: bina, mode, path, xh64
-    try testing.expectEqual(@as(u64, 4), file_reader.pairCount());
-
-    // Verify metadata is present
-    const mode_idx = (try file_reader.findKey("mode")).?;
-    const mode_val = try leaf.readRaw(try file_reader.valueAt(mode_idx));
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0xA4 }, mode_val);
-
-    // Verify required keys still work
-    try testing.expect((try file_reader.findKey("bina")) != null);
-    try testing.expect((try file_reader.findKey("path")) != null);
-    try testing.expect((try file_reader.findKey("xh64")) != null);
-}
-
-test "multiple files with same prefix sorted correctly" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{
-        .{ .path = "src/b.zig", .content = "b", .metadata = null },
-        .{ .path = "src/a.zig", .content = "a", .metadata = null },
-        .{ .path = "src/ab.zig", .content = "ab", .metadata = null },
-        .{ .path = "src/aa.zig", .content = "aa", .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    try testing.expectEqual(@as(u64, 4), try reader.fileCount());
-
-    // Expected canonical byte order: "src/a.zig" < "src/aa.zig" < "src/ab.zig" < "src/b.zig"
-    const expected_paths = [_][]const u8{ "src/a.zig", "src/aa.zig", "src/ab.zig", "src/b.zig" };
-    const expected_contents = [_][]const u8{ "a", "aa", "ab", "b" };
-
-    for (expected_paths, expected_contents, 0..) |expected_path, expected_content, i| {
-        const file_reader = try reader.fileAt(i);
-        const path_idx = (try file_reader.findKey("path")).?;
-        const path_val = try leaf.readUtf8(try file_reader.valueAt(path_idx));
-        try testing.expectEqualSlices(u8, expected_path, path_val);
-
-        const bina_idx = (try file_reader.findKey("bina")).?;
-        const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-        try testing.expectEqualSlices(u8, expected_content, bina_val);
-    }
+    try testing.expect(try reader.verifyFileAt(0));
 }
 
 test "archive with empty file content" {
     const allocator = testing.allocator;
     const files = [_]FileEntry{
-        .{ .path = "empty.txt", .content = "", .metadata = null },
+        .{ .path = "empty.txt", .content = "" },
     };
     const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyMagic());
     try testing.expectEqual(@as(u64, 1), try reader.fileCount());
 
-    const file_reader = try reader.fileAt(0);
-    const bina_idx = (try file_reader.findKey("bina")).?;
-    const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-    try testing.expectEqual(@as(usize, 0), bina_val.len);
-
-    // Empty content hash should be xxHash64 of empty input
-    const xh64_idx = (try file_reader.findKey("xh64")).?;
-    const xh64_val = try leaf.readRaw(try file_reader.valueAt(xh64_idx));
-    const stored_hash = std.mem.readInt(u64, xh64_val[0..8], .little);
-    const expected_hash = XxHash64.hash(0, "");
-    try testing.expectEqual(expected_hash, stored_hash);
+    const content = try reader.fileContentAt(0);
+    try testing.expectEqual(@as(usize, 0), content.len);
+    try testing.expect(try reader.verifyFileAt(0));
 }
 
-test "archive with large file content" {
-    const allocator = testing.allocator;
-
-    // Create a 10KB content buffer
-    const content = try allocator.alloc(u8, 10240);
-    defer allocator.free(content);
-    for (content, 0..) |*byte, i| {
-        byte.* = @intCast(i % 256);
-    }
-
-    const files = [_]FileEntry{
-        .{ .path = "big.bin", .content = content, .metadata = null },
-    };
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyMagic());
-    try testing.expect(try reader.verifyHash());
-    try testing.expectEqual(@as(u64, 1), try reader.fileCount());
-
-    // Verify content round-trips
-    const file_reader = try reader.fileAt(0);
-    const bina_idx = (try file_reader.findKey("bina")).?;
-    const bina_val = try leaf.readRaw(try file_reader.valueAt(bina_idx));
-    try testing.expectEqualSlices(u8, content, bina_val);
-}
-
-test "findFile on empty archive returns null" {
-    const allocator = testing.allocator;
-    const files = [_]FileEntry{};
-    const archive = try createArchive(allocator, &files);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    const found = try reader.findFile("anything.txt");
-    try testing.expectEqual(@as(?dict_mod.DictReader, null), found);
-}
-
-test "outer array element count is 2 (magic + body)" {
+test "findFile by path returns correct index" {
     const allocator = testing.allocator;
     const files = [_]FileEntry{
-        .{ .path = "test.txt", .content = "data", .metadata = null },
+        .{ .path = "alpha.txt", .content = "alpha data" },
+        .{ .path = "beta.txt", .content = "beta data" },
+        .{ .path = "gamma.txt", .content = "gamma data" },
     };
     const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
-    try testing.expectEqual(@as(u64, 2), reader.outer.elementCount());
+    const idx = (try reader.findFile("beta.txt")).?;
+    try testing.expectEqual(@as(u64, 1), idx);
+    try testing.expectEqualSlices(u8, "beta data", try reader.fileContentAt(idx));
+
+    // Not found
+    try testing.expectEqual(@as(?u64, null), try reader.findFile("nonexistent.txt"));
 }
 
-// =============================================================================
-// Full archive tests (DIR + FILE mixed)
-// =============================================================================
-
-test "full archive with DIR + FILE entries round-trips correctly" {
-    const allocator = testing.allocator;
-
-    // Create a simple directory + file archive
-    const file_entries = [_]ArchiveEntry{
-        .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .metadata = null } },
-        .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .metadata = null } },
-    };
-    const archive = try createFullArchive(allocator, &file_entries);
-    defer allocator.free(archive);
-
-    const reader = try ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyMagic());
-    try testing.expect(try reader.verifyHash());
-
-    // Should have 2 entries total
-    try testing.expectEqual(@as(u64, 2), try reader.entryCount());
-}
-
-test "entryTypeAt returns correct type for FILE vs DIR entries" {
+test "full archive with DIR + FILE entries round-trips" {
     const allocator = testing.allocator;
 
     const entries = [_]ArchiveEntry{
-        .{ .dir = .{ .path = "mydir", .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .metadata = null } },
-        .{ .file = .{ .path = "mydir/file.txt", .content = "hello", .metadata = null } },
+        .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
+        .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
     };
     const archive = try createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
+    try testing.expect(try reader.verifyMagic());
+    try testing.expect(try reader.verifyHash());
+    try testing.expectEqual(@as(u64, 2), try reader.entryCount());
 
-    // Entries sorted by path: "mydir" (dir) < "mydir/file.txt" (file)
+    // Entries sorted: "src" < "src/main.zig"
     try testing.expectEqual(ContainerType.dir, try reader.entryTypeAt(0));
     try testing.expectEqual(ContainerType.file, try reader.entryTypeAt(1));
+
+    try testing.expectEqualSlices(u8, "src", try reader.entryPathAt(0));
+    try testing.expectEqualSlices(u8, "src/main.zig", try reader.entryPathAt(1));
 }
 
-test "Merkle hash computed correctly for DIR entries" {
-    const allocator = testing.allocator;
-
-    // Two files under one directory
-    const file_a = ArchiveEntry{ .file = .{ .path = "root/a.txt", .content = "aaa", .metadata = null } };
-    const file_b = ArchiveEntry{ .file = .{ .path = "root/b.txt", .content = "bbb", .metadata = null } };
-
-    // Manually compute what the Merkle hash should be:
-    // xh64 of "aaa" and "bbb", sorted by path, concatenated, then xxHash64
+test "Merkle hash computation" {
     const hash_a = XxHash64.hash(0, "aaa");
     const hash_b = XxHash64.hash(0, "bbb");
     var concat: [16]u8 = undefined;
-    // sorted: "root/a.txt" < "root/b.txt", so hash_a first
     std.mem.writeInt(u64, concat[0..8], hash_a, .little);
     std.mem.writeInt(u64, concat[8..16], hash_b, .little);
     const expected_merkle = XxHash64.hash(0, &concat);
 
-    // Use computeMerkleHash to verify
     const child_hashes = [_][8]u8{
         blk: {
             var h: [8]u8 = undefined;
@@ -834,42 +834,150 @@ test "Merkle hash computed correctly for DIR entries" {
     const merkle = computeMerkleHash(&child_hashes);
     const merkle_u64: u64 = std.mem.readInt(u64, &merkle, .little);
     try testing.expectEqual(expected_merkle, merkle_u64);
+}
 
-    // Also test via full archive creation
-    const dir_entry = ArchiveEntry{ .dir = .{ .path = "root", .xh64 = merkle, .metadata = null } };
-    const all_entries = [_]ArchiveEntry{ dir_entry, file_a, file_b };
-    const archive = try createFullArchive(allocator, &all_entries);
+test "archive with large file content" {
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(u8, 10240);
+    defer allocator.free(content);
+    for (content, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+
+    const files = [_]FileEntry{
+        .{ .path = "big.bin", .content = content },
+    };
+    const archive = try createArchive(allocator, &files);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
+    try testing.expect(try reader.verifyMagic());
     try testing.expect(try reader.verifyHash());
-    try testing.expectEqual(@as(u64, 3), try reader.entryCount());
+    try testing.expectEqual(@as(u64, 1), try reader.fileCount());
+
+    const roundtrip = try reader.fileContentAt(0);
+    try testing.expectEqualSlices(u8, content, roundtrip);
+    try testing.expect(try reader.verifyFileAt(0));
 }
 
-test "DIR entries sorted alongside FILE entries by path" {
+test "FILE metadata round-trip: mode, mtime, username" {
+    const allocator = testing.allocator;
+
+    const files = [_]FileEntry{
+        .{
+            .path = "script.sh",
+            .content = "#!/bin/bash\n",
+            .mode = 0o755,
+            .mtime_ns = 1708787200_000_000_000,
+            .username = "peter",
+        },
+    };
+    const archive = try createArchive(allocator, &files);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+    const arr = try reader.fileArrayAt(0);
+
+    // Element 0 is metadata DICT
+    const meta_view = try arr.elementAt(0);
+    try testing.expectEqual(ContainerType.dict, meta_view.container_type);
+
+    // Parse metadata dict
+    const buf = reader.buf;
+    const meta_start = @intFromPtr(meta_view.buf.ptr) - @intFromPtr(buf.ptr);
+    const meta_end = meta_start + @as(usize, @intCast(meta_view.total_length));
+    const meta_buf = buf[meta_start..meta_end];
+    const meta_reader = try dict_mod.DictReader.init(meta_buf);
+
+    // Verify md (mode)
+    const md_idx = (try meta_reader.findKey("md")).?;
+    const md_val = try leaf.readRaw(try meta_reader.valueAt(md_idx));
+    try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, md_val[0..2], .little));
+
+    // Verify mt (mtime)
+    const mt_idx = (try meta_reader.findKey("mt")).?;
+    const mt_val = try leaf.readRaw(try meta_reader.valueAt(mt_idx));
+    try testing.expectEqual(@as(i64, 1708787200_000_000_000), std.mem.readInt(i64, mt_val[0..8], .little));
+
+    // Verify pa (path)
+    const pa_idx = (try meta_reader.findKey("pa")).?;
+    const pa_val = try leaf.readUtf8(try meta_reader.valueAt(pa_idx));
+    try testing.expectEqualSlices(u8, "script.sh", pa_val);
+
+    // Verify un (username)
+    const un_idx = (try meta_reader.findKey("un")).?;
+    const un_val = try leaf.readUtf8(try meta_reader.valueAt(un_idx));
+    try testing.expectEqualSlices(u8, "peter", un_val);
+}
+
+test "DIR metadata round-trip with 2-char keys" {
     const allocator = testing.allocator;
 
     const entries = [_]ArchiveEntry{
-        .{ .file = .{ .path = "z.txt", .content = "z", .metadata = null } },
-        .{ .dir = .{ .path = "a_dir", .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .metadata = null } },
-        .{ .file = .{ .path = "b.txt", .content = "b", .metadata = null } },
+        .{ .dir = .{
+            .path = "mydir",
+            .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 },
+            .mode = 0o755,
+            .mtime_ns = 1708787200_000_000_000,
+            .username = "peter",
+        } },
     };
     const archive = try createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
-    try testing.expectEqual(@as(u64, 3), try reader.entryCount());
+    const dict_reader = try reader.dirDictAt(0);
+    try testing.expect(try dict_reader.verifyHash());
 
-    // Should be sorted: "a_dir" < "b.txt" < "z.txt"
-    const entry0 = try reader.entryAt(0);
-    const path0_idx = (try entry0.findKey("path")).?;
-    try testing.expectEqualSlices(u8, "a_dir", try leaf.readUtf8(try entry0.valueAt(path0_idx)));
+    // Verify 2-char keys
+    const pa_idx = (try dict_reader.findKey("pa")).?;
+    try testing.expectEqualSlices(u8, "mydir", try leaf.readUtf8(try dict_reader.valueAt(pa_idx)));
 
-    const entry1 = try reader.entryAt(1);
-    const path1_idx = (try entry1.findKey("path")).?;
-    try testing.expectEqualSlices(u8, "b.txt", try leaf.readUtf8(try entry1.valueAt(path1_idx)));
+    const md_idx = (try dict_reader.findKey("md")).?;
+    const md_val = try leaf.readRaw(try dict_reader.valueAt(md_idx));
+    try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, md_val[0..2], .little));
 
-    const entry2 = try reader.entryAt(2);
-    const path2_idx = (try entry2.findKey("path")).?;
-    try testing.expectEqualSlices(u8, "z.txt", try leaf.readUtf8(try entry2.valueAt(path2_idx)));
+    const xh_idx = (try dict_reader.findKey("xh")).?;
+    const xh_val = try leaf.readRaw(try dict_reader.valueAt(xh_idx));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, xh_val);
+}
+
+test "FILE with xattrs creates forks DICT" {
+    const allocator = testing.allocator;
+
+    const files = [_]FileEntry{
+        .{
+            .path = "test.txt",
+            .content = "hello",
+            .mode = 0o644,
+            .xattrs = &[_]XattrEntry{
+                .{ .name = "user.comment", .value = "test xattr" },
+            },
+        },
+    };
+    const archive = try createArchive(allocator, &files);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+    const arr = try reader.fileArrayAt(0);
+
+    // Should have 3 elements: metadata DICT, DATA, forks DICT
+    try testing.expectEqual(@as(u64, 3), arr.elementCount());
+
+    // Element 2 should be a DICT
+    const forks_view = try arr.elementAt(2);
+    try testing.expectEqual(ContainerType.dict, forks_view.container_type);
+}
+
+test "outer array element count is 2 (magic + body)" {
+    const allocator = testing.allocator;
+    const files = [_]FileEntry{
+        .{ .path = "test.txt", .content = "data" },
+    };
+    const archive = try createArchive(allocator, &files);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+    try testing.expectEqual(@as(u64, 2), reader.outer.elementCount());
 }

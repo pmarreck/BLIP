@@ -12,6 +12,7 @@ pub const ContainerType = enum(u7) {
     file = 0x05,
     map = 0x06,
     dir = 0x07,
+    data = 0x08,
 };
 
 /// Sentinel byte constants for each container type.

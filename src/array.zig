@@ -10,11 +10,11 @@ const ContainerError = container.ContainerError;
 const ContainerType = ct.ContainerType;
 const XxHash64 = std.hash.XxHash64;
 
-/// Serialize an ordered array of pre-serialized container elements.
-/// Each element in `elements` must already be a complete TLV container (e.g.,
-/// the output of leaf.serializeUtf8, leaf.serializeRaw, or serializeArray).
+/// Serialize an ordered array of pre-serialized container elements with a specified container type sentinel.
+/// This is the generic implementation used by both ARRAY and FILE (ARRAY-layout) containers.
+/// Each element in `elements` must already be a complete TLV container.
 /// Caller owns returned memory.
-pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Allocator.Error || ContainerError)![]u8 {
+pub fn serializeArrayLike(allocator: Allocator, elements: []const []const u8, container_type: ContainerType) (Allocator.Error || ContainerError)![]u8 {
     const n: u64 = elements.len;
 
     // Compute total data size (sum of all element byte lengths)
@@ -75,8 +75,8 @@ pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Alloc
 
     var pos: usize = 0;
 
-    // Write type sentinel (ARRAY = 0x81 0x01)
-    const sentinel = ct.typeSentinel(.array);
+    // Write type sentinel
+    const sentinel = ct.typeSentinel(container_type);
     buf[pos] = sentinel[0];
     buf[pos + 1] = sentinel[1];
     pos += 2;
@@ -114,6 +114,14 @@ pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Alloc
     return buf;
 }
 
+/// Serialize an ordered array of pre-serialized container elements.
+/// Each element in `elements` must already be a complete TLV container (e.g.,
+/// the output of leaf.serializeUtf8, leaf.serializeRaw, or serializeArray).
+/// Caller owns returned memory.
+pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Allocator.Error || ContainerError)![]u8 {
+    return serializeArrayLike(allocator, elements, .array);
+}
+
 /// Reader for an ARRAY container. Provides random access to elements via the index.
 pub const ArrayReader = struct {
     buf: []const u8,
@@ -127,7 +135,7 @@ pub const ArrayReader = struct {
     pub fn init(buf: []const u8) ContainerError!ArrayReader {
         // Parse outer header: type + total_length
         const view = try container.parseHeader(buf);
-        if (view.container_type != .array) return ContainerError.InvalidContainerType;
+        if (view.container_type != .array and view.container_type != .file) return ContainerError.InvalidContainerType;
 
         const total_length = view.total_length;
         const value_start = view.value_offset;
@@ -658,6 +666,51 @@ test "deeply nested arrays" {
 
     const v3 = try r3.elementAt(0);
     try testing.expectEqual(ContainerType.array, v3.container_type);
+}
+
+test "serializeArrayLike with .file type produces FILE sentinel with ARRAY layout" {
+    const allocator = testing.allocator;
+    const elem = try leaf.serializeUtf8(allocator, "hello");
+    defer allocator.free(elem);
+
+    const elements = [_][]const u8{elem};
+    const result = try serializeArrayLike(allocator, &elements, .file);
+    defer allocator.free(result);
+
+    // Should start with FILE sentinel (0x81 0x05)
+    try testing.expectEqual(@as(u8, 0x81), result[0]);
+    try testing.expectEqual(@as(u8, 0x05), result[1]);
+
+    // ArrayReader should accept .file type and read elements correctly
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 1), reader.elementCount());
+    try testing.expect(try reader.verifyHash());
+
+    // Read back element
+    const view = try reader.elementAt(0);
+    try testing.expectEqual(ContainerType.utf8, view.container_type);
+    try testing.expectEqualSlices(u8, "hello", view.valueSlice());
+}
+
+test "serializeArrayLike with .file type multi-element round-trip" {
+    const allocator = testing.allocator;
+    const elem0 = try leaf.serializeUtf8(allocator, "metadata");
+    defer allocator.free(elem0);
+    const elem1 = try leaf.serializeRaw(allocator, "content");
+    defer allocator.free(elem1);
+
+    const elements = [_][]const u8{ elem0, elem1 };
+    const result = try serializeArrayLike(allocator, &elements, .file);
+    defer allocator.free(result);
+
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 2), reader.elementCount());
+    try testing.expect(try reader.verifyHash());
+
+    const v0 = try reader.elementAt(0);
+    try testing.expectEqualSlices(u8, "metadata", v0.valueSlice());
+    const v1 = try reader.elementAt(1);
+    try testing.expectEqualSlices(u8, "content", v1.valueSlice());
 }
 
 test "array total_length matches buffer length" {

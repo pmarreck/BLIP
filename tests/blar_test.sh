@@ -119,7 +119,9 @@ else
 fi
 
 # --------------- 8. Cat file content matches original ---------------
-CAT_OUT="$("$BLAR" cat "$ARCHIVE_ROUNDTRIP" "$TMPDIR_TEST/hello.txt" 2>/dev/null)"
+# Paths are now normalized (leading / stripped) in the archive
+NORM_PATH="${TMPDIR_TEST#/}/hello.txt"
+CAT_OUT="$("$BLAR" cat "$ARCHIVE_ROUNDTRIP" "$NORM_PATH" 2>/dev/null)"
 EXPECTED="$(cat "$TMPDIR_TEST/hello.txt")"
 if [[ "$CAT_OUT" == "$EXPECTED" ]]; then
   pass "cat file content matches original"
@@ -218,7 +220,8 @@ fi
 # --------------- 15. Binary content roundtrip ---------------
 ARCHIVE_BIN="$TMPDIR_TEST/binary.blip"
 "$BLAR" create -o "$ARCHIVE_BIN" "$TMPDIR_TEST/binary.dat" 2>/dev/null
-"$BLAR" cat "$ARCHIVE_BIN" "$TMPDIR_TEST/binary.dat" > "$TMPDIR_TEST/binary_out.dat" 2>/dev/null
+NORM_BIN="${TMPDIR_TEST#/}/binary.dat"
+"$BLAR" cat "$ARCHIVE_BIN" "$NORM_BIN" > "$TMPDIR_TEST/binary_out.dat" 2>/dev/null
 if diff -q "$TMPDIR_TEST/binary.dat" "$TMPDIR_TEST/binary_out.dat" >/dev/null 2>&1; then
   pass "binary content roundtrip (cat)"
 else
@@ -229,8 +232,8 @@ fi
 EXTRACT_BIN_DIR="$TMPDIR_TEST/bin_extracted"
 mkdir -p "$EXTRACT_BIN_DIR"
 "$BLAR" extract "$ARCHIVE_BIN" -C "$EXTRACT_BIN_DIR" 2>/dev/null
-# The extracted path mirrors the original absolute path stored in the archive
-BIN_EXTRACTED="$EXTRACT_BIN_DIR/$TMPDIR_TEST/binary.dat"
+# Paths are now normalized (leading / stripped), so extracted path is relative
+BIN_EXTRACTED="$EXTRACT_BIN_DIR/${TMPDIR_TEST#/}/binary.dat"
 if [[ -f "$BIN_EXTRACTED" ]] && diff -q "$TMPDIR_TEST/binary.dat" "$BIN_EXTRACTED" >/dev/null 2>&1; then
   pass "binary content roundtrip (extract)"
 else

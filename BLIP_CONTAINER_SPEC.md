@@ -3,7 +3,7 @@
 A recursive, typed, self-indexed binary container format built on [BLIP encoding](BLIP_SPEC.md). Designed as a compact, deterministic, integrity-verified alternative to tar and similar archive formats.
 
 **Author:** Peter Marreck
-**Version:** 1.1 (2026-02-23)
+**Version:** 1.2 (2026-02-24)
 **Depends on:** BLIP Spec v1.1
 
 ## Overview
@@ -22,12 +22,12 @@ The format provides:
 Every container follows this layout:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ Type:   BLIP sentinel (2 bytes: 0x81 + type byte)        │
-│ Length: BLIP integer (total container size in bytes,      │
+┌────────────────────────────────────────────────────────────┐
+│ Type:   BLIP sentinel (2 bytes: 0x81 + type byte)          │
+│ Length: BLIP integer (total container size in bytes,       │
 │         INCLUDING Type bytes + Length bytes + Value bytes) │
-│ Value:  payload (type-specific)                           │
-└──────────────────────────────────────────────────────────┘
+│ Value:  payload (type-specific)                            │
+└────────────────────────────────────────────────────────────┘
 ```
 
 **Total container size** = offset from container start to first byte past it. To skip a container during sequential parsing: `next = container_start + Length`.
@@ -55,10 +55,11 @@ Sentinel        Type            Description
 0x81 0x02       DICT            Sorted key-value pairs, indexed + hashed (deterministic)
 0x81 0x03       UTF8            UTF-8 string
 0x81 0x04       RAW             Raw binary data (untyped)
-0x81 0x05       FILE            Specialized sorted dictionary (required keys: path, xh64, bina)
+0x81 0x05       FILE            ARRAY-layout container (metadata DICT + DATA content + optional forks DICT)
 0x81 0x06       MAP             Unsorted key-value pairs, indexed + hashed (insertion order)
-0x81 0x07       DIR             Specialized sorted dictionary (required keys: path, xh64; no bina)
-0x81 0x08 - 0x81 0x0F          Reserved (future container types)
+0x81 0x07       DIR             Specialized sorted dictionary (2-char keys: pa, xh, md, mt, etc.)
+0x81 0x08       DATA            Checksummed binary data (raw bytes + embedded xxHash64)
+0x81 0x09 - 0x81 0x0F          Reserved (future container types)
 0x81 0x10 - 0x81 0x7F          Application-defined types
 ```
 
@@ -70,7 +71,7 @@ Offsets MAY be negative (signed two's complement) when pointing into a scratch p
 
 ## Key Ordering
 
-Dictionary (DICT), File (FILE), and Directory (DIR) containers store key-value pairs in a canonical sort order. Map (MAP) containers are exempt — they preserve insertion order. For DICT, FILE, and DIR, keys MUST be sorted in **lexicographic byte order** — the same ordering as `memcmp`.
+Dictionary (DICT) and Directory (DIR) containers store key-value pairs in a canonical sort order. Map (MAP) containers are exempt — they preserve insertion order. File (FILE) containers use ARRAY layout internally and contain a metadata DICT whose keys follow this same ordering. For DICT and DIR, keys MUST be sorted in **lexicographic byte order** — the same ordering as `memcmp`.
 
 **Rules:**
 1. Compare keys byte-by-byte using unsigned byte values (0x00 < 0x01 < ... < 0xFF)
@@ -80,21 +81,22 @@ Dictionary (DICT), File (FILE), and Directory (DIR) containers store key-value p
 
 **Examples (sorted):**
 ```
-"a"       (0x61)
-"aa"      (0x61 0x61)
-"ab"      (0x61 0x62)
-"b"       (0x62)
-"bina"    (0x62 0x69 0x6E 0x61)
-"mode"    (0x6D 0x6F 0x64 0x65)
-"mtime"   (0x6D 0x74 0x69 0x6D 0x65)
-"path"    (0x70 0x61 0x74 0x68)
-"xattr"   (0x78 0x61 0x74 0x74 0x72)
-"xh64"    (0x78 0x68 0x36 0x34)
+"bt"      (0x62 0x74)   birthtime
+"ct"      (0x63 0x74)   ctime
+"gi"      (0x67 0x69)   group ID
+"gn"      (0x67 0x6E)   group name
+"md"      (0x6D 0x64)   mode (permissions)
+"mt"      (0x6D 0x74)   mtime
+"pa"      (0x70 0x61)   path
+"ui"      (0x75 0x69)   user ID
+"un"      (0x75 0x6E)   username
+"xa"      (0x78 0x61)   xattrs (DIR only)
+"xh"      (0x78 0x68)   Merkle hash (DIR only)
 ```
 
 **Rationale:** Byte ordering is unambiguous, locale-independent, trivial to implement, and works identically for UTF8 and RAW keys. It also means that keys in the index section are in a known order, enabling binary search for key lookup in dictionaries with many keys.
 
-Encoders MUST emit key-value pairs in canonical key order for DICT, FILE, and DIR containers. Decoders SHOULD reject DICT/FILE/DIR containers with out-of-order keys as malformed. MAP containers are exempt from ordering requirements.
+Encoders MUST emit key-value pairs in canonical key order for DICT and DIR containers, and for the metadata DICT within FILE containers. Decoders SHOULD reject DICT/DIR containers with out-of-order keys as malformed. MAP containers are exempt from ordering requirements.
 
 ## Container Types
 
@@ -106,7 +108,7 @@ A UTF-8 encoded string. Value is the raw string bytes (no null terminator).
 ┌─────────────────────────────────────┐
 │ Type:   0x81 0x03                   │
 │ Length: BLIP(total)                 │
-│ Value:  raw UTF-8 bytes            │
+│ Value:  raw UTF-8 bytes             │
 └─────────────────────────────────────┘
 ```
 
@@ -125,7 +127,7 @@ Untyped binary data. Value is raw bytes.
 ┌─────────────────────────────────────┐
 │ Type:   0x81 0x04                   │
 │ Length: BLIP(total)                 │
-│ Value:  raw bytes                  │
+│ Value:  raw bytes                   │
 └─────────────────────────────────────┘
 ```
 
@@ -153,16 +155,16 @@ An ordered sequence of containers with a trailing index for random access and a 
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ INDEX SECTION (at index_offset from container start)     │   │
 │   │   Element count: BLIP(N)                                 │   │
-│   │   Offset 0: BLIP(off_0)  ← from array container start   │   │
-│   │   Offset 1: BLIP(off_1)                                 │   │
+│   │   Offset 0: BLIP(off_0)  ← from array container start    │   │
+│   │   Offset 1: BLIP(off_1)                                  │   │
 │   │   ...                                                    │   │
-│   │   Offset N-1: BLIP(off_N-1)                             │   │
+│   │   Offset N-1: BLIP(off_N-1)                              │   │
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ HASH: xxHash64 (8 bytes, fixed)                          │   │
-│   │   Hash of all bytes from array container start            │   │
-│   │   through end of INDEX SECTION (everything except         │   │
-│   │   these 8 hash bytes). These 8 bytes DO count             │   │
-│   │   towards the container's total Length.                    │   │
+│   │   Hash of all bytes from array container start           │   │
+│   │   through end of INDEX SECTION (everything except        │   │
+│   │   these 8 hash bytes). These 8 bytes DO count            │   │
+│   │   towards the container's total Length.                  │   │
 │   └──────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -216,14 +218,14 @@ A sorted collection of key-value pairs with a trailing index and hash. Keys must
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ INDEX SECTION                                            │   │
 │   │   Pair count: BLIP(N)                                    │   │
-│   │   Pair 0: BLIP(key_0) BLIP(val_0)                       │   │
-│   │   Pair 1: BLIP(key_1) BLIP(val_1)                       │   │
+│   │   Pair 0: BLIP(key_0) BLIP(val_0)                        │   │
+│   │   Pair 1: BLIP(key_1) BLIP(val_1)                        │   │
 │   │   ...                                                    │   │
-│   │   Pair N-1: BLIP(key_N-1) BLIP(val_N-1)                 │   │
-│   │   All offsets from dictionary container start.            │   │
+│   │   Pair N-1: BLIP(key_N-1) BLIP(val_N-1)                  │   │
+│   │   All offsets from dictionary container start.           │   │
 │   ├──────────────────────────────────────────────────────────┤   │
 │   │ HASH: xxHash64 (8 bytes)                                 │   │
-│   │   Same semantics as array hash.                           │   │
+│   │   Same semantics as array hash.                          │   │
 │   └──────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -242,39 +244,51 @@ Keys are either UTF8 (0x81 0x03) or RAW (0x81 0x04) containers. Keys MUST be uni
 
 ### Directory (0x81 0x07)
 
-A specialized dictionary representing a directory in an archive. Like FILE, has required keys but does NOT contain file content (`bina`).
+A specialized dictionary representing a directory in an archive. Uses 2-character lowercase key names for compactness.
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Type:    0x81 0x07                                         │
-│ Length:  BLIP(total)                                       │
-│ Value:   (dictionary structure — index, data, hash)        │
-│                                                            │
-│ Required keys:                                             │
-│   "path"  → UTF8: relative path, forward-slash separated,  │
-│              normalized, no leading slash, UTF-8            │
-│   "xh64"  → RAW: 8-byte Merkle hash (see below)           │
-│                                                            │
-│ Optional keys (examples):                                  │
-│   "mtime" → RAW: modification time (8-byte LE int64 ns)   │
-│   "mode"  → RAW: POSIX permissions (2-byte LE uint16)     │
-│   "owner" → UTF8: owner name                               │
-│                                                            │
-│ DIR containers follow dictionary layout (index + hash).    │
-│ DIR containers do NOT have a "bina" key.                   │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Type:    0x81 0x07                                            │
+│ Length:  BLIP(total)                                         │
+│ Value:   (dictionary structure — index, data, hash)           │
+│                                                              │
+│ Required keys: pa, xh                                        │
+│ Optional keys: bt, ct, gi, gn, md, mt, ui, un, xa           │
+│                                                              │
+│ DIR containers follow dictionary layout (index + hash).      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-**Merkle hash algorithm:** The `xh64` value for a DIR entry is a Merkle hash computed from its direct children:
+**DIR key table:**
 
-1. Collect the `xh64` values of all direct children (files and subdirectories) sorted by path
-2. Concatenate these 8-byte hashes in sorted-path order
-3. Compute `xxHash64(child_0_xh64 || child_1_xh64 || ... || child_N_xh64)` with seed 0
+| Key | Type | Description | Required? |
+|-----|------|-------------|-----------|
+| `bt` | RAW 8B i64 LE | birthtime / creation time (ns since epoch) | When available |
+| `ct` | RAW 8B i64 LE | ctime / inode change time (ns since epoch) | When available |
+| `gi` | RAW 4B u32 LE | Numeric group ID | When available |
+| `gn` | UTF8 | Group name string | When available |
+| `md` | RAW 2B u16 LE | POSIX permission bits | When available |
+| `mt` | RAW 8B i64 LE | mtime (ns since epoch) | When available |
+| `pa` | UTF8 | Relative path (normalized) | Required |
+| `ui` | RAW 4B u32 LE | Numeric user ID | When available |
+| `un` | UTF8 | Username string | When available |
+| `xa` | DICT | Extended attributes (xattr name → RAW value) | Optional |
+| `xh` | RAW 8B | Merkle hash | Required |
 
-This produces a bottom-up hash tree: leaf files have `xh64 = xxHash64(file_content)`, leaf directories (empty or containing only files) hash their children's xh64 values, and parent directories hash their children's (already-computed) xh64 values.
+**Merkle hash algorithm:** The `xh` value for a DIR entry is a Merkle hash computed from its direct children:
+
+1. Collect the trailing 8-byte xxHash64 from each direct child's container:
+   - For FILE children: the ARRAY hash (last 8 bytes of the FILE container)
+   - For DIR children: the DICT hash (last 8 bytes of the DIR container)
+2. Sort children by path
+3. Concatenate these 8-byte hashes in sorted-path order
+4. Compute `xxHash64(child_0_hash || child_1_hash || ... || child_N_hash)` with seed 0
+
+This produces a bottom-up hash tree where any change to a file's content OR metadata propagates up through all ancestor directory hashes to the root.
 
 **Merkle hash properties:**
-- Changing any file's content changes its xh64, which propagates up through all ancestor directory hashes to the root
+- Changing any file's content changes its DATA hash, which changes its FILE ARRAY hash, which propagates up through all ancestor directory Merkle hashes
+- Changing any file's metadata (permissions, mtime, etc.) also changes the FILE ARRAY hash and propagates up
 - Verifying the root directory's Merkle hash transitively verifies every file and subdirectory in the tree
 - Individual subtrees can be verified independently
 
@@ -287,7 +301,7 @@ An unsorted collection of key-value pairs with a trailing index and hash. Identi
 │ Type:    0x81 0x06                                               │
 │ Length:  BLIP(total)                                             │
 │ Value:   (same layout as Dictionary — index offset, data,        │
-│           index section, xxHash64)                                │
+│           index section, xxHash64)                               │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -303,32 +317,68 @@ An unsorted collection of key-value pairs with a trailing index and hash. Identi
 
 Keys in a MAP MUST still be unique — duplicate keys are a format error regardless of container type.
 
+### Data (0x81 0x08)
+
+Checksummed binary data: raw bytes with an embedded xxHash64 suffix for content integrity verification.
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Type:   0x81 0x08                                    │
+│ Length: BLIP(total)                                  │
+│ Value:  [data_bytes][xxHash64(data_bytes) 8B LE]     │
+└─────────────────────────────────────────────────────┘
+```
+
+- `data_len = value_len - 8`
+- The trailing 8 bytes are `xxHash64(data_bytes)` with seed 0, little-endian
+- Hash covers only the data bytes, NOT the type/length prefix
+- Empty content is valid: value = 8-byte hash of empty (hash of zero-length input)
+
+DATA containers provide content-only integrity checking. When used inside a FILE container, this gives two levels of checksumming for free: the DATA hash verifies content-only integrity, while the FILE's ARRAY hash verifies everything (metadata + content + forks).
+
 ### File (0x81 0x05)
 
-A specialized dictionary representing a file in an archive. Has required keys and allows arbitrary additional keys for metadata.
+A container representing a file in an archive. Uses ARRAY layout (like ARRAY 0x81 0x01) but with the FILE sentinel (0x81 0x05). Always contains 2 or 3 elements.
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Type:    0x81 0x05                                         │
-│ Length:  BLIP(total)                                       │
-│ Value:   (dictionary structure — index, data, hash)        │
-│                                                            │
-│ Required keys:                                             │
-│   "path"  → UTF8: relative path, forward-slash separated,  │
-│              normalized, no leading slash, UTF-8            │
-│   "xh64"  → RAW: 8-byte xxHash64 of the file content      │
-│   "bina"  → RAW: the file content bytes                    │
-│                                                            │
-│ Optional keys (examples):                                  │
-│   "mtime" → RAW: modification time (platform encoding)     │
-│   "mode"  → RAW: POSIX permissions                         │
-│   "owner" → UTF8: owner name                               │
-│   "xattr" → DICT: extended attributes                      │
-│   ...any UTF8 or RAW key with any container value...       │
-│                                                            │
-│ File containers follow dictionary layout (index + hash).   │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Type:    0x81 0x05                                               │
+│ Length:  BLIP(total)                                             │
+│ Value:   (ARRAY structure — index offset, data, index, hash)     │
+│                                                                  │
+│ Elements (ARRAY layout):                                         │
+│   [0]: DICT (0x81 0x02) — metadata                               │
+│        Required keys: pa, md, mt                                 │
+│        Optional keys: ct, bt, ui, gi, un, gn                    │
+│   [1]: DATA (0x81 0x08) — file content with embedded xxHash64    │
+│   [2]: DICT (0x81 0x02) — extended forks (optional)              │
+│        Keys: "rf" → RAW (resource fork), xattr names → RAW      │
+│                                                                  │
+│ Trailing INDEX + xxHash64 (covers everything including metadata) │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+**Two checksums for free:**
+- DATA hash (element 1) = content-only integrity
+- FILE ARRAY hash = everything (metadata + content + forks)
+
+No explicit content hash key needed — hashes are structural.
+
+**Metadata keys (element 0 DICT):**
+
+| Key | Type | Description | Required? |
+|-----|------|-------------|-----------|
+| `bt` | RAW 8B i64 LE | birthtime / creation time (ns since epoch) | When available |
+| `ct` | RAW 8B i64 LE | ctime / inode change time (ns since epoch) | When available (Unix) |
+| `gi` | RAW 4B u32 LE | Numeric group ID | When available |
+| `gn` | UTF8 | Group name string | When available |
+| `md` | RAW 2B u16 LE | POSIX permission bits | Required |
+| `mt` | RAW 8B i64 LE | mtime (ns since epoch) | Required |
+| `pa` | UTF8 | Relative path (normalized) | Required |
+| `ui` | RAW 4B u32 LE | Numeric user ID | When available |
+| `un` | UTF8 | Username string | When available |
+
+Keys are in canonical byte sort order: bt < ct < gi < gn < md < mt < pa < ui < un
 
 **Path normalization:**
 - Forward slashes only (`/`), never backslashes
@@ -337,7 +387,11 @@ A specialized dictionary representing a file in an archive. Has required keys an
 - UTF-8 encoded, NFC normalized
 - Example: `src/core/main.zig`
 
-**Metadata keys:** Applications can store any additional key-value pairs. Use platform-applicable keys as appropriate (POSIX, Windows, macOS). Clients SHOULD parse best-effort — ignore keys they don't understand. Key names SHOULD be short (4-8 chars) to minimize overhead.
+**Extended forks (element 2, optional):**
+- Present only when the file has a resource fork or extended attributes
+- `"rf"` key → RAW resource fork data (macOS)
+- xattr names as-is → RAW xattr values
+- On extraction to non-macOS: resource fork written as AppleDouble file (`._originalname`)
 
 ## Archive Format
 
@@ -347,14 +401,16 @@ A complete archive (the "tar replacement") is a top-level **Array** container:
 Archive (ARRAY):
   Element 0: RAW containing magic bytes: "BLIP" + version byte (0x01)
   Element 1: ARRAY (body) containing:
-    Element 0: DIR  { path: "src",          xh64: [Merkle hash] }
-    Element 1: FILE { path: "src/main.zig", xh64: ..., bina: ... }
-    Element 2: FILE { path: "src/lib.zig",  xh64: ..., bina: ... }
+    Element 0: DIR  { pa: "src", xh: [Merkle hash], md: 0o755, mt: ... }
+    Element 1: FILE [metadata DICT {pa: "src/main.zig", md: 0o644, mt: ...},
+                      DATA [content + xxHash64]]
+    Element 2: FILE [metadata DICT {pa: "src/lib.zig", md: 0o644, mt: ...},
+                      DATA [content + xxHash64]]
     ...
     Element N-1: FILE or DIR { ... }
 ```
 
-The body array may contain both FILE (0x81 0x05) and DIR (0x81 0x07) entries. DIR entries represent directories explicitly, enabling storage of directory metadata (permissions, mtime, owner). Archives without DIR entries are valid — directories are then implicit from file paths.
+The body array may contain both FILE (0x81 0x05) and DIR (0x81 0x07) entries. FILE entries use ARRAY layout containing a metadata DICT and a DATA container. DIR entries use DICT layout with 2-char keys. Archives without DIR entries are valid — directories are then implicit from file paths.
 
 **Magic identification:** The first bytes of any archive are:
 ```
@@ -380,10 +436,13 @@ A parser can identify a BLIP archive by checking for the ARRAY sentinel at byte 
 ARRAY                                           ← top-level archive
 ├── RAW "BLIP\x01"                              ← magic + version
 └── ARRAY                                       ← body
-    └── FILE                                    ← single file
-        ├── "bina" → RAW "Hello, world!\n"      ← keys in byte order
-        ├── "path" → UTF8 "hello.txt"
-        └── "xh64" → RAW [8 bytes xxHash64]
+    └── FILE (ARRAY layout, 0x81 0x05)          ← single file
+        ├── [0] DICT (metadata)                 ← keys in canonical byte order
+        │   ├── "md" → RAW [2 bytes, 0o644]
+        │   ├── "mt" → RAW [8 bytes, ns since epoch]
+        │   └── "pa" → UTF8 "hello.txt"
+        └── [1] DATA                            ← content + embedded xxHash64
+            └── "Hello, world!\n" + [8B hash]
 ```
 
 ### Archive with directories
@@ -392,42 +451,43 @@ ARRAY                                           ← top-level archive
 ARRAY                                           ← top-level archive
 ├── RAW "BLIP\x01"
 └── ARRAY                                       ← body
-    ├── DIR                                     ← directory entry
-    │   ├── "mode"  → RAW [2 bytes, 0o755]
-    │   ├── "mtime" → RAW [8 bytes, nanoseconds]
-    │   ├── "path"  → UTF8 "src"
-    │   └── "xh64"  → RAW [8 bytes, Merkle hash of children]
-    ├── FILE
-    │   ├── "bina"  → RAW [file contents]
-    │   ├── "path"  → UTF8 "src/lib.zig"
-    │   └── "xh64"  → RAW [8 bytes]
-    └── FILE
-        ├── "bina"  → RAW [file contents]
-        ├── "path"  → UTF8 "src/main.zig"
-        └── "xh64"  → RAW [8 bytes]
+    ├── DIR (DICT layout, 0x81 0x07)            ← directory entry
+    │   ├── "md" → RAW [2 bytes, 0o755]
+    │   ├── "mt" → RAW [8 bytes, nanoseconds]
+    │   ├── "pa" → UTF8 "src"
+    │   └── "xh" → RAW [8 bytes, Merkle hash]
+    ├── FILE (ARRAY layout, 0x81 0x05)
+    │   ├── [0] DICT { md: 0o644, mt: ..., pa: "src/lib.zig" }
+    │   └── [1] DATA [file contents + hash]
+    └── FILE (ARRAY layout, 0x81 0x05)
+        ├── [0] DICT { md: 0o644, mt: ..., pa: "src/main.zig" }
+        └── [1] DATA [file contents + hash]
 ```
 
-The DIR entry's `xh64` is `xxHash64(xh64_of_lib.zig || xh64_of_main.zig)` — a Merkle hash of its children's hashes, concatenated in path-sorted order.
+The DIR entry's `xh` is `xxHash64(file_hash_lib || file_hash_main)` — a Merkle hash of children's ARRAY hashes, concatenated in path-sorted order.
 
-### Archive with metadata
+### Archive with extended metadata and forks
 
 ```
 ARRAY                                           ← top-level archive
 ├── RAW "BLIP\x01"
 └── ARRAY                                       ← body
-    ├── FILE                                    ← keys in canonical byte order
-    │   ├── "bina"  → RAW [file contents]
-    │   ├── "mode"  → RAW [2 bytes, 0o644]
-    │   ├── "mtime" → RAW [8 bytes, unix epoch nanoseconds]
-    │   ├── "path"  → UTF8 "README.md"
-    │   └── "xh64"  → RAW [8 bytes]
-    └── FILE
-        ├── "bina"  → RAW [file contents]
-        ├── "path"  → UTF8 "src/main.zig"
-        ├── "xattr" → DICT                     ← nested sorted dictionary
-        │   ├── "security.selinux" → RAW [...]
-        │   └── "user.comment" → UTF8 "entry point"
-        └── "xh64"  → RAW [8 bytes]
+    ├── FILE (ARRAY layout, 0x81 0x05)
+    │   ├── [0] DICT (metadata)
+    │   │   ├── "gi" → RAW [4 bytes, gid]
+    │   │   ├── "gn" → UTF8 "staff"
+    │   │   ├── "md" → RAW [2 bytes, 0o644]
+    │   │   ├── "mt" → RAW [8 bytes, ns since epoch]
+    │   │   ├── "pa" → UTF8 "README.md"
+    │   │   ├── "ui" → RAW [4 bytes, uid]
+    │   │   └── "un" → UTF8 "peter"
+    │   └── [1] DATA [content + hash]
+    └── FILE (ARRAY layout, 0x81 0x05)
+        ├── [0] DICT { md: 0o755, mt: ..., pa: "icon.icns", un: "peter" }
+        ├── [1] DATA [content + hash]
+        └── [2] DICT (forks)                    ← extended forks
+            ├── "rf" → RAW [resource fork data]
+            └── "user.comment" → RAW [xattr value]
 ```
 
 ## Encoding Process
@@ -440,15 +500,17 @@ When the full archive is constructed in memory and serialized once, all values a
 1. Sort files by path (for deterministic output)
 2. Serialize magic element: RAW("BLIP\x01")
 3. For each file:
-   a. Serialize key-value pairs as containers
-   b. Compute file content xxHash64 → "xh64" value
-   c. Build FILE dictionary: emit data section, record key/value offsets
-   d. Emit FILE index (N, key offsets, value offsets)
-   e. Compute and emit FILE xxHash64
-   f. Record FILE's position for body array index
-4. Build body ARRAY: emit index offset (normal BLIP), data section (FILEs),
+   a. Build metadata DICT (element 0): 2-char keys in canonical order
+   b. Build DATA container (element 1): content bytes + xxHash64 suffix
+   c. Optionally build forks DICT (element 2): resource fork, xattrs
+   d. Serialize FILE as ARRAY-layout with FILE sentinel (0x81 0x05)
+   e. Record FILE's position for body array index
+4. For each directory:
+   a. Compute Merkle hash from children's ARRAY/DICT hashes
+   b. Build DIR DICT with 2-char keys (pa, xh, md, mt, etc.)
+5. Build body ARRAY: emit index offset (normal BLIP), data section (FILEs/DIRs),
    index (N, element offsets), xxHash64
-5. Build outer ARRAY: emit index offset (normal BLIP), magic + body elements,
+6. Build outer ARRAY: emit index offset (normal BLIP), magic + body elements,
    index (2, element offsets), xxHash64
 ```
 
@@ -485,8 +547,10 @@ If a padded BLIP's budget is exceeded (value doesn't fit), the writer uses the i
 6. Read element 1 offset → jump to body ARRAY
 7. Read body ARRAY index offset → jump to body index
 8. Read body element count N and offsets
-9. For element K: jump to offset K → read FILE container
-10. Read FILE index → find "path", "xh64", "bina" keys by scanning key offsets
+9. For element K: jump to offset K → check container type:
+   - FILE (0x81 0x05): parse as ARRAY; element 0 = metadata DICT (read "pa"),
+     element 1 = DATA (content + hash)
+   - DIR (0x81 0x07): parse as DICT; read "pa" key for path
 ```
 
 Note: When reading a padded BLIP index offset, the parser reads the BLIP header, extracts the value, then skips any trailing 0x00 padding bytes and the PAD_END sentinel (0x81 0x00). This is handled transparently by the BLIP decoder — no special container-level logic is needed.
@@ -497,11 +561,12 @@ Note: When reading a padded BLIP index offset, the parser reads the BLIP header,
 1. Parse outer ARRAY → find body ARRAY (element 1)
 2. Parse body ARRAY index → get all N element offsets
 3. For each element offset:
-   a. Jump to FILE container
-   b. Parse FILE index → find "path" key offset
-   c. Read path value → compare with target path
-   d. If match: find "bina" key offset → read file content
-   e. Done (or continue scanning if not found)
+   a. Check container type (FILE or DIR)
+   b. If FILE: parse as ARRAY → element 0 is metadata DICT → read "pa" key
+   c. If DIR: parse as DICT → read "pa" key
+   d. Compare path with target
+   e. If match (FILE): element 1 is DATA → read content (data_len = value_len - 8)
+   f. Done (or continue scanning if not found)
 ```
 
 For frequent lookups, cache the path→element mapping after first scan.
@@ -544,11 +609,11 @@ Containers that use padded BLIPs for streaming writes MAY reserve a **scratch po
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ Type + Length                                      │
-│ Index offset: padded BLIP                          │
-│ Scratch pool: [0x00 × S bytes]                     │  ← optional
-│ DATA SECTION: elements...                          │
-│ INDEX SECTION + HASH                               │
+│ Type + Length                                    │
+│ Index offset: padded BLIP                        │
+│ Scratch pool: [0x00 × S bytes]                   │  ← optional
+│ DATA SECTION: elements...                        │
+│ INDEX SECTION + HASH                             │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -587,14 +652,15 @@ For deterministic archives, padded BLIPs are unnecessary — use in-memory const
 For a typical use case (200 files averaging 50KB each, ~10MB total content):
 
 ```
-Per-file overhead:
-  FILE TLV shell:     2 (type) + 3 (length) = 5 bytes
-  path key+value:     8 ("path" TLV) + ~20 (path string TLV) = ~28 bytes
-  xh64 key+value:     8 ("xh64" TLV) + 12 (8-byte hash TLV) = 20 bytes
-  bina key+value:     8 ("bina" TLV) + 5 (RAW TLV shell) + content = ~13 + content
-  FILE index:         ~40 bytes (count + 3 key offsets + 3 value offsets)
+Per-file overhead (FILE as ARRAY with metadata DICT + DATA):
+  FILE ARRAY shell:   2 (type) + 3 (length) = 5 bytes
+  FILE index offset:  ~3 bytes (BLIP)
+  Metadata DICT:      ~5 (shell) + ~3 (idx offset) + ~80 (pa+md+mt keys/values)
+                      + ~30 (index) + 8 (hash) ≈ 126 bytes
+  DATA container:     2 (type) + 3 (length) + content + 8 (xxHash64) = 13 + content
+  FILE index:         ~10 bytes (count + 2 element offsets)
   FILE hash:          8 bytes
-  Total per file:     ~114 bytes overhead (+ content)
+  Total per file:     ~165 bytes overhead (+ content)
 
 Body array:
   200 element offsets: ~600 bytes
@@ -604,9 +670,9 @@ Outer array:
   2 element offsets:  ~8 bytes
   Outer hash:         8 bytes
 
-Total overhead:       ~114 × 200 + 600 + 16 ≈ 23.4 KB
+Total overhead:       ~165 × 200 + 600 + 16 ≈ 33.6 KB
 Content:              10 MB
-Overhead ratio:       0.23%
+Overhead ratio:       0.33%
 
 Compare to tar:       200 × 1024 = 200 KB (2%)
 ```
@@ -617,14 +683,14 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 |--------|-----|----------------|
 | Determinism | Format-dependent (GNU/BSD/POSIX differ) | Guaranteed by spec |
 | Random access | Sequential scan only | O(1) via index tables |
-| Per-file overhead | 512B header + padding to 512B | ~114 bytes |
+| Per-file overhead | 512B header + padding to 512B | ~165 bytes (with metadata) |
 | Integrity | None built-in | xxHash64 per array/dict |
 | Metadata | Fixed set (mtime, uid, gid, mode, etc.) | Extensible key-value pairs |
 | Nesting | Flat (no nested containers) | Recursive |
 | Streaming write | Yes (append elements, finalize) | Yes (padded BLIP backfill) |
 | Streaming read | Yes (sequential headers) | Yes (ignore index, read TLVs) |
 | Platform encoding | ASCII (POSIX) or UTF-8 (pax) | UTF-8 only |
-| Typed values | No (everything is byte ranges) | Yes (UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR) |
+| Typed values | No (everything is byte ranges) | Yes (UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR, DATA) |
 | Ecosystem | Universal | New (requires BLIP decoder) |
 | Compression | External (tar.gz, tar.zst) | External (same — wrap in compression) |
 
@@ -636,7 +702,7 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 
 3. **Index offset validation:** The index offset must point within the container's value section. Parsers MUST validate before jumping.
 
-4. **Duplicate keys:** Dictionary, Map, and File containers MUST NOT have duplicate keys. Parsers SHOULD reject duplicates.
+4. **Duplicate keys:** Dictionary, Map, and Directory containers MUST NOT have duplicate keys. Parsers SHOULD reject duplicates. File containers' metadata DICT must also not have duplicate keys.
 
 5. **Hash verification:** The xxHash64 at the end of arrays and dictionaries provides integrity checking, not cryptographic authentication. It detects accidental corruption but not adversarial tampering. For cryptographic integrity, layer a signature over the archive.
 
@@ -645,12 +711,6 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 ## Open Questions
 
 1. **Compression:** Should the format define a standard compression wrapper (e.g., a COMPRESSED container type that wraps another container with zstd/deflate)? Or is external compression (like `archive.blip.zst`) sufficient?
-
-2. **Symbolic links:** Should FILE containers support a "link" key (target path as UTF8) as an alternative to "bina"? Or are symlinks out of scope?
-
-3. ~~**Empty directories:** Should the format represent empty directories?~~ **Resolved:** The DIR container type (0x81 0x07) explicitly represents directories, including empty ones. Directories can also be implicit from file paths in archives that omit DIR entries.
-
-4. **Maximum container size:** The format is theoretically unlimited (BLIP integers are unbounded). Should we define a practical maximum (e.g., 2^63 bytes) for interoperability?
 
 ## License
 

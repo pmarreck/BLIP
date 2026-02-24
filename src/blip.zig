@@ -635,6 +635,8 @@ pub const encoding = @import("encoding.zig");
 pub const bignum_mod = @import("bignum.zig");
 pub const mini_blip_mod = @import("mini_blip.zig");
 pub const array_mod = @import("array.zig");
+pub const data_mod = @import("data.zig");
+pub const peek_mod = @import("peek.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -653,5 +655,7 @@ test {
     _ = @import("leaf.zig");
     _ = @import("array.zig");
     _ = @import("dict.zig");
+    _ = @import("data.zig");
+    _ = @import("peek.zig");
     _ = @import("mini_blip.zig");
 }

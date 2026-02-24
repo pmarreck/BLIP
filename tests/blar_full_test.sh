@@ -169,7 +169,9 @@ else
 fi
 
 # --------------- 13. Cat file content ---------------
-CAT_OUT="$("$BLAR" cat "$ARCHIVE_TAR" "$TMPDIR_TEST/hello.txt" 2>/dev/null)"
+# Paths are now normalized (leading / stripped) in the archive
+NORM_HELLO="${TMPDIR_TEST#/}/hello.txt"
+CAT_OUT="$("$BLAR" cat "$ARCHIVE_TAR" "$NORM_HELLO" 2>/dev/null)"
 EXPECTED="$(cat "$TMPDIR_TEST/hello.txt")"
 if [[ "$CAT_OUT" == "$EXPECTED" ]]; then
   pass "cat file content matches original"
@@ -180,7 +182,8 @@ fi
 # --------------- 14. Binary content roundtrip ---------------
 ARCHIVE_BIN="$TMPDIR_TEST/binary.blar"
 "$BLAR" create -o "$ARCHIVE_BIN" "$TMPDIR_TEST/myproject/binary.dat" 2>/dev/null
-"$BLAR" cat "$ARCHIVE_BIN" "$TMPDIR_TEST/myproject/binary.dat" > "$TMPDIR_TEST/binary_out.dat" 2>/dev/null
+NORM_BINARY="${TMPDIR_TEST#/}/myproject/binary.dat"
+"$BLAR" cat "$ARCHIVE_BIN" "$NORM_BINARY" > "$TMPDIR_TEST/binary_out.dat" 2>/dev/null
 if diff -q "$TMPDIR_TEST/myproject/binary.dat" "$TMPDIR_TEST/binary_out.dat" >/dev/null 2>&1; then
   pass "binary content roundtrip"
 else

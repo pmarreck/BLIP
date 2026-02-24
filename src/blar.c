@@ -25,13 +25,11 @@
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <pwd.h>
-#include <sys/types.h>
 #include <time.h>
 
-#if defined(__APPLE__)
-#include <sys/time.h>
-#endif
+/* ── Module-scoped state ──────────────────────────────────────────────── */
+
+static bool g_absolute_names = false;
 
 /* ── Forward declarations ─────────────────────────────────────────────── */
 
@@ -41,6 +39,7 @@ static int cmd_extract(int argc, char **argv);
 static int cmd_verify(int argc, char **argv);
 static int cmd_info(int argc, char **argv);
 static int cmd_cat(int argc, char **argv);
+static int cmd_peek(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -102,36 +101,6 @@ static void entry_list_free(entry_list_t *el) {
     el->content_capacity = 0;
 }
 
-/* ── Path normalization ───────────────────────────────────────────────── */
-
-/* Strip leading "./" and "/" from a path, and trailing slashes, tar-style. */
-static const char *normalize_path(const char *path) {
-    while (path[0] == '.' && path[1] == '/') path += 2;
-    while (path[0] == '/') path++;
-    return path;
-}
-
-/* ── Get owner name from uid ──────────────────────────────────────────── */
-
-static const char *get_owner_name(uid_t uid) {
-    struct passwd *pw = getpwuid(uid);
-    return pw ? pw->pw_name : NULL;
-}
-
-/* ── Get mtime in nanoseconds ─────────────────────────────────────────── */
-
-static int64_t get_mtime_ns(const struct stat *st) {
-#if defined(__APPLE__)
-    return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL +
-           (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(__linux__)
-    return (int64_t)st->st_mtim.tv_sec * 1000000000LL +
-           (int64_t)st->st_mtim.tv_nsec;
-#else
-    return (int64_t)st->st_mtime * 1000000000LL;
-#endif
-}
-
 /* ── Recursive directory walker ───────────────────────────────────────── */
 
 /* Add a strdup'd path to the content list so it gets freed with entry_list_free. */
@@ -188,23 +157,26 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         return false;
     }
 
-    const char *norm = normalize_path(path);
-    if (norm[0] == '\0') {
+    const char *norm = NULL;
+    size_t norm_len = 0;
+    blip_normalize_path(path, strlen(path), &norm, &norm_len);
+    if (norm_len == 0) {
         /* Root "." — skip entry but recurse */
         if (S_ISDIR(st.st_mode)) return collect_dir_children(path, el);
         return true;
     }
 
     /* Duplicate the normalized path so it survives stack unwinding */
-    char *owned_path = entry_list_strdup(el, norm);
-    if (!owned_path) return false;
+    char *norm_dup = strndup(norm, norm_len);
+    if (!norm_dup) return false;
+    if (!entry_list_add_content(el, (uint8_t *)norm_dup)) {
+        free(norm_dup);
+        return false;
+    }
+    char *owned_path = norm_dup;
     /* Strip trailing slashes from stored path */
-    size_t op_len = strlen(owned_path);
+    size_t op_len = norm_len;
     while (op_len > 0 && owned_path[op_len - 1] == '/') owned_path[--op_len] = '\0';
-
-    const char *owner = get_owner_name(st.st_uid);
-    int64_t mtime_ns = get_mtime_ns(&st);
-    uint16_t mode = (uint16_t)(st.st_mode & 07777);
 
     if (S_ISDIR(st.st_mode)) {
         blip_archive_entry entry;
@@ -212,12 +184,7 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.path = owned_path;
         entry.path_len = strlen(owned_path);
         entry.is_dir = 1;
-        entry.mode = mode;
-        entry.mtime_ns = mtime_ns;
-        if (owner) {
-            entry.owner = owner;
-            entry.owner_len = strlen(owner);
-        }
+        fill_entry_metadata(&entry, &st);
         memset(entry.xh64, 0, 8);
         if (!entry_list_add(el, entry)) return false;
 
@@ -242,12 +209,7 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.content = content;
         entry.content_len = content_len;
         entry.is_dir = 0;
-        entry.mode = mode;
-        entry.mtime_ns = mtime_ns;
-        if (owner) {
-            entry.owner = owner;
-            entry.owner_len = strlen(owner);
-        }
+        fill_entry_metadata(&entry, &st);
         if (!entry_list_add(el, entry)) return false;
     }
 
@@ -280,10 +242,12 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "verify") == 0) return cmd_verify(argc - 2, argv + 2);
     if (strcmp(arg1, "info") == 0)   return cmd_info(argc - 2, argv + 2);
     if (strcmp(arg1, "cat") == 0)    return cmd_cat(argc - 2, argv + 2);
+    if (strcmp(arg1, "peek") == 0)   return cmd_peek(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
     if (op != OP_NONE && has_f) {
+        if (tar_flags_has_P(arg1)) g_absolute_names = true;
         switch (op) {
         case OP_CREATE:  return cmd_create(argc - 2, argv + 2);
         case OP_LIST:    return cmd_list(argc - 2, argv + 2);
@@ -291,6 +255,7 @@ int main(int argc, char **argv) {
         case OP_VERIFY:  return cmd_verify(argc - 2, argv + 2);
         case OP_INFO:    return cmd_info(argc - 2, argv + 2);
         case OP_CAT:     return cmd_cat(argc - 2, argv + 2);
+        case OP_PEEK:    return cmd_peek(argc - 2, argv + 2);
         case OP_NONE:    break;
         }
     }
@@ -316,6 +281,7 @@ static void print_usage(FILE *out) {
         "  verify <archive>                       Verify archive integrity\n"
         "  info <archive>                         Show archive information\n"
         "  cat <archive> <path>                   Print file contents to stdout\n"
+        "  peek <archive> [<path>] [flags]        Inspect archive structure\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -324,8 +290,13 @@ static void print_usage(FILE *out) {
         "  blar Vf  <archive>                     Verify\n"
         "  blar If  <archive>                     Info\n"
         "  blar pf  <archive> <path>              Cat\n"
+        "  blar kf  <archive> [<path>] [flags]    Peek\n"
+        "\n"
+        "Tar-style flags:\n"
+        "  P                             Absolute names (preserve leading /)\n"
         "\n"
         "Options:\n"
+        "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
     );
@@ -340,10 +311,22 @@ static void print_version(void) {
 static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
     int input_start = 0;
+    bool absolute_names = g_absolute_names;
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
         return EXIT_USAGE;
+    }
+
+    /* Scan for --absolute-names before positional parsing */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--absolute-names") == 0) {
+            absolute_names = true;
+            /* Shift remaining args down */
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--; /* re-check this position */
+        }
     }
 
     /* Check for -o flag (subcommand style) */
@@ -366,7 +349,7 @@ static int cmd_create(int argc, char **argv) {
         struct stat st_check;
         if (stat(out_path, &st_check) == 0) {
             const char *input = out_path;
-            if (!default_output_name(input, default_out, sizeof(default_out))) {
+            if (!default_output_name(input, ".blar", default_out, sizeof(default_out))) {
                 fprintf(stderr, "blar: create: cannot generate output name\n");
                 return EXIT_USAGE;
             }
@@ -412,7 +395,8 @@ static int cmd_create(int argc, char **argv) {
     /* Create the archive via FFI */
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
-    int32_t rc = blip_archive_create_full(el.entries, el.count,
+    uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
+    int32_t rc = blip_archive_create_full(el.entries, el.count, create_flags,
                                            &archive_buf, &archive_len);
     entry_list_free(&el);
 
@@ -848,7 +832,7 @@ static int cmd_cat(int argc, char **argv) {
     }
 
     const char *archive_path = argv[0];
-    const char *file_path = normalize_path(argv[1]);
+    const char *file_path = argv[1];
 
     size_t buf_len = 0;
     uint8_t *buf = read_file(archive_path, &buf_len);
@@ -879,4 +863,10 @@ static int cmd_cat(int argc, char **argv) {
 
     free(buf);
     return EXIT_OK;
+}
+
+/* ── cmd_peek ─────────────────────────────────────────────────────────── */
+
+static int cmd_peek(int argc, char **argv) {
+    return cmd_peek_common("blar", argc, argv);
 }

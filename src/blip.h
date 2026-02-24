@@ -22,7 +22,11 @@
 #define BLIP_ERR_OVERFLOW         -12
 #define BLIP_ERR_ALLOC            -13
 #define BLIP_ERR_NOT_FOUND        -14
+#define BLIP_ERR_INVALID_PATH     -15
 #define BLIP_ERR_UNKNOWN          -99
+
+/* Archive creation flags */
+#define BLIP_ARCHIVE_ABSOLUTE_PATHS  0x0001u  /* preserve absolute paths (default: strip leading ./ and /) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +59,7 @@ typedef struct {
  * Returns 0 on success, -1 on error.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create(const blip_file_entry *files, size_t file_count,
+                            uint32_t flags,
                             uint8_t **out_buf, size_t *out_len);
 
 /* Get the number of files in a BLIP archive.
@@ -101,8 +106,14 @@ typedef struct {
     uint8_t is_dir;          /* 1 for directory, 0 for file */
     uint16_t mode;           /* permission bits (LE uint16), 0 = not set */
     int64_t mtime_ns;        /* nanoseconds since epoch (LE int64), 0 = not set */
-    const char *owner;       /* NULL = not set */
+    int64_t ctime_ns;        /* inode change time (ns since epoch), 0 = not set */
+    int64_t birthtime_ns;    /* creation time (ns since epoch), 0 = not set */
+    uint32_t uid;            /* numeric user ID, 0 = not set */
+    uint32_t gid;            /* numeric group ID, 0 = not set */
+    const char *owner;       /* username, NULL = not set */
     size_t owner_len;        /* 0 = not set */
+    const char *groupname;   /* group name, NULL = not set */
+    size_t groupname_len;    /* 0 = not set */
     uint8_t xh64[8];         /* Merkle hash for dirs (pre-computed), ignored for files */
 } blip_archive_entry;
 
@@ -110,6 +121,7 @@ typedef struct {
  * Returns 0 on success, negative error code on failure.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
+                                  uint32_t flags,
                                   uint8_t **out_buf, size_t *out_len);
 
 /* Get the container type of an entry (0x05 = FILE, 0x07 = DIR). */
@@ -123,6 +135,40 @@ int32_t blip_archive_entry_metadata(const uint8_t *buf, size_t buf_len,
                                      int64_t *out_mtime_ns,
                                      const char **out_owner,
                                      size_t *out_owner_len);
+
+/* Normalize a path by stripping leading "./" and "/" sequences (tar-style).
+ * Returns a pointer into the original path buffer (zero-copy).
+ * See normalizePath() in lib.zig for full documentation and examples. */
+void blip_normalize_path(const char *path, size_t path_len,
+                         const char **out_path, size_t *out_path_len);
+
+/* --- Peek / navigation API --- */
+
+/* Navigate to a container within a BLIP buffer using a path expression.
+ * Path syntax: [N] for array index, [key] for dict key.
+ * Returns 0 on success. out_type receives the container type byte (0x01-0x08).
+ * out_data/out_data_len receive a zero-copy pointer to the container bytes. */
+int32_t blip_peek(const uint8_t *buf, size_t buf_len,
+                  const char *path, size_t path_len,
+                  uint8_t *out_type,
+                  const uint8_t **out_data, size_t *out_data_len);
+
+/* Get element/pair count for an array-like or dict-like container. */
+int32_t blip_container_count(const uint8_t *buf, size_t len, uint64_t *out_count);
+
+/* Get the trailing xxHash64 from a container (ARRAY, DICT, MAP, FILE, DIR, DATA).
+ * out_hash must point to an 8-byte buffer. */
+int32_t blip_container_hash(const uint8_t *buf, size_t len, uint8_t out_hash[8]);
+
+/* Get the key payload bytes at the given pair index from a dict-like container.
+ * Returns zero-copy pointer into buf. */
+int32_t blip_container_key_at(const uint8_t *buf, size_t len, uint64_t index,
+                               const uint8_t **out_key, size_t *out_key_len);
+
+/* Encode binary data as printable-binary UTF-8.
+ * Caller must free the output buffer with blip_free(). */
+int32_t blip_encode_printable_binary(const uint8_t *input, size_t input_len,
+                                      uint8_t **out_buf, size_t *out_len);
 
 #ifdef __cplusplus
 }

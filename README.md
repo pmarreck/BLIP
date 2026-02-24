@@ -80,7 +80,7 @@ nix develop -c zig build bench -Doptimize=ReleaseFast
 
 BLIP also defines a recursive binary container format (TLV) for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
 
-Container types: ARRAY, DICT, MAP, FILE, DIR, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, Merkle hash trees for directories, and canonical key ordering for deterministic output.
+Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, Merkle hash trees for directories, and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming (content-only and whole-file). All metadata uses compact 2-character key names.
 
 ### miniBLIP Archive API
 
@@ -91,16 +91,17 @@ const mini_blip = @import("mini_blip.zig");
 
 // Create an archive
 const files = [_]mini_blip.FileEntry{
-    .{ .path = "hello.txt", .content = "Hello, world!\n", .metadata = null },
-    .{ .path = "src/main.zig", .content = source_bytes, .metadata = null },
+    .{ .path = "hello.txt", .content = "Hello, world!\n" },
+    .{ .path = "src/main.zig", .content = source_bytes, .mode = 0o644, .mtime_ns = 1708787200_000_000_000 },
 };
 const archive = try mini_blip.createArchive(allocator, &files);
 defer allocator.free(archive);
 
 // Read an archive
 const reader = try mini_blip.ArchiveReader.init(archive);
-const count = try reader.fileCount();   // 2
-const file = try reader.findFile("hello.txt");  // DictReader for the file
+const count = try reader.entryCount();    // 2
+const path = try reader.entryPathAt(0);   // "hello.txt"
+const content = try reader.fileContentAt(0);  // "Hello, world!\n"
 ```
 
 ## C FFI
@@ -168,28 +169,87 @@ blar xf archive.blar              # extract
 blar Vf archive.blar              # verify
 blar If archive.blar              # info
 blar pf archive.blar file.txt     # cat (print)
+blar kf archive.blar "[1][0]"     # peek
 ```
+
+### Inspecting archives (peek)
+
+Navigate BLIP archive structure with jq-like path expressions:
+
+```bash
+# Navigation: [N] for array index, [key] for dict key
+blar peek archive.blar "[1][0][0][pa]"      # file path
+blar peek archive.blar "[1][0][1]" --raw    # raw file content
+
+# Accessors
+blar peek archive.blar "[1][0].type"        # FILE
+blar peek archive.blar "[1][0].count"       # 2
+blar peek archive.blar "[1][0].hash"        # a1b2c3d4e5f6a7b8
+blar peek archive.blar "[1][0][0].keys"     # metadata key list
+
+# Output modes
+blar peek archive.blar "[1][0][0][md]"          # 0644 (semantic: mode as octal)
+blar peek archive.blar "[1][0][0][mt]"          # 2026-02-24T10:30:00.123456789Z
+blar peek archive.blar "[1][0][0].keys" --json  # ["bt","ct","gi","gn","md","mt","pa","ui","un"]
+blar peek archive.blar "[1][0][1]" --raw        # raw bytes to stdout
+blar peek archive.blar "[1][0]" --type          # FILE (shorthand for .type)
+```
+
+Archive structure: `ARRAY[RAW magic, ARRAY[FILE[DICT{metadata}, DATA{content}], ...]]`. So `[0]` is the magic, `[1]` is the body array, `[1][0]` is the first file entry, `[1][0][0]` is its metadata dict, and `[1][0][1]` is its content. Known metadata keys (md, mt, ct, bt, ui, gi, xh) get semantic display (octal, ISO 8601, decimal, hex).
+
+`miniblar peek` works identically.
+
+## BLIP Archive vs tar
+
+| | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |
+|---|---|---|
+| **Determinism** | Byte-identical output guaranteed by spec (sorted paths, canonical key ordering, canonical BLIP encoding) | Format-dependent — GNU, BSD, and POSIX tar produce different bytes from the same inputs; header fields vary by implementation |
+| **Integrity** | Built-in xxHash64 on every array and dictionary container; Merkle hash trees for directories propagate changes from any leaf to the root | None built-in; users layer external checksums (`sha256sum`) or signatures after the fact |
+| **Random access** | O(1) via index tables at the end of each container; jump directly to element K without scanning | Sequential scan only — must read every 512-byte header from the beginning to find a file |
+| **Per-file overhead** | ~165 bytes (metadata DICT + DATA container + ARRAY index + dual hashes) | 512-byte header + content padded to 512-byte boundary; minimum 1024 bytes per file regardless of content size |
+| **Metadata** | Extensible key-value pairs — any key name, any container type as value; applications define what they need | Fixed set defined by the header format (mtime, uid, gid, mode, size, linkname, uname, gname); pax extended headers add flexibility but are complex |
+| **Typed values** | First-class types: UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR | Everything is byte ranges within fixed-width header fields; no type system |
+| **Nesting** | Recursive — containers nest arbitrarily (ARRAY of DICTs of ARRAYs...) | Flat — one level of file entries; no structured nesting |
+| **Path encoding** | UTF-8 only, normalized (no leading `/`, forward slashes, no `.`/`..`) | ASCII (POSIX) or UTF-8 (pax); leading `/` handling varies by implementation; `..` components are a known security risk |
+| **Streaming** | Supported via padded BLIPs with backfill; streaming reads ignore the index and process TLVs sequentially | Native strength — append headers + data sequentially, finalize with two zero blocks |
+| **Ecosystem** | New — requires a BLIP-aware tool | Universal — every Unix system has tar; decades of tooling, documentation, and interoperability |
+| **Specification** | Single spec, one canonical encoding | Multiple incompatible specs (v7, ustar, pax, GNU, BSD); real-world archives mix formats |
+| **Empty directories** | Explicit DIR container type with its own metadata and Merkle hash | Representable but inconsistently handled across implementations |
+
+**Where tar wins:** Ubiquity. tar is everywhere, understood by every tool, and has decades of battle-tested interoperability. If you need an archive that any system can unpack without installing anything, tar is the right choice.
+
+**Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in dual-level integrity verification (content-only DATA hash + whole-file ARRAY hash) catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. And ~3x lower per-file overhead matters when archiving many small files.
 
 ## miniblar: Minimal BLIP Archive Tool
 
-`miniblar` creates flat file-only archives (no directory entries, no metadata). Use it when you need a simple archive of individual files.
+`miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, ownership). No directory entries — files only. The result is a compact bag of files with deterministic ordering and full metadata preservation.
+
+### Use cases
+
+- **Hashing a set of files together.** Deterministic encoding (sorted paths, canonical BLIP encoding) produces a stable archive hash. Any change to file contents OR metadata (permissions, mtime) changes the archive hash — useful for cache invalidation.
+- **Lightweight bundles with metadata.** Ship files as a single blob with permissions and timestamps preserved. Extracted files retain their original mode and mtime.
+- **Integrity-verified file sets.** Each file has dual checksums: a DATA hash for content-only integrity and a FILE ARRAY hash covering content + metadata.
+- **Embedding in other formats.** Compact overhead (~165 bytes per file with metadata, no 512-byte block padding) keeps the archive small when used as a payload inside another container.
 
 ### Usage
 
 ```bash
 # Create archive from files (directories rejected)
-miniblar create -o archive.blip file1.txt file2.txt
+miniblar create -o bundle.mblar file1.txt file2.txt
+
+# Default extension is .mblar
+miniblar create file1.txt file2.txt   # -> file1.mblar
 
 # Same subcommands as blar: list, extract, verify, info, cat
-miniblar list archive.blip
-miniblar verify archive.blip
+miniblar list bundle.mblar
+miniblar verify bundle.mblar
 
 # Tar-style shortcuts work too
-miniblar cf archive.blip file1.txt
-miniblar tf archive.blip
+miniblar cf bundle.mblar file1.txt
+miniblar tf bundle.mblar
 ```
 
-`miniblar` rejects directory arguments — use `blar` for directory support.
+`miniblar` rejects directory arguments — use `blar` for directory trees and Merkle hashing.
 
 ## License
 

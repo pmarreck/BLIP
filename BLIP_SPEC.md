@@ -22,12 +22,12 @@ First byte:
 
   Bit 7 = 0: IMMEDIATE MODE
     ┌─┬─────────────────┐
-    │0│     value        │  Bits 6-0 = value directly
+    │0│     value       │  Bits 6-0 = value directly
     └─┴─────────────────┘  Range: 0-127. Total size: 1 byte.
 
   Bit 7 = 1: LENGTH-PREFIXED MODE
     ┌─┬─┬─┬─────────────┐
-    │1│C│P│   L bits     │
+    │1│C│P│   L bits    │
     └─┴─┴─┴─────────────┘
     Bit 6 = C (continuation flag for L)
     Bit 5 = P (padded flag)
