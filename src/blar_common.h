@@ -7,6 +7,14 @@
 #ifndef BLAR_COMMON_H
 #define BLAR_COMMON_H
 
+/* Enable POSIX.1-2008 for st_mtim, utimensat, AT_FDCWD, UTIME_OMIT on Linux.
+ * Not needed on macOS (which exposes these without feature macros) and would
+ * actually hide BSD extensions like st_birthtimespec. */
+#if defined(__linux__) && (!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L)
+#undef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "blip.h"
 
 #include <errno.h>
@@ -428,7 +436,7 @@ static int cmd_peek_common(const char *prog, int argc, char **argv) {
     size_t out_stderr_len = 0;
 
     int32_t rc = blip_peek_display(buf, buf_len,
-                                    (const uint8_t *)path, strlen(path),
+                                    path, strlen(path),
                                     flags,
                                     &out_stdout, &out_stdout_len,
                                     &out_stderr, &out_stderr_len);
@@ -619,7 +627,7 @@ static int cmd_poke_common(const char *prog, int argc, char **argv) {
     uint8_t *out_buf = NULL;
     size_t out_len = 0;
     int32_t rc = blip_poke(buf, buf_len,
-                           (const uint8_t *)path_expr, strlen(path_expr),
+                           path_expr, strlen(path_expr),
                            new_value, new_value_len,
                            &out_buf, &out_len);
 
