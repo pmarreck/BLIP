@@ -415,7 +415,8 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
 }
 
 /// Create a miniBlar archive from a list of file entries.
-/// Files are sorted by path in canonical byte order.
+/// Create a flat BLIP archive from a list of file entries.
+/// Entries are serialized in the order given — caller controls ordering.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.Error || ContainerError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
@@ -424,22 +425,11 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
         to_free.deinit(allocator);
     }
 
-    // Copy files into a sortable array, sort by path
-    const sorted_files = try allocator.alloc(FileEntry, files.len);
-    defer allocator.free(sorted_files);
-    @memcpy(sorted_files, files);
-
-    std.mem.sort(FileEntry, sorted_files, {}, struct {
-        fn lessThan(_: void, a: FileEntry, b: FileEntry) bool {
-            return std.mem.order(u8, a.path, b.path) == .lt;
-        }
-    }.lessThan);
-
     // Serialize each file into a FILE container (ARRAY-based)
     var file_elements: std.ArrayList([]const u8) = .{};
     defer file_elements.deinit(allocator);
 
-    for (sorted_files) |file| {
+    for (files) |file| {
         const file_bytes = try serializeFileEntry(allocator, file, &to_free);
         try file_elements.append(allocator, file_bytes);
     }
@@ -460,7 +450,7 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
 }
 
 /// Create a full BLIP archive from a list of file and/or directory entries.
-/// Entries are sorted by path in canonical byte order.
+/// Entries are serialized in the order given — caller controls ordering.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (Allocator.Error || ContainerError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
@@ -469,22 +459,11 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
         to_free.deinit(allocator);
     }
 
-    // Copy entries into a sortable array, sort by path
-    const sorted_entries = try allocator.alloc(ArchiveEntry, entries.len);
-    defer allocator.free(sorted_entries);
-    @memcpy(sorted_entries, entries);
-
-    std.mem.sort(ArchiveEntry, sorted_entries, {}, struct {
-        fn lessThan(_: void, a: ArchiveEntry, b: ArchiveEntry) bool {
-            return std.mem.order(u8, a.getPath(), b.getPath()) == .lt;
-        }
-    }.lessThan);
-
     // Serialize each entry as FILE or DIR container
     var entry_elements: std.ArrayList([]const u8) = .{};
     defer entry_elements.deinit(allocator);
 
-    for (sorted_entries) |entry| {
+    for (entries) |entry| {
         switch (entry) {
             .file => |file| {
                 const file_bytes = try serializeFileEntry(allocator, file, &to_free);
@@ -497,8 +476,16 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
         }
     }
 
-    // Serialize magic: RAW("BLAR\x01")
-    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC_BLAR);
+    // Choose magic based on content: BLAR if any DIR entries, MBAR if all files
+    var has_dir = false;
+    for (entries) |entry| {
+        if (entry == .dir) {
+            has_dir = true;
+            break;
+        }
+    }
+    const magic = if (has_dir) MAGIC_BLAR else MAGIC_MBAR;
+    const magic_bytes = try leaf.serializeRaw(allocator, magic);
     try to_free.append(allocator, magic_bytes);
 
     // Serialize body array (containing all entries)
@@ -737,7 +724,7 @@ test "single file archive round-trip with ARRAY-based FILE" {
     try testing.expect(try reader.verifyFileAt(0));
 }
 
-test "multi-file archive: path sorting preserved" {
+test "multi-file archive: caller order preserved" {
     const allocator = testing.allocator;
     const files = [_]FileEntry{
         .{ .path = "src/c.zig", .content = "c content" },
@@ -750,14 +737,14 @@ test "multi-file archive: path sorting preserved" {
     const reader = try ArchiveReader.init(archive);
     try testing.expectEqual(@as(u64, 3), try reader.fileCount());
 
-    // Verify sorted order: a, b, c
-    try testing.expectEqualSlices(u8, "src/a.zig", try reader.entryPathAt(0));
-    try testing.expectEqualSlices(u8, "src/b.zig", try reader.entryPathAt(1));
-    try testing.expectEqualSlices(u8, "src/c.zig", try reader.entryPathAt(2));
+    // Verify caller's order is preserved: c, a, b (not sorted)
+    try testing.expectEqualSlices(u8, "src/c.zig", try reader.entryPathAt(0));
+    try testing.expectEqualSlices(u8, "src/a.zig", try reader.entryPathAt(1));
+    try testing.expectEqualSlices(u8, "src/b.zig", try reader.entryPathAt(2));
 
-    try testing.expectEqualSlices(u8, "a content", try reader.fileContentAt(0));
-    try testing.expectEqualSlices(u8, "b content", try reader.fileContentAt(1));
-    try testing.expectEqualSlices(u8, "c content", try reader.fileContentAt(2));
+    try testing.expectEqualSlices(u8, "c content", try reader.fileContentAt(0));
+    try testing.expectEqualSlices(u8, "a content", try reader.fileContentAt(1));
+    try testing.expectEqualSlices(u8, "b content", try reader.fileContentAt(2));
 }
 
 test "FILE contains dual checksums: DATA hash + ARRAY hash" {
@@ -811,8 +798,8 @@ test "full archive with DIR + FILE entries round-trips" {
     const allocator = testing.allocator;
 
     const entries = [_]ArchiveEntry{
-        .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
+        .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
     const archive = try createFullArchive(allocator, &entries);
     defer allocator.free(archive);
@@ -822,7 +809,7 @@ test "full archive with DIR + FILE entries round-trips" {
     try testing.expect(try reader.verifyHash());
     try testing.expectEqual(@as(u64, 2), try reader.entryCount());
 
-    // Entries sorted: "src" < "src/main.zig"
+    // Caller order preserved: dir first, then file
     try testing.expectEqual(ContainerType.dir, try reader.entryTypeAt(0));
     try testing.expectEqual(ContainerType.file, try reader.entryTypeAt(1));
 

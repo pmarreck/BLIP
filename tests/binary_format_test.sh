@@ -96,20 +96,20 @@ fi
   && pass "miniblar single file: verify passes" \
   || fail "miniblar single file: verify failed"
 
-# --------------- Test 2: Two file archive with path sorting ---------------
+# --------------- Test 2: Two file archive preserves caller order ---------------
 cleanup && mkdir -p "$BFT"
 echo -n "hello" > "$BFT/a.txt"
 echo -n "world" > "$BFT/b.txt"
-# Pass files in reverse alphabetical order — archive should sort them
+# Pass files in reverse alphabetical order — archive should preserve that order
 "$MINIBLAR" create -o "$BFT/two.blip" "$BFT/b.txt" "$BFT/a.txt" 2>/dev/null
 
-# Verify path sorting: a.txt should appear before b.txt in list output
+# Verify caller order preserved: b.txt should appear before a.txt
 LIST_OUT=$("$MINIBLAR" list "$BFT/two.blip" 2>/dev/null)
 FIRST_FILE=$(echo "$LIST_OUT" | head -1)
-if echo "$FIRST_FILE" | grep -q "a.txt"; then
-  pass "miniblar two files: paths sorted (a.txt before b.txt)"
+if echo "$FIRST_FILE" | grep -q "b.txt"; then
+  pass "miniblar two files: caller order preserved (b.txt before a.txt)"
 else
-  fail "miniblar two files: paths not sorted, first file: $FIRST_FILE"
+  fail "miniblar two files: caller order not preserved, first file: $FIRST_FILE"
 fi
 
 "$MINIBLAR" verify "$BFT/two.blip" >/dev/null 2>&1 \
@@ -148,12 +148,12 @@ else
   fail "miniblar magic: expected ARRAY sentinel 0x8101, got 0x$FIRST_TWO"
 fi
 
-# Check that BLIP\x01 magic appears in the archive
+# Check that MBAR\x01 magic appears in the archive
 PB_OUT="$($PB "$BFT/magic.blip" 2>/dev/null)"
-if [[ "$PB_OUT" == *"BLIP¯"* ]]; then
-  pass "miniblar magic: BLIP magic bytes present"
+if [[ "$PB_OUT" == *"MBAR¯"* ]]; then
+  pass "miniblar magic: MBAR magic bytes present"
 else
-  fail "miniblar magic: BLIP magic bytes not found in archive"
+  fail "miniblar magic: MBAR magic bytes not found in archive"
 fi
 
 # =============================================================================
@@ -173,10 +173,10 @@ else
 fi
 
 PB_OUT="$($PB "$BFT/blar.blar" 2>/dev/null)"
-if [[ "$PB_OUT" == *"BLIP¯"* ]]; then
-  pass "blar header: BLIP magic bytes present"
+if [[ "$PB_OUT" == *"BLAR¯"* ]]; then
+  pass "blar header: BLAR magic bytes present"
 else
-  fail "blar header: BLIP magic bytes not found"
+  fail "blar header: BLAR magic bytes not found"
 fi
 
 # --------------- Test 6: DIR entry sentinel present ---------------

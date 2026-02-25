@@ -308,7 +308,7 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 
 | | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |
 |---|---|---|
-| **Determinism** | Byte-identical output guaranteed by spec (sorted paths, canonical key ordering, canonical BLIP encoding) | Format-dependent — GNU, BSD, and POSIX tar produce different bytes from the same inputs; header fields vary by implementation |
+| **Determinism** | Byte-identical output guaranteed by spec (canonical key ordering, canonical BLIP encoding, caller-controlled entry order) | Format-dependent — GNU, BSD, and POSIX tar produce different bytes from the same inputs; header fields vary by implementation |
 | **Integrity** | Built-in xxHash64 on every array and dictionary container; Merkle hash trees for directories propagate changes from any leaf to the root | None built-in; users layer external checksums (`sha256sum`) or signatures after the fact |
 | **Random access** | O(1) via index tables at the end of each container; jump directly to element K without scanning | Sequential scan only — must read every 512-byte header from the beginning to find a file |
 | **Per-file overhead** | ~165 bytes (metadata DICT + DATA container + ARRAY index + dual hashes) | 512-byte header + content padded to 512-byte boundary; minimum 1024 bytes per file regardless of content size |
@@ -327,11 +327,11 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 
 ## miniblar: Minimal BLIP Archive Tool
 
-`miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, ownership). No directory entries — files only. The result is a compact bag of files with deterministic ordering and full metadata preservation.
+`miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, ownership). No directory entries — files only. The result is a compact bag of files with full metadata preservation. Entry order is caller-controlled (the CLI sorts by path; the Zig API preserves the order given).
 
 ### Use cases
 
-- **Hashing a set of files together.** Deterministic encoding (sorted paths, canonical BLIP encoding) produces a stable archive hash. Any change to file contents OR metadata (permissions, mtime) changes the archive hash — useful for cache invalidation.
+- **Hashing a set of files together.** Deterministic encoding (canonical BLIP encoding, caller-controlled entry order) produces a stable archive hash. Any change to file contents OR metadata (permissions, mtime) changes the archive hash — useful for cache invalidation.
 - **Lightweight bundles with metadata.** Ship files as a single blob with permissions and timestamps preserved. Extracted files retain their original mode and mtime.
 - **Integrity-verified file sets.** Each file has dual checksums: a DATA hash for content-only integrity and a FILE ARRAY hash covering content + metadata.
 - **Embedding in other formats.** Compact overhead (~165 bytes per file with metadata, no 512-byte block padding) keeps the archive small when used as a payload inside another container.

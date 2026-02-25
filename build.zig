@@ -26,6 +26,27 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Expose named modules for downstream Zig consumers:
+    //   dep.module("blip")      — full API (blip.zig + printable_binary)
+    //   dep.module("mini_blar") — archive creation/reading (mini_blar.zig)
+    _ = b.addModule("blip", .{
+        .root_source_file = b.path("src/blip.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "printable_binary", .module = pb_module },
+        },
+    });
+
+    _ = b.addModule("mini_blar", .{
+        .root_source_file = b.path("src/mini_blar.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "printable_binary", .module = pb_module },
+        },
+    });
+
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
         .name = "blip",
