@@ -43,10 +43,10 @@ export fn blip_encoded_size(value: u64) callconv(.c) i32 {
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const page_allocator = std.heap.page_allocator;
-const mini_blip = blip.mini_blip_mod;
-const ContainerError = mini_blip.ContainerError;
-const leaf = mini_blip.leaf;
-const dict_mod = mini_blip.dict_mod;
+const mini_blar = blip.mini_blar_mod;
+const ContainerError = mini_blar.ContainerError;
+const leaf = mini_blar.leaf;
+const dict_mod = mini_blar.dict_mod;
 
 /// Map a full archive error (ContainerError | OutOfMemory) to a C FFI error code.
 fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
@@ -181,7 +181,7 @@ export fn blip_archive_create(
 ) callconv(.c) i32 {
     const normalize = (flags & BLIP_ARCHIVE_ABSOLUTE_PATHS) == 0;
 
-    const file_entries = page_allocator.alloc(mini_blip.FileEntry, file_count) catch return -13;
+    const file_entries = page_allocator.alloc(mini_blar.FileEntry, file_count) catch return -13;
     defer page_allocator.free(file_entries);
 
     for (0..file_count) |i| {
@@ -193,7 +193,7 @@ export fn blip_archive_create(
         };
     }
 
-    const result = mini_blip.createArchive(page_allocator, file_entries) catch return -1;
+    const result = mini_blar.createArchive(page_allocator, file_entries) catch return -1;
     out_buf.* = result.ptr;
     out_len.* = result.len;
     return 0;
@@ -209,7 +209,7 @@ export fn blip_archive_create_full(
 ) callconv(.c) i32 {
     const normalize = (flags & BLIP_ARCHIVE_ABSOLUTE_PATHS) == 0;
 
-    var archive_entries = page_allocator.alloc(mini_blip.ArchiveEntry, entry_count) catch return -13;
+    var archive_entries = page_allocator.alloc(mini_blar.ArchiveEntry, entry_count) catch return -13;
     defer page_allocator.free(archive_entries);
 
     for (0..entry_count) |i| {
@@ -254,7 +254,7 @@ export fn blip_archive_create_full(
         }
     }
 
-    const result = mini_blip.createFullArchive(page_allocator, archive_entries) catch |e| {
+    const result = mini_blar.createFullArchive(page_allocator, archive_entries) catch |e| {
         return fullArchiveErrorCode(e);
     };
     out_buf.* = result.ptr;
@@ -268,7 +268,7 @@ export fn blip_archive_file_count(
     buf_len: usize,
     out_count: *u64,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
     out_count.* = reader.entryCount() catch return -1;
     return 0;
 }
@@ -278,7 +278,7 @@ export fn blip_archive_verify(
     buf: [*]const u8,
     buf_len: usize,
 ) callconv(.c) bool {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch return false;
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return false;
     return reader.verifyHash() catch false;
 }
 
@@ -291,7 +291,7 @@ export fn blip_archive_file_path(
     out_path: *[*]const u8,
     out_path_len: *usize,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const path_val = reader.entryPathAt(index) catch |e| return containerErrorCode(e);
     out_path.* = path_val.ptr;
     out_path_len.* = path_val.len;
@@ -307,7 +307,7 @@ export fn blip_archive_file_content(
     out_data: *[*]const u8,
     out_data_len: *usize,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const content = reader.fileContentAt(index) catch |e| return containerErrorCode(e);
     out_data.* = content.ptr;
     out_data_len.* = content.len;
@@ -323,7 +323,7 @@ export fn blip_archive_file_content_by_path(
     out_data: *[*]const u8,
     out_data_len: *usize,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const idx = (reader.findFile(path[0..path_len]) catch |e| return containerErrorCode(e)) orelse return -14;
     const content = reader.fileContentAt(idx) catch |e| return containerErrorCode(e);
     out_data.* = content.ptr;
@@ -339,7 +339,7 @@ export fn blip_archive_file_verify(
     buf_len: usize,
     index: u64,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const ok = reader.verifyFileAt(index) catch |e| return containerErrorCode(e);
     if (!ok) return -7;
     return 0;
@@ -353,7 +353,7 @@ export fn blip_archive_entry_type(
     index: u64,
     out_type: *u8,
 ) callconv(.c) i32 {
-    const reader = mini_blip.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const entry_type = reader.entryTypeAt(index) catch |e| return containerErrorCode(e);
     out_type.* = @intFromEnum(entry_type);
     return 0;
@@ -371,7 +371,7 @@ export fn blip_archive_entry_metadata(
     out_owner_len: *usize,
 ) callconv(.c) i32 {
     const slice = buf[0..buf_len];
-    const reader = mini_blip.ArchiveReader.init(slice) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(slice) catch |e| return containerErrorCode(e);
 
     // Default to zero/null
     out_mode.* = 0;

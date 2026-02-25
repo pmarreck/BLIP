@@ -77,8 +77,8 @@ DICT, FILE, and DIR containers with key ordering and interleaved index.
 - `DictReader` — zero-copy reader: init, pairCount, keyAt, valueAt, findKey, verifyHash (supports DICT, FILE, MAP, DIR)
 - `extractKeyBytes(key_container) ![]const u8` — extract key value from TLV
 
-## src/mini_blip.zig
-High-level BLIP archive API (miniBLIP flat archives + full archives with DIR).
+## src/mini_blar.zig
+High-level BLIP archive API (miniBlar flat archives + full archives with DIR).
 - `FileEntry` — struct { path, content, metadata }
 - `DirEntry` — struct { path, xh64, metadata }
 - `ArchiveEntry` — union(enum) { file: FileEntry, dir: DirEntry }

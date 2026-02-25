@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Implement the BLIP Container Format (v1.1) as a Zig library with C FFI, plus a miniBLIP high-level API for entropy_shield.
+**Goal:** Implement the BLIP Container Format (v1.1) as a Zig library with C FFI, plus a miniBlar high-level API for entropy_shield.
 
-**Architecture:** Layered module stack — one file per container type (leaf, array, dict), a core TLV module, a high-level miniBLIP composition layer, and C FFI exports. Writer API uses pre-serialized composable byte slices. Reader API is zero-copy with lazy index access.
+**Architecture:** Layered module stack — one file per container type (leaf, array, dict), a core TLV module, a high-level miniBlar composition layer, and C FFI exports. Writer API uses pre-serialized composable byte slices. Reader API is zero-copy with lazy index access.
 
 **Tech Stack:** Zig 0.15.2, std.hash.XxHash64, Nix flake for hermetic build
 
@@ -650,10 +650,10 @@ git commit -m "feat: add dict.zig with DICT/FILE containers, key ordering, and i
 
 ---
 
-### Task 7: mini_blip.zig — High-level archive API
+### Task 7: mini_blar.zig — High-level archive API
 
 **Files:**
-- Create: `src/mini_blip.zig`
+- Create: `src/mini_blar.zig`
 
 **Implementation notes:**
 - `createArchive` builds a complete BLIP archive from file entries
@@ -726,8 +726,8 @@ pub const ArchiveReader = struct {
 
 **Commit:**
 ```bash
-git add src/mini_blip.zig
-git commit -m "feat: add mini_blip.zig with high-level archive creation and reading"
+git add src/mini_blar.zig
+git commit -m "feat: add mini_blar.zig with high-level archive creation and reading"
 ```
 
 ---
@@ -748,7 +748,7 @@ Add to the `test { }` block at the bottom of `src/blip.zig`:
     _ = @import("leaf.zig");
     _ = @import("array.zig");
     _ = @import("dict.zig");
-    _ = @import("mini_blip.zig");
+    _ = @import("mini_blar.zig");
 ```
 
 **Step 2: Run full test suite**
@@ -775,7 +775,7 @@ git commit -m "feat: integrate container modules into test suite"
 
 ```zig
 // In lib.zig, add:
-const mini_blip = @import("blip").mini_blip_mod;
+const mini_blar = @import("blip").mini_blar_mod;
 
 /// Create a BLIP archive from file entries.
 /// files: array of {path, path_len, content, content_len} structs
@@ -864,7 +864,7 @@ nix develop -c zig build -Doptimize=ReleaseFast 2>&1
 
 **Step 3: Update docs**
 
-Add container module entries to CODE_MINIMAP.md. Add "Container Format" section to README.md linking to BLIP_CONTAINER_SPEC.md and describing the miniBLIP API.
+Add container module entries to CODE_MINIMAP.md. Add "Container Format" section to README.md linking to BLIP_CONTAINER_SPEC.md and describing the miniBlar API.
 
 **Step 4: Commit and push**
 

@@ -79,7 +79,7 @@ pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
     return result;
 }
 
-/// The magic bytes identifying a miniBLIP archive: "BLIP" + version 1.
+/// The magic bytes identifying a miniBlar archive: "BLIP" + version 1.
 const MAGIC: *const [5]u8 = "BLIP\x01";
 
 /// Serialize a FILE entry as an ARRAY-based container.
@@ -412,7 +412,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
     return dir_bytes;
 }
 
-/// Create a miniBLIP archive from a list of file entries.
+/// Create a miniBlar archive from a list of file entries.
 /// Files are sorted by path in canonical byte order.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.Error || ContainerError)![]u8 {

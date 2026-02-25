@@ -151,7 +151,7 @@ pub fn serializeDict(allocator: Allocator, pairs: []const KeyValue) (Allocator.E
     return serializeDictLike(allocator, pairs, .dict);
 }
 
-// serializeFile removed: FILE is now ARRAY-based (see mini_blip.zig serializeFileV2)
+// serializeFile removed: FILE is now ARRAY-based (see mini_blar.zig serializeFileV2)
 
 /// Serialize an ordered set of key-value pairs as a DIR container (0x81 0x07).
 /// Same as serializeDict but validates required keys: "pa" and "xh".
@@ -570,7 +570,7 @@ test "valueAt out of bounds -> IndexOutOfBounds" {
     try testing.expectError(ContainerError.IndexOutOfBounds, reader.valueAt(100));
 }
 
-// FILE is now ARRAY-based (see mini_blip.zig). FILE-specific tests moved there.
+// FILE is now ARRAY-based (see mini_blar.zig). FILE-specific tests moved there.
 
 test "verifyHash valid for dict" {
     const allocator = testing.allocator;
@@ -783,7 +783,7 @@ test "empty dict: total length matches buffer length" {
     try testing.expectEqual(@as(u64, result.len), reader.total_length);
 }
 
-// FILE with optional keys tests moved to mini_blip.zig (FILE is now ARRAY-based)
+// FILE with optional keys tests moved to mini_blar.zig (FILE is now ARRAY-based)
 
 test "verifyHash with corrupted hash bytes in dict" {
     const allocator = testing.allocator;

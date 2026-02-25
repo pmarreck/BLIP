@@ -7,7 +7,7 @@ const array_mod = @import("array.zig");
 const dict_mod = @import("dict.zig");
 const data_mod = @import("data.zig");
 const leaf = @import("leaf.zig");
-const mini_blip = @import("mini_blip.zig");
+const mini_blar = @import("mini_blar.zig");
 const peek = @import("peek.zig");
 const testing = std.testing;
 
@@ -93,7 +93,7 @@ fn classifyTarget(segments: []const peek.PathSegment) PokeTarget {
 // =============================================================================
 
 /// Reconstruct a FileEntry from a FILE container in the archive.
-fn reconstructFileEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, index: u64) !mini_blip.FileEntry {
+fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, index: u64) !mini_blar.FileEntry {
     // Get the path
     const path_slice = try reader.entryPathAt(index);
     const path = try allocator.dupe(u8, path_slice);
@@ -104,7 +104,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, i
 
     // Read metadata from the DICT
     const arr = try reader.fileArrayAt(index);
-    const meta_view = arr.elementAt(0) catch return mini_blip.FileEntry{
+    const meta_view = arr.elementAt(0) catch return mini_blar.FileEntry{
         .path = path,
         .content = content,
     };
@@ -113,7 +113,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, i
     const meta_buf = reader.buf[meta_start..meta_end];
     const meta_reader = try dict_mod.DictReader.init(meta_buf);
 
-    var entry = mini_blip.FileEntry{
+    var entry = mini_blar.FileEntry{
         .path = path,
         .content = content,
     };
@@ -216,7 +216,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, i
                 }
 
                 if (xattr_count > 0) {
-                    const xattrs = try allocator.alloc(mini_blip.XattrEntry, xattr_count);
+                    const xattrs = try allocator.alloc(mini_blar.XattrEntry, xattr_count);
                     var xi: usize = 0;
                     for (0..fork_count) |fi| {
                         const key_container = try forks_reader.keyAt(fi);
@@ -241,7 +241,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, i
 }
 
 /// Reconstruct a DirEntry from a DIR container in the archive.
-fn reconstructDirEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, index: u64) !mini_blip.DirEntry {
+fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, index: u64) !mini_blar.DirEntry {
     const dict_reader = try reader.dirDictAt(index);
 
     // Read path
@@ -250,7 +250,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, in
     const path_slice = try leaf.readUtf8(pa_container);
     const path = try allocator.dupe(u8, path_slice);
 
-    var entry = mini_blip.DirEntry{
+    var entry = mini_blar.DirEntry{
         .path = path,
         .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
@@ -338,7 +338,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, in
         const xa_reader = try dict_mod.DictReader.init(xa_container);
         const xa_count = xa_reader.pairCount();
         if (xa_count > 0) {
-            const xattrs = try allocator.alloc(mini_blip.XattrEntry, xa_count);
+            const xattrs = try allocator.alloc(mini_blar.XattrEntry, xa_count);
             for (0..xa_count) |xi| {
                 const key_container = try xa_reader.keyAt(xi);
                 const key_bytes = try dict_mod.extractKeyBytes(key_container);
@@ -358,11 +358,11 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blip.ArchiveReader, in
 
 /// Reconstruct all entries from an archive buffer into ArchiveEntry structs.
 /// Caller owns all allocated memory (entries, paths, content, etc.).
-pub fn reconstructEntries(allocator: Allocator, buf: []const u8) ![]mini_blip.ArchiveEntry {
-    const reader = try mini_blip.ArchiveReader.init(buf);
+pub fn reconstructEntries(allocator: Allocator, buf: []const u8) ![]mini_blar.ArchiveEntry {
+    const reader = try mini_blar.ArchiveReader.init(buf);
     const count = try reader.entryCount();
 
-    var entries = try allocator.alloc(mini_blip.ArchiveEntry, count);
+    var entries = try allocator.alloc(mini_blar.ArchiveEntry, count);
     errdefer allocator.free(entries);
 
     for (0..count) |i| {
@@ -568,7 +568,7 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
     }
 
     // Re-serialize the archive
-    const result = mini_blip.createFullArchive(allocator, entries) catch |e| {
+    const result = mini_blar.createFullArchive(allocator, entries) catch |e| {
         return switch (e) {
             error.OutOfMemory => PokeError.OutOfMemory,
             error.InvalidContainerType => PokeError.InvalidContainerType,
@@ -595,17 +595,17 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
 
 test "round-trip: create -> reconstruct -> re-create produces identical archive" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "hello.txt", .content = "Hello, world!\n", .mode = 0o644, .mtime_ns = 1000000 },
         .{ .path = "test.bin", .content = "binary data", .mode = 0o755, .mtime_ns = 2000000 },
     };
 
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
         .{ .file = files[1] },
     };
 
-    const archive1 = try mini_blip.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive1);
 
     // Reconstruct
@@ -641,7 +641,7 @@ test "round-trip: create -> reconstruct -> re-create produces identical archive"
     }
 
     // Re-create
-    const archive2 = try mini_blip.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
     defer allocator.free(archive2);
 
     // Should be byte-identical
@@ -650,13 +650,13 @@ test "round-trip: create -> reconstruct -> re-create produces identical archive"
 
 test "poke content: change DATA, verify via peek" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "test.txt", .content = "original", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     // Poke new content
@@ -664,7 +664,7 @@ test "poke content: change DATA, verify via peek" {
     defer allocator.free(poked);
 
     // Read back content
-    const reader = try mini_blip.ArchiveReader.init(poked);
+    const reader = try mini_blar.ArchiveReader.init(poked);
     const content = try reader.fileContentAt(0);
     try testing.expectEqualSlices(u8, "modified", content);
 
@@ -675,13 +675,13 @@ test "poke content: change DATA, verify via peek" {
 
 test "poke metadata: change path, verify" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "old.txt", .content = "data", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     // Poke new path
@@ -689,7 +689,7 @@ test "poke metadata: change path, verify" {
     defer allocator.free(poked);
 
     // Read back path
-    const reader = try mini_blip.ArchiveReader.init(poked);
+    const reader = try mini_blar.ArchiveReader.init(poked);
     const path = try reader.entryPathAt(0);
     try testing.expectEqualSlices(u8, "new.txt", path);
 
@@ -703,19 +703,19 @@ test "poke metadata: change path, verify" {
 
 test "poke empty value allowed" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "test.txt", .content = "some data", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     const poked = try pokeArchive(allocator, archive, "[1][0][1]", "");
     defer allocator.free(poked);
 
-    const reader = try mini_blip.ArchiveReader.init(poked);
+    const reader = try mini_blar.ArchiveReader.init(poked);
     const content = try reader.fileContentAt(0);
     try testing.expectEqual(@as(usize, 0), content.len);
     try testing.expect(try reader.verifyHash());
@@ -723,13 +723,13 @@ test "poke empty value allowed" {
 
 test "poke error on non-leaf target" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "test.txt", .content = "data", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     // [1][0] is a FILE container, not a leaf
@@ -742,13 +742,13 @@ test "poke error on non-leaf target" {
 
 test "poke error on magic bytes" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "test.txt", .content = "data", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     try testing.expectError(PokeError.ImmutableTarget, pokeArchive(allocator, archive, "[0]", "x"));
@@ -756,24 +756,24 @@ test "poke error on magic bytes" {
 
 test "poke multi-file: only target modified" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "a.txt", .content = "alpha", .mode = 0o644 },
         .{ .path = "b.txt", .content = "bravo", .mode = 0o644 },
         .{ .path = "c.txt", .content = "charlie", .mode = 0o644 },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
         .{ .file = files[1] },
         .{ .file = files[2] },
     };
-    const archive = try mini_blip.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive);
 
     // Poke file 1 (b.txt)
     const poked = try pokeArchive(allocator, archive, "[1][1][1]", "BRAVO");
     defer allocator.free(poked);
 
-    const reader = try mini_blip.ArchiveReader.init(poked);
+    const reader = try mini_blar.ArchiveReader.init(poked);
 
     // File 0 unchanged
     try testing.expectEqualSlices(u8, "alpha", try reader.fileContentAt(0));
@@ -791,20 +791,20 @@ test "poke multi-file: only target modified" {
 
 test "poke integrity passes after every poke" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{ .path = "test.txt", .content = "original", .mode = 0o644, .mtime_ns = 1000000, .username = "user1" },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    var archive = try mini_blip.createFullArchive(allocator, &entries);
+    var archive = try mini_blar.createFullArchive(allocator, &entries);
 
     // Poke content
     const poked1 = try pokeArchive(allocator, archive, "[1][0][1]", "new content");
     allocator.free(archive);
     archive = poked1;
 
-    var reader = try mini_blip.ArchiveReader.init(archive);
+    var reader = try mini_blar.ArchiveReader.init(archive);
     try testing.expect(try reader.verifyHash());
     try testing.expect(try reader.verifyFileAt(0));
 
@@ -813,7 +813,7 @@ test "poke integrity passes after every poke" {
     allocator.free(archive);
     archive = poked2;
 
-    reader = try mini_blip.ArchiveReader.init(archive);
+    reader = try mini_blar.ArchiveReader.init(archive);
     try testing.expect(try reader.verifyHash());
     try testing.expect(try reader.verifyFileAt(0));
 
@@ -822,20 +822,20 @@ test "poke integrity passes after every poke" {
 
 test "reconstruct preserves FILE with xattrs" {
     const allocator = testing.allocator;
-    const files = [_]mini_blip.FileEntry{
+    const files = [_]mini_blar.FileEntry{
         .{
             .path = "test.txt",
             .content = "hello",
             .mode = 0o644,
-            .xattrs = &[_]mini_blip.XattrEntry{
+            .xattrs = &[_]mini_blar.XattrEntry{
                 .{ .name = "user.comment", .value = "test xattr" },
             },
         },
     };
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive1 = try mini_blip.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive1);
 
     const reconstructed = try reconstructEntries(allocator, archive1);
@@ -869,7 +869,7 @@ test "reconstruct preserves FILE with xattrs" {
         allocator.free(reconstructed);
     }
 
-    const archive2 = try mini_blip.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
     defer allocator.free(archive2);
 
     try testing.expectEqualSlices(u8, archive1, archive2);
@@ -877,7 +877,7 @@ test "reconstruct preserves FILE with xattrs" {
 
 test "reconstruct preserves DIR entries" {
     const allocator = testing.allocator;
-    const entries = [_]mini_blip.ArchiveEntry{
+    const entries = [_]mini_blar.ArchiveEntry{
         .{ .dir = .{
             .path = "mydir",
             .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 },
@@ -891,7 +891,7 @@ test "reconstruct preserves DIR entries" {
             .mode = 0o644,
         } },
     };
-    const archive1 = try mini_blip.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
     defer allocator.free(archive1);
 
     const reconstructed = try reconstructEntries(allocator, archive1);
@@ -925,7 +925,7 @@ test "reconstruct preserves DIR entries" {
         allocator.free(reconstructed);
     }
 
-    const archive2 = try mini_blip.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
     defer allocator.free(archive2);
 
     try testing.expectEqualSlices(u8, archive1, archive2);

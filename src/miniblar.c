@@ -1,7 +1,7 @@
 /*
  * miniblar -- Minimal BLIP Archive CLI
  *
- * Creates flat miniBLIP archives (FILE entries only, no directory support,
+ * Creates flat miniBlar archives (FILE entries only, no directory support,
  * no metadata). For full directory and metadata support, use blar.
  *
  * Usage:

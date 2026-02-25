@@ -1,16 +1,16 @@
-# BLIP Container Library + miniBLIP Design
+# BLIP Container Library + miniBlar Design
 
 **Date:** 2026-02-23
 **Status:** Approved
 
 ## Goal
 
-Implement the BLIP Container Format (BLIP_CONTAINER_SPEC.md v1.1) as a Zig library with C FFI, plus a "miniBLIP" high-level API for entropy_shield's virtual manifest use case.
+Implement the BLIP Container Format (BLIP_CONTAINER_SPEC.md v1.1) as a Zig library with C FFI, plus a "miniBlar" high-level API for entropy_shield's virtual manifest use case.
 
 ## Decisions
 
 - **Architecture:** Layered module stack (one file per container type)
-- **miniBLIP scope:** ARRAY + FILE (as sorted DICT) + UTF8 keys + RAW values + xxHash64 on outer ARRAY
+- **miniBlar scope:** ARRAY + FILE (as sorted DICT) + UTF8 keys + RAW values + xxHash64 on outer ARRAY
 - **Repo:** Same repo (pmarreck/BLIP), entropy_shield imports as dependency
 - **C FFI:** Both Zig module and C API
 - **xxHash64:** Use std.hash.XxHash64
@@ -27,7 +27,7 @@ src/
   leaf.zig              -- UTF8 + RAW serialize/parse
   array.zig             -- ARRAY serialize/parse, index table, xxHash64
   dict.zig              -- DICT/MAP/FILE serialize/parse, key ordering, index
-  mini_blip.zig         -- high-level miniBLIP API (createArchive, readArchive)
+  mini_blar.zig         -- high-level miniBlar API (createArchive, readArchive)
   container_lib.zig     -- C FFI exports for container operations
   container.h           -- C header for container FFI
 ```
@@ -50,7 +50,7 @@ Writer builds containers bottom-up (leaves first), serializes to `[]u8`. Reader 
 - `dict.serializeDict(allocator, pairs) -> []u8` (canonical key order)
 - `dict.serializeFile(allocator, pairs) -> []u8` (validates required keys)
 - `array.serializeArray(allocator, elements) -> []u8` (index + xxHash64)
-- `mini_blip.createArchive(allocator, files) -> []u8`
+- `mini_blar.createArchive(allocator, files) -> []u8`
 
 Self-referential length: iterate to find L where `2 + blip_size(L) + V_size == L`.
 
@@ -61,7 +61,7 @@ Self-referential length: iterate to find L where `2 + blip_size(L) + V_size == L
 - `dict.readDict(buf) -> DictReader` (keyAt, valueAt, findKey, verifyHash)
 - `leaf.readUtf8(view) -> []const u8`
 - `leaf.readRaw(view) -> []const u8`
-- `mini_blip.readArchive(buf) -> ArchiveReader`
+- `mini_blar.readArchive(buf) -> ArchiveReader`
 
 ## Testing (~100 tests)
 
@@ -70,7 +70,7 @@ Self-referential length: iterate to find L where `2 + blip_size(L) + V_size == L
 3. Array round-trips + index verification (~20)
 4. Dict round-trips + key ordering + binary search (~20)
 5. FILE validation (required keys) (~10)
-6. miniBLIP archive end-to-end (~15)
+6. miniBlar archive end-to-end (~15)
 7. Spec compliance (hand-crafted byte sequences) (~10)
 8. C FFI round-trips (~5)
 

@@ -82,28 +82,6 @@ BLIP also defines a recursive binary container format (TLV) for archives, dictio
 
 Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, Merkle hash trees for directories, and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming (content-only and whole-file). All metadata uses compact 2-character key names.
 
-### miniBLIP Archive API
-
-The `mini_blip` module provides a high-level API for creating and reading BLIP archives:
-
-```zig
-const mini_blip = @import("mini_blip.zig");
-
-// Create an archive
-const files = [_]mini_blip.FileEntry{
-    .{ .path = "hello.txt", .content = "Hello, world!\n" },
-    .{ .path = "src/main.zig", .content = source_bytes, .mode = 0o644, .mtime_ns = 1708787200_000_000_000 },
-};
-const archive = try mini_blip.createArchive(allocator, &files);
-defer allocator.free(archive);
-
-// Read an archive
-const reader = try mini_blip.ArchiveReader.init(archive);
-const count = try reader.entryCount();    // 2
-const path = try reader.entryPathAt(0);   // "hello.txt"
-const content = try reader.fileContentAt(0);  // "Hello, world!\n"
-```
-
 ## C FFI
 
 BLIP is available as a C library. Link against `libblip.a` and include `src/blip.h`:
@@ -328,6 +306,28 @@ miniblar tf bundle.mblar
 ```
 
 `miniblar` rejects directory arguments — use `blar` for directory trees and Merkle hashing.
+
+### Zig API
+
+The `mini_blar` module provides a high-level API for creating and reading BLIP archives:
+
+```zig
+const mini_blar = @import("mini_blar.zig");
+
+// Create an archive
+const files = [_]mini_blar.FileEntry{
+    .{ .path = "hello.txt", .content = "Hello, world!\n" },
+    .{ .path = "src/main.zig", .content = source_bytes, .mode = 0o644, .mtime_ns = 1708787200_000_000_000 },
+};
+const archive = try mini_blar.createArchive(allocator, &files);
+defer allocator.free(archive);
+
+// Read an archive
+const reader = try mini_blar.ArchiveReader.init(archive);
+const count = try reader.entryCount();    // 2
+const path = try reader.entryPathAt(0);   // "hello.txt"
+const content = try reader.fileContentAt(0);  // "Hello, world!\n"
+```
 
 ## License
 

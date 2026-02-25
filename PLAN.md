@@ -24,7 +24,7 @@
 - [x] leaf.zig — UTF8 + RAW container serialize/parse
 - [x] array.zig — ARRAY with fixpoint iteration, index tables, xxHash64
 - [x] dict.zig — DICT/FILE with key ordering, interleaved index
-- [x] mini_blip.zig — high-level archive API (createArchive, ArchiveReader)
+- [x] mini_blar.zig — high-level archive API (createArchive, ArchiveReader)
 - [x] Container C FFI exports (blip_archive_create, verify, file_count, free)
 - [x] 447 tests total (all passing)
 

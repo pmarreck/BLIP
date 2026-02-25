@@ -53,7 +53,7 @@ const char *blip_error_string(int32_t error_code);
 Add to `src/lib.zig` after the existing imports:
 
 ```zig
-const ContainerError = blip.mini_blip_mod.ContainerError;
+const ContainerError = blip.mini_blar_mod.ContainerError;
 
 /// Map a ContainerError to a C FFI error code.
 fn containerErrorCode(err: ContainerError) i32 {
@@ -223,8 +223,8 @@ Expected: FAIL — `blip_archive_file_path`, `blip_archive_file_content`, `blip_
 Add to `src/lib.zig` after the existing `blip_free` function:
 
 ```zig
-const leaf = blip.mini_blip_mod.leaf;
-const dict_mod = blip.mini_blip_mod.dict_mod;
+const leaf = blip.mini_blar_mod.leaf;
+const dict_mod = blip.mini_blar_mod.dict_mod;
 
 /// Get the file path at the given index in a BLIP archive.
 /// Returns BLIP_OK (0) on success, or a negative error code.
@@ -237,7 +237,7 @@ export fn blip_archive_file_path(
     out_path_len: *usize,
 ) callconv(.c) i32 {
     const archive_buf = buf[0..buf_len];
-    const reader = mini_blip.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
     const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
     const path_idx = file_reader.findKey("path") catch |e| return containerErrorCode(e);
     const idx = path_idx orelse return -14; // NOT_FOUND
@@ -259,7 +259,7 @@ export fn blip_archive_file_content(
     out_data_len: *usize,
 ) callconv(.c) i32 {
     const archive_buf = buf[0..buf_len];
-    const reader = mini_blip.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
     const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
     const bina_idx = file_reader.findKey("bina") catch |e| return containerErrorCode(e);
     const idx = bina_idx orelse return -14; // NOT_FOUND
@@ -283,7 +283,7 @@ export fn blip_archive_file_content_by_path(
 ) callconv(.c) i32 {
     const archive_buf = buf[0..buf_len];
     const path_str = path[0..path_len];
-    const reader = mini_blip.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
     const file_reader_opt = reader.findFile(path_str) catch |e| return containerErrorCode(e);
     const file_reader = file_reader_opt orelse return -14; // NOT_FOUND
     const bina_idx = file_reader.findKey("bina") catch |e| return containerErrorCode(e);
@@ -303,7 +303,7 @@ export fn blip_archive_file_verify(
     index: u64,
 ) callconv(.c) i32 {
     const archive_buf = buf[0..buf_len];
-    const reader = mini_blip.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
+    const reader = mini_blar.ArchiveReader.init(archive_buf) catch |e| return containerErrorCode(e);
     const file_reader = reader.fileAt(index) catch |e| return containerErrorCode(e);
 
     // Get stored xh64
@@ -372,16 +372,16 @@ git commit -m "Add FFI functions for archive file access and verification"
 
 ### Task 3: Expose re-exports for leaf and dict_mod through blip.zig
 
-The FFI functions in lib.zig need to access `leaf` and `dict_mod` through the `blip` module. Currently `mini_blip_mod` is re-exported from `blip.zig`, but we need `leaf` and `dict_mod` accessible too.
+The FFI functions in lib.zig need to access `leaf` and `dict_mod` through the `blip` module. Currently `mini_blar_mod` is re-exported from `blip.zig`, but we need `leaf` and `dict_mod` accessible too.
 
 **Files:**
-- Modify: `src/mini_blip.zig` — verify `leaf` and `dict_mod` are `pub`
+- Modify: `src/mini_blar.zig` — verify `leaf` and `dict_mod` are `pub`
 
 **Step 1: Check and fix visibility**
 
-In `src/mini_blip.zig`, the imports of `leaf` and `dict_mod` are currently private (`const`). They need to be `pub const` so that `lib.zig` can access them through `blip.mini_blip_mod.leaf` and `blip.mini_blip_mod.dict_mod`.
+In `src/mini_blar.zig`, the imports of `leaf` and `dict_mod` are currently private (`const`). They need to be `pub const` so that `lib.zig` can access them through `blip.mini_blar_mod.leaf` and `blip.mini_blar_mod.dict_mod`.
 
-Change in `src/mini_blip.zig`:
+Change in `src/mini_blar.zig`:
 ```zig
 // Change these from:
 const leaf = @import("leaf.zig");
@@ -401,8 +401,8 @@ Expected: All tests still pass.
 **Step 3: Commit**
 
 ```bash
-git add src/mini_blip.zig
-git commit -m "Make leaf and dict_mod public in mini_blip for FFI access"
+git add src/mini_blar.zig
+git commit -m "Make leaf and dict_mod public in mini_blar for FFI access"
 ```
 
 ---

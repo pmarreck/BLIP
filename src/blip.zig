@@ -633,7 +633,7 @@ test "encodedSize matches actual encode size" {
 // ---------------------------------------------------------------------------
 pub const encoding = @import("encoding.zig");
 pub const bignum_mod = @import("bignum.zig");
-pub const mini_blip_mod = @import("mini_blip.zig");
+pub const mini_blar_mod = @import("mini_blar.zig");
 pub const array_mod = @import("array.zig");
 pub const data_mod = @import("data.zig");
 pub const peek_mod = @import("peek.zig");
@@ -659,5 +659,5 @@ test {
     _ = @import("data.zig");
     _ = @import("peek.zig");
     _ = @import("poke.zig");
-    _ = @import("mini_blip.zig");
+    _ = @import("mini_blar.zig");
 }
