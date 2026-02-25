@@ -638,6 +638,7 @@ pub const array_mod = @import("array.zig");
 pub const data_mod = @import("data.zig");
 pub const peek_mod = @import("peek.zig");
 pub const poke_mod = @import("poke.zig");
+pub const json_serde = @import("json_serde.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -660,4 +661,5 @@ test {
     _ = @import("peek.zig");
     _ = @import("poke.zig");
     _ = @import("mini_blar.zig");
+    _ = @import("json_serde.zig");
 }

@@ -60,10 +60,22 @@
 - [x] All existing tests still pass (141 tests across 5 suites)
 - [x] README documentation
 
+## JSON Serialization/Deserialization (Completed 2026-02-25)
+- [x] json_serde.zig — archiveToJson, jsonToArchive, timestamp/mode formatting
+- [x] High-level structured JSON format (entries array with type/path/content/metadata)
+- [x] Printable-binary encoding for binary content in JSON strings
+- [x] Merkle hash recomputation for DIR entries on from-json
+- [x] C FFI: blip_to_json, blip_from_json exports in lib.zig + blip.h
+- [x] blar/miniblar CLI: to-json + from-json commands, j/J tar-style flags
+- [x] Full jq integration: content/path/mode/timestamp manipulation, add/remove entries
+- [x] Integration tests: 34 JSON tests + 12 Zig unit tests (all passing)
+- [x] All existing tests still pass (158 tests across 6 suites)
+- [x] README documentation with jq pipeline examples
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
 - [ ] Cross-language implementations (C, Rust, etc.)
 - [ ] Compression wrapper container type
-- [ ] Binary data manipulation DSL — extend peek/poke into a full structural editor (insert/delete array elements, add/remove dict keys, splice content, move entries, etc.)
+- [ ] Binary data manipulation DSL — extend peek/poke into a full structural editor (insert/delete array elements, add/remove dict keys, splice content, move entries, etc.). Note: JSON interchange (`to-json | jq | from-json`) already covers most high-level manipulation use cases.
 - [ ] Segmentation container type — a new top-level container for splitting large archives into fixed-size segments (e.g. for transport over size-limited channels, span across volumes, or resumable transfers)

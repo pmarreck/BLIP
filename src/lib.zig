@@ -106,6 +106,11 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -15 => "invalid path",
         -16 => "immutable target (magic bytes)",
         -17 => "not a leaf (cannot poke containers)",
+        -18 => "invalid JSON",
+        -19 => "missing required field",
+        -20 => "invalid entry type",
+        -21 => "invalid timestamp",
+        -22 => "invalid mode",
         else => "unknown error",
     };
 }
@@ -608,6 +613,72 @@ export fn blip_encode_printable_binary(
     const encoded = pb.encode(page_allocator, input_slice, .{}) catch return -13;
     out_buf.* = encoded.ptr;
     out_len.* = encoded.len;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// JSON serde C FFI exports
+// ---------------------------------------------------------------------------
+
+const json_serde = blip.json_serde;
+
+/// Map JsonSerdeError to a C FFI error code.
+fn jsonSerdeErrorCode(err: json_serde.JsonSerdeError) i32 {
+    return switch (err) {
+        error.OutOfMemory => -13,
+        error.InvalidJson => -18,
+        error.MissingRequiredField => -19,
+        error.InvalidEntryType => -20,
+        error.InvalidTimestamp => -21,
+        error.InvalidMode => -22,
+        error.InvalidContainerType => -1,
+        error.InvalidLength => -2,
+        error.LengthExceedsBounds => -3,
+        error.MissingRequiredKey => -4,
+        error.DuplicateKey => -5,
+        error.KeysNotSorted => -6,
+        error.HashMismatch => -7,
+        error.IndexOutOfBounds => -8,
+        error.InvalidMagic => -9,
+        error.BufferTooSmall => -10,
+        error.UnexpectedEndOfInput => -11,
+        error.Overflow => -12,
+    };
+}
+
+/// Convert a BLIP archive to JSON.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_to_json(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const result = json_serde.archiveToJson(page_allocator, slice) catch |e| {
+        return jsonSerdeErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Convert JSON to a BLIP archive.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_from_json(
+    json_buf: [*]const u8,
+    json_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const json_slice = json_buf[0..json_len];
+    const result = json_serde.jsonToArchive(page_allocator, json_slice) catch |e| {
+        return jsonSerdeErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
     return 0;
 }
 

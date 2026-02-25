@@ -79,8 +79,10 @@ pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
     return result;
 }
 
-/// The magic bytes identifying a miniBlar archive: "BLIP" + version 1.
-const MAGIC: *const [5]u8 = "BLIP\x01";
+/// Magic bytes for full blar archives (with DIR support): "BLAR" + version 1.
+pub const MAGIC_BLAR: *const [5]u8 = "BLAR\x01";
+/// Magic bytes for miniblar archives (flat files only): "MBAR" + version 1.
+pub const MAGIC_MBAR: *const [5]u8 = "MBAR\x01";
 
 /// Serialize a FILE entry as an ARRAY-based container.
 /// Layout: FILE (0x81 0x05, ARRAY layout)
@@ -442,8 +444,8 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
         try file_elements.append(allocator, file_bytes);
     }
 
-    // Serialize magic: RAW("BLIP\x01")
-    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC);
+    // Serialize magic: RAW("MBAR\x01")
+    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC_MBAR);
     try to_free.append(allocator, magic_bytes);
 
     // Serialize body array (containing all FILE elements)
@@ -495,8 +497,8 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
         }
     }
 
-    // Serialize magic: RAW("BLIP\x01")
-    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC);
+    // Serialize magic: RAW("BLAR\x01")
+    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC_BLAR);
     try to_free.append(allocator, magic_bytes);
 
     // Serialize body array (containing all entries)
@@ -525,12 +527,29 @@ pub const ArchiveReader = struct {
     }
 
     /// Verify the magic bytes at element 0.
+    /// Accepts both BLAR (full) and MBAR (miniblar) magic.
     pub fn verifyMagic(self: ArchiveReader) ContainerError!bool {
         if (self.outer.elementCount() < 1) return false;
         const view = try self.outer.elementAt(0);
         if (view.container_type != .raw) return false;
         const value = view.valueSlice();
-        return std.mem.eql(u8, value, MAGIC);
+        return std.mem.eql(u8, value, MAGIC_BLAR) or std.mem.eql(u8, value, MAGIC_MBAR);
+    }
+
+    /// Check if this archive has full blar magic (BLAR).
+    pub fn isBlar(self: ArchiveReader) ContainerError!bool {
+        if (self.outer.elementCount() < 1) return false;
+        const view = try self.outer.elementAt(0);
+        if (view.container_type != .raw) return false;
+        return std.mem.eql(u8, view.valueSlice(), MAGIC_BLAR);
+    }
+
+    /// Check if this archive has miniblar magic (MBAR).
+    pub fn isMiniblar(self: ArchiveReader) ContainerError!bool {
+        if (self.outer.elementCount() < 1) return false;
+        const view = try self.outer.elementAt(0);
+        if (view.container_type != .raw) return false;
+        return std.mem.eql(u8, view.valueSlice(), MAGIC_MBAR);
     }
 
     /// Returns the number of entries in the archive.

@@ -23,6 +23,11 @@
 #define BLIP_ERR_ALLOC            -13
 #define BLIP_ERR_NOT_FOUND        -14
 #define BLIP_ERR_INVALID_PATH     -15
+#define BLIP_ERR_INVALID_JSON     -18
+#define BLIP_ERR_MISSING_FIELD    -19
+#define BLIP_ERR_INVALID_ENTRY    -20
+#define BLIP_ERR_INVALID_TIMESTAMP -21
+#define BLIP_ERR_INVALID_MODE     -22
 #define BLIP_ERR_UNKNOWN          -99
 
 /* Archive creation flags */
@@ -201,6 +206,20 @@ int32_t blip_poke(const uint8_t *buf, size_t buf_len,
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_encode_printable_binary(const uint8_t *input, size_t input_len,
                                       uint8_t **out_buf, size_t *out_len);
+
+/* --- JSON serialization/deserialization --- */
+
+/* Convert a BLIP archive to JSON.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_to_json(const uint8_t *buf, size_t buf_len,
+                     uint8_t **out_buf, size_t *out_len);
+
+/* Convert JSON to a BLIP archive.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
+                       uint8_t **out_buf, size_t *out_len);
 
 #ifdef __cplusplus
 }

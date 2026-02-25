@@ -41,6 +41,8 @@ static int cmd_info(int argc, char **argv);
 static int cmd_cat(int argc, char **argv);
 static int cmd_peek(int argc, char **argv);
 static int cmd_poke(int argc, char **argv);
+static int cmd_to_json(int argc, char **argv);
+static int cmd_from_json(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -245,6 +247,8 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "cat") == 0)    return cmd_cat(argc - 2, argv + 2);
     if (strcmp(arg1, "peek") == 0)   return cmd_peek(argc - 2, argv + 2);
     if (strcmp(arg1, "poke") == 0)   return cmd_poke(argc - 2, argv + 2);
+    if (strcmp(arg1, "to-json") == 0) return cmd_to_json(argc - 2, argv + 2);
+    if (strcmp(arg1, "from-json") == 0) return cmd_from_json(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -259,6 +263,8 @@ int main(int argc, char **argv) {
         case OP_CAT:     return cmd_cat(argc - 2, argv + 2);
         case OP_PEEK:    return cmd_peek(argc - 2, argv + 2);
         case OP_POKE:    return cmd_poke(argc - 2, argv + 2);
+        case OP_TO_JSON: return cmd_to_json(argc - 2, argv + 2);
+        case OP_FROM_JSON: return cmd_from_json(argc - 2, argv + 2);
         case OP_NONE:    break;
         }
     }
@@ -286,6 +292,8 @@ static void print_usage(FILE *out) {
         "  cat <archive> <path>                   Print file contents to stdout\n"
         "  peek <archive> [<path>] [flags]        Inspect archive structure\n"
         "  poke <archive> <path> [options]        Modify a value in archive\n"
+        "  to-json <archive>                     Convert archive to JSON (stdout)\n"
+        "  from-json [-o <archive>] [<json>]     Convert JSON to archive\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -296,6 +304,8 @@ static void print_usage(FILE *out) {
         "  blar pf  <archive> <path>              Cat\n"
         "  blar kf  <archive> [<path>] [flags]    Peek\n"
         "  blar Kf  <archive> <path> [options]   Poke\n"
+        "  blar jf  <archive>                    To-JSON\n"
+        "  blar Jf  ... -o <archive>             From-JSON\n"
         "\n"
         "Tar-style flags:\n"
         "  P                             Absolute names (preserve leading /)\n"
@@ -906,4 +916,16 @@ static int cmd_peek(int argc, char **argv) {
 
 static int cmd_poke(int argc, char **argv) {
     return cmd_poke_common("blar", argc, argv);
+}
+
+/* ── cmd_to_json ──────────────────────────────────────────────────────── */
+
+static int cmd_to_json(int argc, char **argv) {
+    return cmd_to_json_common("blar", argc, argv);
+}
+
+/* ── cmd_from_json ────────────────────────────────────────────────────── */
+
+static int cmd_from_json(int argc, char **argv) {
+    return cmd_from_json_common("blar", argc, argv);
 }

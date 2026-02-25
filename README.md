@@ -139,6 +139,15 @@ blar cat archive.blar path/to/file.txt
 
 # Modify a value in the archive
 blar poke archive.blar "[1][0][1]" --value "new content"
+
+# Convert archive to JSON (pipe to jq for manipulation)
+blar to-json archive.blar | jq '.entries[].path'
+
+# Modify via jq and create new archive
+blar to-json a.blar | jq '(.entries[] | select(.path=="hello.txt")).content = "new"' | blar from-json -o b.blar
+
+# Add a file via jq
+blar to-json a.blar | jq '.entries += [{"type":"file","path":"new.txt","content":"added"}]' | blar from-json -o b.blar
 ```
 
 ### Tar-style shortcuts (hyphen optional)
@@ -152,6 +161,8 @@ blar If archive.blar              # info
 blar pf archive.blar file.txt     # cat (print)
 blar kf archive.blar "[1][0]"     # peek
 blar Kf archive.blar "[1][0][1]"  # poke
+blar jf archive.blar              # to-json
+blar Jf input.json -o out.blar    # from-json
 ```
 
 ### Inspecting archives (peek)
@@ -254,6 +265,44 @@ $ blar peek archive.blar "[1][0][1]" --hex
 This isn't just a debugging tool — it's a **verification tool**. You can extract the stored hash of any container and independently verify it against `xxhsum`. You can inspect metadata without extracting. You can trace the Merkle hash tree of a directory archive from leaf to root. No other archive format gives you this level of structural transparency.
 
 **`poke` — the write counterpart to peek.** Same path syntax, but *sets* values. C64 PEEK/POKE for binary archives — read any value, write any value, with automatic hash recomputation across the entire archive. See [Modifying archives](#modifying-archives-poke) above.
+
+### JSON interchange (to-json / from-json)
+
+JSON is the universal interchange format for BLIP archives. Convert any archive to JSON, manipulate it with `jq` (or any tool that speaks JSON), and convert back:
+
+```bash
+# List all file paths
+blar to-json archive.blar | jq '.entries[].path'
+
+# Change file content
+blar to-json a.blar \
+  | jq '(.entries[] | select(.path=="hello.txt")).content = "new"' \
+  | blar from-json -o b.blar
+
+# Add a file
+blar to-json a.blar \
+  | jq '.entries += [{"type":"file","path":"new.txt","content":"hello"}]' \
+  | blar from-json -o b.blar
+
+# Remove a file
+blar to-json a.blar \
+  | jq '.entries = [.entries[] | select(.path != "remove-me.txt")]' \
+  | blar from-json -o b.blar
+
+# Rename a file
+blar to-json a.blar \
+  | jq '(.entries[] | select(.path=="old.txt")).path = "new.txt"' \
+  | blar from-json -o b.blar
+
+# Change permissions
+blar to-json a.blar \
+  | jq '(.entries[] | select(.path=="script.sh")).mode = "0755"' \
+  | blar from-json -o b.blar
+```
+
+Binary content is encoded using printable-binary encoding in JSON strings, which preserves all 256 byte values safely within JSON. All hashes, offsets, and index tables are recomputed automatically on `from-json`.
+
+`miniblar to-json` and `miniblar from-json` work identically.
 
 ## BLIP Archive (blar) vs tar
 

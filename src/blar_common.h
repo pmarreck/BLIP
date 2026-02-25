@@ -56,6 +56,8 @@ typedef enum {
     OP_CAT,
     OP_PEEK,
     OP_POKE,
+    OP_TO_JSON,
+    OP_FROM_JSON,
 } operation_t;
 
 /* ── Utility: read entire file into malloc'd buffer ──────────────────── */
@@ -278,6 +280,14 @@ static operation_t parse_tar_flags(const char *flags, bool *has_f) {
         case 'K':
             if (op != OP_NONE) return OP_NONE;
             op = OP_POKE;
+            break;
+        case 'j':
+            if (op != OP_NONE) return OP_NONE;
+            op = OP_TO_JSON;
+            break;
+        case 'J':
+            if (op != OP_NONE) return OP_NONE;
+            op = OP_FROM_JSON;
             break;
         case 'P':
             break; /* absolute-names: handled by caller after parse */
@@ -667,6 +677,155 @@ static int cmd_poke_common(const char *prog, int argc, char **argv) {
     }
 
     blip_free(out_buf, out_len);
+    return EXIT_OK;
+}
+
+/* ── to-json: convert archive to JSON ─────────────────────────────────── */
+
+static void to_json_usage(FILE *out, const char *prog) {
+    fprintf(out,
+        "Usage: %s to-json <archive>\n"
+        "\n"
+        "Convert a BLIP archive to JSON and write to stdout.\n"
+        "The JSON can be piped through jq for manipulation,\n"
+        "then piped to 'from-json' to create a new archive.\n"
+        "\n"
+        "Examples:\n"
+        "  %s to-json archive.blar | jq '.entries[].path'\n"
+        "  %s to-json a.blar | jq '(.entries[] | select(.path==\"hello.txt\")).content = \"new\"' | %s from-json -o b.blar\n",
+        prog, prog, prog, prog);
+}
+
+static int cmd_to_json_common(const char *prog, int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            to_json_usage(stdout, prog);
+            return EXIT_OK;
+        }
+    }
+
+    if (argc < 1) {
+        to_json_usage(stderr, prog);
+        return EXIT_USAGE;
+    }
+
+    const char *archive_path = argv[0];
+    size_t buf_len = 0;
+    uint8_t *buf = read_file(archive_path, &buf_len);
+    if (!buf) {
+        fprintf(stderr, "%s: to-json: cannot open '%s': %s\n",
+                prog, archive_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    uint8_t *json_buf = NULL;
+    size_t json_len = 0;
+    int32_t rc = blip_to_json(buf, buf_len, &json_buf, &json_len);
+    free(buf);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "%s: to-json: %s\n", prog, blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    if (json_len > 0) fwrite(json_buf, 1, json_len, stdout);
+    blip_free(json_buf, json_len);
+    return EXIT_OK;
+}
+
+/* ── from-json: convert JSON to archive ──────────────────────────────── */
+
+static void from_json_usage(FILE *out, const char *prog) {
+    fprintf(out,
+        "Usage: %s from-json [-o <output>] [<json-file>]\n"
+        "\n"
+        "Convert JSON to a BLIP archive.\n"
+        "Reads JSON from a file argument or stdin.\n"
+        "\n"
+        "Options:\n"
+        "  -o <output>   Write archive to specified file (required unless piping)\n"
+        "\n"
+        "Examples:\n"
+        "  %s from-json input.json -o output.blar\n"
+        "  cat input.json | %s from-json -o output.blar\n"
+        "  %s to-json a.blar | jq '...' | %s from-json -o b.blar\n",
+        prog, prog, prog, prog, prog);
+}
+
+static int cmd_from_json_common(const char *prog, int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            from_json_usage(stdout, prog);
+            return EXIT_OK;
+        }
+    }
+
+    const char *output_path = NULL;
+    const char *input_file = NULL;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: from-json: -o requires an argument\n", prog);
+                return EXIT_USAGE;
+            }
+            output_path = argv[++i];
+        } else if (argv[i][0] != '-') {
+            if (!input_file)
+                input_file = argv[i];
+            else {
+                fprintf(stderr, "%s: from-json: unexpected argument '%s'\n", prog, argv[i]);
+                return EXIT_USAGE;
+            }
+        } else {
+            fprintf(stderr, "%s: from-json: unknown option '%s'\n", prog, argv[i]);
+            return EXIT_USAGE;
+        }
+    }
+
+    if (!output_path) {
+        fprintf(stderr, "%s: from-json: -o <output> is required\n", prog);
+        return EXIT_USAGE;
+    }
+
+    /* Read JSON from file or stdin */
+    uint8_t *json_buf = NULL;
+    size_t json_len = 0;
+
+    if (input_file) {
+        json_buf = read_file(input_file, &json_len);
+        if (!json_buf) {
+            fprintf(stderr, "%s: from-json: cannot open '%s': %s\n",
+                    prog, input_file, strerror(errno));
+            return EXIT_IO;
+        }
+    } else {
+        json_buf = read_stdin_all(&json_len);
+        if (!json_buf) {
+            fprintf(stderr, "%s: from-json: cannot read from stdin\n", prog);
+            return EXIT_IO;
+        }
+    }
+
+    /* Convert JSON to archive */
+    uint8_t *archive_buf = NULL;
+    size_t archive_len = 0;
+    int32_t rc = blip_from_json(json_buf, json_len, &archive_buf, &archive_len);
+    free(json_buf);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "%s: from-json: %s\n", prog, blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    if (!write_file(output_path, archive_buf, archive_len)) {
+        fprintf(stderr, "%s: from-json: cannot write '%s': %s\n",
+                prog, output_path, strerror(errno));
+        blip_free(archive_buf, archive_len);
+        return EXIT_IO;
+    }
+
+    blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
 
