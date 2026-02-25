@@ -104,6 +104,8 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -13 => "allocation failure",
         -14 => "not found",
         -15 => "invalid path",
+        -16 => "immutable target (magic bytes)",
+        -17 => "not a leaf (cannot poke containers)",
         else => "unknown error",
     };
 }
@@ -543,6 +545,55 @@ export fn blip_peek_display(
     result.stderr_buf = &.{};
 
     return if (had_error) @as(i32, -1) else @as(i32, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Poke C FFI exports
+// ---------------------------------------------------------------------------
+
+const poke_mod = blip.poke_mod;
+
+/// Modify a value in a BLIP archive at the given path expression.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free out_buf with blip_free().
+export fn blip_poke(
+    buf: [*]const u8,
+    buf_len: usize,
+    path: [*]const u8,
+    path_len: usize,
+    new_value: [*]const u8,
+    new_value_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const path_str = path[0..path_len];
+    const value_slice = if (new_value_len > 0) new_value[0..new_value_len] else &[_]u8{};
+
+    const result = poke_mod.pokeArchive(page_allocator, slice, path_str, value_slice) catch |e| {
+        return switch (e) {
+            error.ImmutableTarget => @as(i32, -16),
+            error.NotALeaf => @as(i32, -17),
+            error.OutOfMemory => @as(i32, -13),
+            error.InvalidContainerType => @as(i32, -1),
+            error.InvalidLength => @as(i32, -2),
+            error.LengthExceedsBounds => @as(i32, -3),
+            error.MissingRequiredKey => @as(i32, -4),
+            error.DuplicateKey => @as(i32, -5),
+            error.KeysNotSorted => @as(i32, -6),
+            error.HashMismatch => @as(i32, -7),
+            error.IndexOutOfBounds => @as(i32, -8),
+            error.InvalidMagic => @as(i32, -9),
+            error.BufferTooSmall => @as(i32, -10),
+            error.UnexpectedEndOfInput => @as(i32, -11),
+            error.Overflow => @as(i32, -12),
+            error.UnclosedBracket, error.EmptyBracket, error.InvalidIndex, error.UnexpectedCharacter => @as(i32, -15),
+        };
+    };
+
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
 }
 
 /// Encode binary data as printable-binary UTF-8.

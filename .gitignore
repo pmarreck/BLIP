@@ -3,3 +3,5 @@ zig-out/
 .cache/
 .codescan/
 result
+*.blar
+*.mblar

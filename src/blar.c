@@ -40,6 +40,7 @@ static int cmd_verify(int argc, char **argv);
 static int cmd_info(int argc, char **argv);
 static int cmd_cat(int argc, char **argv);
 static int cmd_peek(int argc, char **argv);
+static int cmd_poke(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -243,6 +244,7 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "info") == 0)   return cmd_info(argc - 2, argv + 2);
     if (strcmp(arg1, "cat") == 0)    return cmd_cat(argc - 2, argv + 2);
     if (strcmp(arg1, "peek") == 0)   return cmd_peek(argc - 2, argv + 2);
+    if (strcmp(arg1, "poke") == 0)   return cmd_poke(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -256,6 +258,7 @@ int main(int argc, char **argv) {
         case OP_INFO:    return cmd_info(argc - 2, argv + 2);
         case OP_CAT:     return cmd_cat(argc - 2, argv + 2);
         case OP_PEEK:    return cmd_peek(argc - 2, argv + 2);
+        case OP_POKE:    return cmd_poke(argc - 2, argv + 2);
         case OP_NONE:    break;
         }
     }
@@ -282,6 +285,7 @@ static void print_usage(FILE *out) {
         "  info <archive>                         Show archive information\n"
         "  cat <archive> <path>                   Print file contents to stdout\n"
         "  peek <archive> [<path>] [flags]        Inspect archive structure\n"
+        "  poke <archive> <path> [options]        Modify a value in archive\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -291,6 +295,7 @@ static void print_usage(FILE *out) {
         "  blar If  <archive>                     Info\n"
         "  blar pf  <archive> <path>              Cat\n"
         "  blar kf  <archive> [<path>] [flags]    Peek\n"
+        "  blar Kf  <archive> <path> [options]   Poke\n"
         "\n"
         "Tar-style flags:\n"
         "  P                             Absolute names (preserve leading /)\n"
@@ -895,4 +900,10 @@ static int cmd_cat(int argc, char **argv) {
 
 static int cmd_peek(int argc, char **argv) {
     return cmd_peek_common("blar", argc, argv);
+}
+
+/* ── cmd_poke ─────────────────────────────────────────────────────────── */
+
+static int cmd_poke(int argc, char **argv) {
+    return cmd_poke_common("blar", argc, argv);
 }

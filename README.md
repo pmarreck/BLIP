@@ -158,6 +158,9 @@ blar info archive.blar
 
 # Print single file to stdout
 blar cat archive.blar path/to/file.txt
+
+# Modify a value in the archive
+blar poke archive.blar "[1][0][1]" --value "new content"
 ```
 
 ### Tar-style shortcuts (hyphen optional)
@@ -170,6 +173,7 @@ blar Vf archive.blar              # verify
 blar If archive.blar              # info
 blar pf archive.blar file.txt     # cat (print)
 blar kf archive.blar "[1][0]"     # peek
+blar Kf archive.blar "[1][0][1]"  # poke
 ```
 
 ### Inspecting archives (peek)
@@ -206,6 +210,32 @@ blar peek archive.blar "[1][0]" --type          # FILE (shorthand for .type)
 Archive structure: `ARRAY[RAW magic, ARRAY[FILE[DICT{metadata}, DATA{content}], ...]]`. So `[0]` is the magic, `[1]` is the body array, `[1][0]` is the first file entry, `[1][0][0]` is its metadata dict, and `[1][0][1]` is its content. Known metadata keys (md, mt, ct, bt, ui, gi, xh) get semantic display (octal, ISO 8601, decimal, hex).
 
 `miniblar peek` works identically.
+
+### Modifying archives (poke)
+
+Modify any leaf value in a BLIP archive with automatic hash recomputation:
+
+```bash
+# Replace file content via stdin
+echo -n "new content" | blar poke archive.blar "[1][0][1]"
+
+# Replace file content with --value flag
+blar poke archive.blar "[1][0][1]" --value "hello world"
+
+# Rename a file
+blar poke archive.blar "[1][0][0][pa]" --value "renamed.txt"
+
+# Read new value from a file
+blar poke archive.blar "[1][0][1]" -i data.bin
+
+# Write to a different file (original unchanged)
+blar poke archive.blar "[1][0][1]" --value "x" -o modified.blar
+
+# Create .bak backup before overwriting
+blar poke archive.blar "[1][0][1]" --value "x" --backup
+```
+
+`poke` is the write counterpart to `peek` — same path syntax, but *sets* values. The entire archive is re-serialized with all hashes, offsets, and index tables recomputed automatically. `miniblar poke` works identically.
 
 ## Killer Feature: `peek` — Structural Introspection
 
@@ -245,9 +275,9 @@ $ blar peek archive.blar "[1][0][1]" --hex
 
 This isn't just a debugging tool — it's a **verification tool**. You can extract the stored hash of any container and independently verify it against `xxhsum`. You can inspect metadata without extracting. You can trace the Merkle hash tree of a directory archive from leaf to root. No other archive format gives you this level of structural transparency.
 
-**Coming soon: `poke` — the write counterpart to peek.** Same path syntax, but *sets* values. Think C64 PEEK/POKE for binary archives — read any byte, write any byte, with automatic hash recomputation across the entire archive.
+**`poke` — the write counterpart to peek.** Same path syntax, but *sets* values. C64 PEEK/POKE for binary archives — read any value, write any value, with automatic hash recomputation across the entire archive. See [Modifying archives](#modifying-archives-poke) above.
 
-## BLIP Archive vs tar
+## BLIP Archive (blar) vs tar
 
 | | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |
 |---|---|---|

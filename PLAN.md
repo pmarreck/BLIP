@@ -49,8 +49,21 @@
 - [x] Integration tests: 18 blar tests + 19 miniblar tests (all passing)
 - [x] Documentation updates (spec, README, CODE_MINIMAP)
 
+## poke Command (Completed 2026-02-24)
+- [x] poke.zig — reconstructEntries (inverse of createFullArchive), pokeArchive
+- [x] Path target classification: data_content, metadata_leaf, container (error), immutable (error)
+- [x] C FFI: blip_poke export in lib.zig + blip.h
+- [x] blar/miniblar CLI: poke command + Kf tar-style flag
+- [x] Value input: --value, -i (file), stdin
+- [x] Output: in-place (atomic write), -o (different file), --backup (.bak)
+- [x] Integration tests: 22 poke tests (all passing)
+- [x] All existing tests still pass (141 tests across 5 suites)
+- [x] README documentation
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
 - [ ] Cross-language implementations (C, Rust, etc.)
 - [ ] Compression wrapper container type
+- [ ] Binary data manipulation DSL — extend peek/poke into a full structural editor (insert/delete array elements, add/remove dict keys, splice content, move entries, etc.)
+- [ ] Segmentation container type — a new top-level container for splitting large archives into fixed-size segments (e.g. for transport over size-limited channels, span across volumes, or resumable transfers)

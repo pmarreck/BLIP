@@ -47,6 +47,7 @@ typedef enum {
     OP_INFO,
     OP_CAT,
     OP_PEEK,
+    OP_POKE,
 } operation_t;
 
 /* ── Utility: read entire file into malloc'd buffer ──────────────────── */
@@ -266,6 +267,10 @@ static operation_t parse_tar_flags(const char *flags, bool *has_f) {
             if (op != OP_NONE) return OP_NONE;
             op = OP_PEEK;
             break;
+        case 'K':
+            if (op != OP_NONE) return OP_NONE;
+            op = OP_POKE;
+            break;
         case 'P':
             break; /* absolute-names: handled by caller after parse */
         case 'f':
@@ -438,6 +443,223 @@ static int cmd_peek_common(const char *prog, int argc, char **argv) {
     free(buf);
 
     return (rc == 0) ? EXIT_OK : EXIT_IO;
+}
+
+/* ── Poke: thin C wrapper calling Zig core via blip_poke ──────────────── */
+
+static void poke_usage(FILE *out, const char *prog) {
+    fprintf(out,
+        "Usage: %s poke <archive> <path> [--value <string>] [-i <file>] [-o <output>] [--backup]\n"
+        "\n"
+        "Modify a value in a BLIP archive.\n"
+        "\n"
+        "Value sources (priority order):\n"
+        "  --value <string>   Literal string value\n"
+        "  -i <file>          Read value from file\n"
+        "  (stdin)            Read value from standard input (default)\n"
+        "\n"
+        "Output options:\n"
+        "  -o <output>        Write modified archive to a different file\n"
+        "  --backup           Create .bak copy before overwriting in place\n"
+        "\n"
+        "Path syntax:\n"
+        "  [N]       Array/FILE element by index\n"
+        "  [key]     DICT/MAP/DIR value by key\n"
+        "\n"
+        "Pokeable targets:\n"
+        "  [1][N][1]          FILE content (DATA)\n"
+        "  [1][N][0][pa]      File path (rename)\n"
+        "  [1][N][0][key]     Any metadata leaf value\n"
+        "\n"
+        "Examples:\n"
+        "  echo -n 'new' | %s poke archive.blar \"[1][0][1]\"           # stdin\n"
+        "  %s poke archive.blar \"[1][0][1]\" --value \"hello\"            # literal\n"
+        "  %s poke archive.blar \"[1][0][0][pa]\" --value \"renamed.txt\"  # rename\n"
+        "  %s poke archive.blar \"[1][0][1]\" -i data.bin                # from file\n"
+        "  %s poke archive.blar \"[1][0][1]\" --value x -o new.blar      # output file\n"
+        "  %s poke archive.blar \"[1][0][1]\" --value x --backup         # .bak first\n",
+        prog, prog, prog, prog, prog, prog, prog);
+}
+
+/* Read all bytes from stdin into a malloc'd buffer. Returns NULL on error. */
+static uint8_t *read_stdin_all(size_t *out_len) {
+    size_t cap = 4096;
+    size_t len = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return NULL;
+
+    while (1) {
+        if (len >= cap) {
+            cap *= 2;
+            uint8_t *newbuf = realloc(buf, cap);
+            if (!newbuf) { free(buf); return NULL; }
+            buf = newbuf;
+        }
+        size_t n = fread(buf + len, 1, cap - len, stdin);
+        if (n == 0) break;
+        len += n;
+    }
+    *out_len = len;
+    return buf;
+}
+
+/* Atomic write: write to a temp file, then rename. */
+static bool write_file_atomic(const char *path, const uint8_t *data, size_t len) {
+    char tmp_path[4200];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) return false;
+
+    if (!write_file(tmp_path, data, len)) {
+        unlink(tmp_path);
+        return false;
+    }
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+/* Copy a file (for --backup). */
+static bool copy_file(const char *src, const char *dst) {
+    size_t len = 0;
+    uint8_t *data = read_file(src, &len);
+    if (!data) return false;
+    bool ok = write_file(dst, data, len);
+    free(data);
+    return ok;
+}
+
+static int cmd_poke_common(const char *prog, int argc, char **argv) {
+    /* Check for --help / -h anywhere */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            poke_usage(stdout, prog);
+            return EXIT_OK;
+        }
+    }
+
+    if (argc < 2) {
+        poke_usage(stderr, prog);
+        return EXIT_USAGE;
+    }
+
+    const char *archive_path = argv[0];
+    const char *path_expr = argv[1];
+    const char *value_str = NULL;
+    const char *input_file = NULL;
+    const char *output_path = NULL;
+    bool backup = false;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--value") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: poke: --value requires an argument\n", prog);
+                return EXIT_USAGE;
+            }
+            value_str = argv[++i];
+        } else if (strcmp(argv[i], "-i") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: poke: -i requires an argument\n", prog);
+                return EXIT_USAGE;
+            }
+            input_file = argv[++i];
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: poke: -o requires an argument\n", prog);
+                return EXIT_USAGE;
+            }
+            output_path = argv[++i];
+        } else if (strcmp(argv[i], "--backup") == 0) {
+            backup = true;
+        } else {
+            fprintf(stderr, "%s: poke: unknown option '%s'\n", prog, argv[i]);
+            return EXIT_USAGE;
+        }
+    }
+
+    /* Read archive */
+    size_t buf_len = 0;
+    uint8_t *buf = read_file(archive_path, &buf_len);
+    if (!buf) {
+        fprintf(stderr, "%s: poke: cannot open '%s': %s\n",
+                prog, archive_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    /* Get new value from --value, -i, or stdin */
+    uint8_t *new_value = NULL;
+    size_t new_value_len = 0;
+    bool free_new_value = false;
+
+    if (value_str) {
+        new_value = (uint8_t *)value_str;
+        new_value_len = strlen(value_str);
+    } else if (input_file) {
+        new_value = read_file(input_file, &new_value_len);
+        if (!new_value) {
+            fprintf(stderr, "%s: poke: cannot read '%s': %s\n",
+                    prog, input_file, strerror(errno));
+            free(buf);
+            return EXIT_IO;
+        }
+        free_new_value = true;
+    } else {
+        /* Read from stdin */
+        new_value = read_stdin_all(&new_value_len);
+        if (!new_value) {
+            fprintf(stderr, "%s: poke: cannot read from stdin\n", prog);
+            free(buf);
+            return EXIT_IO;
+        }
+        free_new_value = true;
+    }
+
+    /* Call blip_poke */
+    uint8_t *out_buf = NULL;
+    size_t out_len = 0;
+    int32_t rc = blip_poke(buf, buf_len,
+                           (const uint8_t *)path_expr, strlen(path_expr),
+                           new_value, new_value_len,
+                           &out_buf, &out_len);
+
+    if (free_new_value) free(new_value);
+    free(buf);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "%s: poke: %s\n", prog, blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    /* Write output */
+    const char *write_path = output_path ? output_path : archive_path;
+
+    if (!output_path && backup) {
+        /* Create .bak copy of original */
+        char bak_path[4200];
+        int n = snprintf(bak_path, sizeof(bak_path), "%s.bak", archive_path);
+        if (n < 0 || (size_t)n >= sizeof(bak_path)) {
+            fprintf(stderr, "%s: poke: backup path too long\n", prog);
+            blip_free(out_buf, out_len);
+            return EXIT_IO;
+        }
+        if (!copy_file(archive_path, bak_path)) {
+            fprintf(stderr, "%s: poke: cannot create backup '%s': %s\n",
+                    prog, bak_path, strerror(errno));
+            blip_free(out_buf, out_len);
+            return EXIT_IO;
+        }
+    }
+
+    if (!write_file_atomic(write_path, out_buf, out_len)) {
+        fprintf(stderr, "%s: poke: cannot write '%s': %s\n",
+                prog, write_path, strerror(errno));
+        blip_free(out_buf, out_len);
+        return EXIT_IO;
+    }
+
+    blip_free(out_buf, out_len);
+    return EXIT_OK;
 }
 
 #endif /* BLAR_COMMON_H */

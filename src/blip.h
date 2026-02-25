@@ -180,6 +180,23 @@ int32_t blip_peek_display(const uint8_t *buf, size_t buf_len,
                            const uint8_t **out_stdout, size_t *out_stdout_len,
                            const uint8_t **out_stderr, size_t *out_stderr_len);
 
+/* --- Poke API --- */
+
+/* Modify a value in a BLIP archive at the given path expression.
+ * Returns a newly allocated archive buffer with the modification applied.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free the output buffer with blip_free().
+ *
+ * Error codes: -16 = immutable target (magic bytes),
+ *              -17 = not a leaf (can't poke containers) */
+#define BLIP_ERR_IMMUTABLE       -16
+#define BLIP_ERR_NOT_A_LEAF      -17
+
+int32_t blip_poke(const uint8_t *buf, size_t buf_len,
+                  const char *path, size_t path_len,
+                  const uint8_t *new_value, size_t new_value_len,
+                  uint8_t **out_buf, size_t *out_len);
+
 /* Encode binary data as printable-binary UTF-8.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_encode_printable_binary(const uint8_t *input, size_t input_len,
