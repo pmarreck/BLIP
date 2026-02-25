@@ -315,11 +315,55 @@ static char *default_output_name(const char *input_path, const char *ext,
 /* Main peek command implementation shared by blar and miniblar.
  * All formatting logic lives in Zig (peek.zig peekDisplay).
  * This wrapper only handles: arg parsing, file I/O, isatty check, output. */
+static void peek_usage(FILE *out, const char *prog) {
+    fprintf(out,
+        "Usage: %s peek <archive> [<path>] [--json|--raw|--hex|--type]\n"
+        "\n"
+        "Navigate and inspect BLIP archive structure.\n"
+        "\n"
+        "Path syntax:\n"
+        "  [N]       Array/FILE element by index\n"
+        "  [key]     DICT/MAP/DIR value by key\n"
+        "\n"
+        "Accessors (append to path):\n"
+        "  .type     Container type name (ARRAY, DICT, FILE, ...)\n"
+        "  .count    Element/pair count\n"
+        "  .hash     Trailing xxHash64 (hex)\n"
+        "  .keys     List DICT/MAP/DIR keys\n"
+        "\n"
+        "Output flags:\n"
+        "  --raw     Raw payload bytes (printable-binary encoded if stdout is a TTY)\n"
+        "  --hex     Hex-encoded payload (0x-prefixed)\n"
+        "  --json    JSON output\n"
+        "  --type    Shorthand for .type accessor\n"
+        "\n"
+        "Archive structure:\n"
+        "  ARRAY[ RAW(magic), ARRAY[ FILE[DICT{meta}, DATA{content}], ... ] ]\n"
+        "  [0]           magic bytes\n"
+        "  [1]           body array (all entries)\n"
+        "  [1][0]        first entry (FILE or DIR)\n"
+        "  [1][0][0]     metadata dict (keys: pa, md, mt, ct, bt, ui, gi, un, gn)\n"
+        "  [1][0][1]     file content (DATA)\n"
+        "\n"
+        "Examples:\n"
+        "  %s peek archive.blar \"[1][0][0][pa]\"       # file path\n"
+        "  %s peek archive.blar \"[1][0][1]\" --raw     # raw content\n"
+        "  %s peek archive.blar \"[1][0].type\"         # FILE\n"
+        "  %s peek archive.blar \"[1][0][0].keys\"      # metadata key list\n",
+        prog, prog, prog, prog, prog);
+}
+
 static int cmd_peek_common(const char *prog, int argc, char **argv) {
+    /* Check for --help / -h anywhere in args */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            peek_usage(stdout, prog);
+            return EXIT_OK;
+        }
+    }
+
     if (argc < 1) {
-        fprintf(stderr,
-                "%s: peek: requires <archive> [<path>] [--json|--raw|--hex|--type]\n",
-                prog);
+        peek_usage(stderr, prog);
         return EXIT_USAGE;
     }
 

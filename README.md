@@ -207,6 +207,46 @@ Archive structure: `ARRAY[RAW magic, ARRAY[FILE[DICT{metadata}, DATA{content}], 
 
 `miniblar peek` works identically.
 
+## Killer Feature: `peek` — Structural Introspection
+
+Most archive formats are opaque blobs. You can list files, extract files, maybe verify checksums — but the internal structure is invisible. BLIP archives are different: every container, every metadata key, every hash is addressable.
+
+`peek` lets you navigate the binary structure of a BLIP archive the way `jq` lets you navigate JSON. But unlike JSON, BLIP is a typed binary format with integrity guarantees — and peek understands that:
+
+```bash
+# What type is this container?
+$ blar peek archive.blar "[1][0]" --type
+FILE
+
+# What metadata keys does this file have?
+$ blar peek archive.blar "[1][0][0].keys"
+bt ct gi gn md mt pa ui un
+
+# What is the stored xxHash64 of the file content?
+$ blar peek archive.blar "[1][0][1].hash"
+a1b2c3d4e5f6a7b8
+
+# Timestamps are displayed as ISO 8601 with nanosecond precision
+$ blar peek archive.blar "[1][0][0][mt]"
+2026-02-24T10:30:00.123456789Z
+
+# Permissions as octal
+$ blar peek archive.blar "[1][0][0][md]"
+0755
+
+# Raw file content (terminal-safe via printable-binary)
+$ blar peek archive.blar "[1][0][1]" --raw
+hello world
+
+# Hex dump of any payload
+$ blar peek archive.blar "[1][0][1]" --hex
+0x68656c6c6f20776f726c640a
+```
+
+This isn't just a debugging tool — it's a **verification tool**. You can extract the stored hash of any container and independently verify it against `xxhsum`. You can inspect metadata without extracting. You can trace the Merkle hash tree of a directory archive from leaf to root. No other archive format gives you this level of structural transparency.
+
+**Coming soon: `poke` — the write counterpart to peek.** Same path syntax, but *sets* values. Think C64 PEEK/POKE for binary archives — read any byte, write any byte, with automatic hash recomputation across the entire archive.
+
 ## BLIP Archive vs tar
 
 | | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |

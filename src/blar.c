@@ -318,50 +318,76 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
-    /* Scan for --absolute-names before positional parsing */
+    /* Scan for --absolute-names and -o before positional parsing.
+     * Named options can appear anywhere in the argument list. */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--absolute-names") == 0) {
             absolute_names = true;
-            /* Shift remaining args down */
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
-            i--; /* re-check this position */
-        }
-    }
-
-    /* Check for -o flag (subcommand style) */
-    if (argc >= 2 && strcmp(argv[0], "-o") == 0) {
-        out_path = argv[1];
-        input_start = 2;
-    } else {
-        /* Tar-style: first arg is the archive path */
-        out_path = argv[0];
-        input_start = 1;
-    }
-
-    int input_count = argc - input_start;
-
-    /* Default output: single input with no -o -> <basename>.blar
-     * Handles: blar create mydir (1 arg, no -o) */
-    char default_out[4096];
-    if (input_count <= 0 && input_start == 1) {
-        /* Tar-style with single arg: check if it's a real file/dir */
-        struct stat st_check;
-        if (stat(out_path, &st_check) == 0) {
-            const char *input = out_path;
-            if (!default_output_name(input, ".blar", default_out, sizeof(default_out))) {
-                fprintf(stderr, "blar: create: cannot generate output name\n");
+            i--;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: create: -o requires an argument\n");
                 return EXIT_USAGE;
             }
-            out_path = default_out;
-            input_start = 0;
-            input_count = 1;
+            out_path = argv[i + 1];
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
         }
     }
+
+    /* If no -o was given, check if first arg is a non-existent path
+     * (tar-style: cf <archive> <files...>). Otherwise all args are inputs. */
+    input_start = 0;
+    if (!out_path && argc >= 1) {
+        struct stat st_check;
+        if (stat(argv[0], &st_check) != 0) {
+            /* First arg doesn't exist — treat as output path (tar-style) */
+            out_path = argv[0];
+            input_start = 1;
+        }
+    }
+    int input_count = argc - input_start;
 
     if (input_count <= 0) {
         fprintf(stderr, "blar: create: no input files/directories specified\n");
         return EXIT_USAGE;
+    }
+
+    /* If no -o was given, generate default name for single input.
+     * Multiple inputs without -o is an error. */
+    char default_out[4096];
+    if (!out_path) {
+        if (input_count > 1) {
+            fprintf(stderr, "blar: create: multiple inputs require -o <archive>\n");
+            return EXIT_USAGE;
+        }
+        if (!default_output_name(argv[0], ".blar", default_out, sizeof(default_out))) {
+            fprintf(stderr, "blar: create: cannot generate output name\n");
+            return EXIT_USAGE;
+        }
+        out_path = default_out;
+    }
+
+    /* Append .blar extension if the output path has no extension */
+    {
+        const char *base = strrchr(out_path, '/');
+        base = base ? base + 1 : out_path;
+        if (!strchr(base, '.')) {
+            size_t olen = strlen(out_path);
+            if (olen + 5 + 1 > sizeof(default_out)) {
+                fprintf(stderr, "blar: create: output path too long\n");
+                return EXIT_USAGE;
+            }
+            if (out_path != default_out) {
+                memcpy(default_out, out_path, olen);
+            }
+            memcpy(default_out + olen, ".blar", 5);
+            default_out[olen + 5] = '\0';
+            out_path = default_out;
+        }
     }
 
     /* Collect all entries (files and directories, recursively) */

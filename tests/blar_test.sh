@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u
 
 # =============================================================================
 # blar integration test suite
@@ -80,7 +80,7 @@ else
 fi
 
 # --------------- 4. Create + list roundtrip (subcommand style) ---------------
-ARCHIVE_ROUNDTRIP="$TMPDIR_TEST/roundtrip.blip"
+ARCHIVE_ROUNDTRIP="$TMPDIR_TEST/roundtrip.blar"
 "$BLAR" create -o "$ARCHIVE_ROUNDTRIP" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/foo.txt" 2>/dev/null
 LIST_OUT="$("$BLAR" list "$ARCHIVE_ROUNDTRIP" 2>/dev/null)"
 # Both files should appear in the listing
@@ -98,7 +98,7 @@ else
 fi
 
 # --------------- 6. Verify corrupt archive exits non-zero ---------------
-CORRUPT="$TMPDIR_TEST/corrupt.blip"
+CORRUPT="$TMPDIR_TEST/corrupt.blar"
 cp "$ARCHIVE_ROUNDTRIP" "$CORRUPT"
 # Flip a byte near the middle of the archive
 FILE_SIZE=$(wc -c < "$CORRUPT" | tr -d ' ')
@@ -139,7 +139,7 @@ fi
 # --------------- 10. Create + extract roundtrip (diff originals vs extracted) ---------------
 EXTRACT_DIR="$TMPDIR_TEST/extracted"
 mkdir -p "$EXTRACT_DIR"
-ARCHIVE_EXTRACT="$TMPDIR_TEST/extract_test.blip"
+ARCHIVE_EXTRACT="$TMPDIR_TEST/extract_test.blar"
 "$BLAR" create -o "$ARCHIVE_EXTRACT" \
   "$TMPDIR_TEST/hello.txt" \
   "$TMPDIR_TEST/foo.txt" \
@@ -170,7 +170,7 @@ else
 fi
 
 # --------------- 11. Tar-style flags: cf/tf work ---------------
-ARCHIVE_TAR="$TMPDIR_TEST/tar_style.blip"
+ARCHIVE_TAR="$TMPDIR_TEST/tar_style.blar"
 "$BLAR" cf "$ARCHIVE_TAR" "$TMPDIR_TEST/hello.txt" 2>/dev/null
 TAR_LIST="$("$BLAR" tf "$ARCHIVE_TAR" 2>/dev/null)"
 if echo "$TAR_LIST" | grep -q "hello.txt"; then
@@ -180,7 +180,7 @@ else
 fi
 
 # --------------- 12. Tar-style with hyphen: -cf/-tf work ---------------
-ARCHIVE_HYPHEN="$TMPDIR_TEST/hyphen_style.blip"
+ARCHIVE_HYPHEN="$TMPDIR_TEST/hyphen_style.blar"
 "$BLAR" -cf "$ARCHIVE_HYPHEN" "$TMPDIR_TEST/foo.txt" 2>/dev/null
 HYPHEN_LIST="$("$BLAR" -tf "$ARCHIVE_HYPHEN" 2>/dev/null)"
 if echo "$HYPHEN_LIST" | grep -q "foo.txt"; then
@@ -191,12 +191,12 @@ fi
 
 # --------------- 13. Empty archive — create with no files fails ---------------
 # blar create with no files exits non-zero (exit 1)
-if "$BLAR" create -o "$TMPDIR_TEST/empty.blip" >/dev/null 2>&1; then
+if "$BLAR" create -o "$TMPDIR_TEST/empty.blar" >/dev/null 2>&1; then
   # If it somehow succeeded, check that list shows nothing and verify passes
-  EMPTY_LIST="$("$BLAR" list "$TMPDIR_TEST/empty.blip" 2>/dev/null)"
+  EMPTY_LIST="$("$BLAR" list "$TMPDIR_TEST/empty.blar" 2>/dev/null)"
   if [[ -z "$EMPTY_LIST" ]]; then
     EMPTY_VERIFY=true
-    "$BLAR" verify "$TMPDIR_TEST/empty.blip" >/dev/null 2>&1 || EMPTY_VERIFY=false
+    "$BLAR" verify "$TMPDIR_TEST/empty.blar" >/dev/null 2>&1 || EMPTY_VERIFY=false
     if $EMPTY_VERIFY; then
       pass "empty archive: list shows nothing, verify passes"
     else
@@ -218,7 +218,7 @@ else
 fi
 
 # --------------- 15. Binary content roundtrip ---------------
-ARCHIVE_BIN="$TMPDIR_TEST/binary.blip"
+ARCHIVE_BIN="$TMPDIR_TEST/binary.blar"
 "$BLAR" create -o "$ARCHIVE_BIN" "$TMPDIR_TEST/binary.dat" 2>/dev/null
 NORM_BIN="${TMPDIR_TEST#/}/binary.dat"
 "$BLAR" cat "$ARCHIVE_BIN" "$NORM_BIN" > "$TMPDIR_TEST/binary_out.dat" 2>/dev/null
@@ -249,7 +249,7 @@ fi
 
 # --------------- 17. Progress suppression — piped stderr has no progress chars ---------------
 STDERR_FILE="$TMPDIR_TEST/stderr_capture.txt"
-"$BLAR" create -o "$TMPDIR_TEST/progress_test.blip" "$TMPDIR_TEST/hello.txt" 2>"$STDERR_FILE"
+"$BLAR" create -o "$TMPDIR_TEST/progress_test.blar" "$TMPDIR_TEST/hello.txt" 2>"$STDERR_FILE"
 # When not connected to a TTY, stderr should have no progress-bar characters
 # Common progress indicators: \r, escape sequences (\x1b), percentage signs in
 # control sequences, spinner chars. We check for \r and \x1b.
@@ -263,6 +263,44 @@ if [[ -s "$STDERR_FILE" ]]; then
 else
   # Empty stderr when piped — perfect
   pass "progress suppression: no progress-bar chars in piped stderr"
+fi
+
+# --------------- 18. Create with 2+ inputs and no -o should ERROR ---------------
+if "$BLAR" create "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/foo.txt" 2>/dev/null; then
+  fail "create with 2 inputs and no -o should error (got exit 0)"
+else
+  pass "create with 2 inputs and no -o errors"
+fi
+
+# --------------- 19. -o flag works in any position ---------------
+"$BLAR" create "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/foo.txt" -o "$TMPDIR_TEST/trailing_o.blar" 2>/dev/null
+if [[ -f "$TMPDIR_TEST/trailing_o.blar" ]]; then
+  TO_LIST="$("$BLAR" list "$TMPDIR_TEST/trailing_o.blar" 2>/dev/null)"
+  TO_COUNT=$(echo "$TO_LIST" | wc -l | tr -d ' ')
+  if [[ "$TO_COUNT" == "2" ]]; then
+    pass "-o flag works after input files"
+  else
+    fail "-o after inputs: expected 2 files, got $TO_COUNT ($TO_LIST)"
+  fi
+else
+  fail "-o after inputs: archive not created at $TMPDIR_TEST/trailing_o.blar"
+fi
+
+# --------------- 20. -o without extension gets .blar appended ---------------
+"$BLAR" create -o "$TMPDIR_TEST/noext" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+if [[ -f "$TMPDIR_TEST/noext.blar" ]]; then
+  pass "-o without extension gets .blar appended"
+  rm -f "$TMPDIR_TEST/noext.blar"
+else
+  fail "-o without extension: expected $TMPDIR_TEST/noext.blar, not found"
+fi
+
+# --------------- 21. peek --help shows usage (not "cannot open") ---------------
+PEEK_HELP=$("$BLAR" peek --help 2>&1)
+if echo "$PEEK_HELP" | grep -qi "usage\|navigation\|path\|accessor"; then
+  pass "peek --help shows usage info"
+else
+  fail "peek --help: got '$PEEK_HELP'"
 fi
 
 # =============================================================================

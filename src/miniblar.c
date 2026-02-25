@@ -144,33 +144,41 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
-    /* Scan for --absolute-names before positional parsing */
+    /* Scan for --absolute-names and -o before positional parsing.
+     * Named options can appear anywhere in the argument list. */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--absolute-names") == 0) {
             absolute_names = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "miniblar: create: -o requires an argument\n");
+                return EXIT_USAGE;
+            }
+            out_path = argv[i + 1];
+            /* Remove -o and its argument from argv */
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
         }
     }
 
-    /* Check for -o flag (subcommand style) */
-    if (argc >= 2 && strcmp(argv[0], "-o") == 0) {
-        out_path = argv[1];
-        file_start = 2;
-    } else {
-        /* Tar-style: first arg is the archive path */
-        out_path = argv[0];
-        file_start = 1;
+    /* If no -o was given, check if first arg is a non-existent path
+     * (tar-style: cf <archive> <files...>). Otherwise all args are inputs. */
+    file_start = 0;
+    if (!out_path && argc >= 1) {
+        struct stat st_check;
+        if (stat(argv[0], &st_check) != 0) {
+            /* First arg doesn't exist — treat as output path (tar-style) */
+            out_path = argv[0];
+            file_start = 1;
+        }
     }
-
     int file_count = argc - file_start;
 
-    /* If no -o was specified and there's only one argument that looks like
-     * an input file (not an archive path), generate default output name */
-    char default_out[4096];
     if (file_count <= 0) {
-        /* If we had -o flag, then out_path is set but no files given */
         fprintf(stderr, "miniblar: create: no input files specified\n");
         return EXIT_USAGE;
     }
@@ -185,23 +193,37 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
-    /* Default output: single input file -> <basename>.mblar */
-    if (file_count == 1 && file_start == 1) {
-        /* Tar-style with single file: argv[0] was treated as archive path.
-         * We need to check if it's actually a file and use default naming. */
-        struct stat st;
-        if (stat(out_path, &st) == 0) {
-            /* out_path exists as a file, so this is likely: miniblar create file.txt
-             * Treat it as single input, generate default output */
-            const char *input = out_path;
-            if (!default_output_name(input, ".mblar", default_out, sizeof(default_out))) {
-                fprintf(stderr, "miniblar: create: cannot generate output name\n");
+    /* If no -o was given, generate default name for single input.
+     * Multiple inputs without -o is an error. */
+    char default_out[4096];
+    if (!out_path) {
+        if (file_count > 1) {
+            fprintf(stderr, "miniblar: create: multiple inputs require -o <archive>\n");
+            return EXIT_USAGE;
+        }
+        if (!default_output_name(argv[0], ".mblar", default_out, sizeof(default_out))) {
+            fprintf(stderr, "miniblar: create: cannot generate output name\n");
+            return EXIT_USAGE;
+        }
+        out_path = default_out;
+    }
+
+    /* Append .mblar extension if the output path has no extension */
+    {
+        const char *base = strrchr(out_path, '/');
+        base = base ? base + 1 : out_path;
+        if (!strchr(base, '.')) {
+            size_t olen = strlen(out_path);
+            if (olen + 6 + 1 > sizeof(default_out)) {
+                fprintf(stderr, "miniblar: create: output path too long\n");
                 return EXIT_USAGE;
             }
+            if (out_path != default_out) {
+                memcpy(default_out, out_path, olen);
+            }
+            memcpy(default_out + olen, ".mblar", 6);
+            default_out[olen + 6] = '\0';
             out_path = default_out;
-            /* Re-parse: the single arg is the input file */
-            file_start = 0;
-            file_count = 1;
         }
     }
 
