@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .z7z = .{
-            .path = "../z7z",
+            .url = "https://github.com/pmarreck/z7z/archive/18e094eab1cb545c86a6b6e72cc9c48db3539ddd.tar.gz",
+            .hash = "z7z-0.1.0-rkKuF0UdBQDsZxiiNFWuuoHVeGLFO078oGD6yQQiSXoA",
         },
     },
     .paths = .{
