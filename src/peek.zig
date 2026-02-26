@@ -263,6 +263,7 @@ pub fn containerTypeName(buf: []const u8) ContainerError![]const u8 {
         .map => "MAP",
         .dir => "DIR",
         .data => "DATA",
+        .lzma2 => "LZMA2",
     };
 }
 
@@ -749,6 +750,22 @@ fn handleDefaultMode(
                 try stdout_list.appendSlice(allocator, s);
             } else {
                 const s = try std.fmt.allocPrint(allocator, "{s} ({d} pairs)\n", .{ name, count });
+                defer allocator.free(s);
+                try stdout_list.appendSlice(allocator, s);
+            }
+        },
+        .lzma2 => {
+            const lzma2_mod = @import("lzma2.zig");
+            const reader = lzma2_mod.Lzma2Reader.init(target) catch {
+                try stdout_list.appendSlice(allocator, "LZMA2 (invalid)\n");
+                return;
+            };
+            if (flags.json) {
+                const s = try std.fmt.allocPrint(allocator, "{{\"type\":\"LZMA2\",\"compressed_size\":{d},\"uncompressed_size\":{d}}}\n", .{ reader.compressedSize(), reader.uncompressed_size });
+                defer allocator.free(s);
+                try stdout_list.appendSlice(allocator, s);
+            } else {
+                const s = try std.fmt.allocPrint(allocator, "LZMA2 ({d} -> {d} bytes)\n", .{ reader.compressedSize(), reader.uncompressed_size });
                 defer allocator.free(s);
                 try stdout_list.appendSlice(allocator, s);
             }

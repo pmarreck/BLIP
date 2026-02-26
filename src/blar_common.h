@@ -97,6 +97,41 @@ static bool write_file(const char *path, const uint8_t *data, size_t len) {
     return true;
 }
 
+/* ── Utility: read archive with transparent LZMA2 decompression ──────── */
+
+/* Read an archive file, transparently decompressing if LZMA2-wrapped.
+ * Always returns a malloc'd buffer — caller frees with free().
+ * If the file is LZMA2-compressed (sentinel 0x81 0x09), decompresses first. */
+static uint8_t *read_archive(const char *path, size_t *out_len) {
+    uint8_t *buf = read_file(path, out_len);
+    if (!buf) return NULL;
+
+    /* Check for LZMA2 container sentinel */
+    if (*out_len >= 2 && buf[0] == 0x81 && buf[1] == 0x09) {
+        uint8_t *decompressed = NULL;
+        size_t decomp_len = 0;
+        int32_t rc = blip_lzma2_decompress(buf, *out_len, &decompressed, &decomp_len);
+        free(buf);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "Failed to decompress LZMA2 archive: %s\n",
+                    blip_error_string(rc));
+            return NULL;
+        }
+        /* Copy into malloc'd buffer so caller can free() uniformly */
+        uint8_t *result = (uint8_t *)malloc(decomp_len);
+        if (!result) {
+            blip_free(decompressed, decomp_len);
+            return NULL;
+        }
+        memcpy(result, decompressed, decomp_len);
+        blip_free(decompressed, decomp_len);
+        *out_len = decomp_len;
+        return result;
+    }
+
+    return buf;
+}
+
 /* ── Utility: mkdir -p ───────────────────────────────────────────────── */
 
 static bool mkdirp(const char *path) {
@@ -432,7 +467,7 @@ static int cmd_peek_common(const char *prog, int argc, char **argv) {
 
     /* Read archive */
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "%s: peek: cannot open '%s': %s\n",
                 prog, archive_path, strerror(errno));
@@ -503,13 +538,13 @@ static void poke_usage(FILE *out, const char *prog) {
 static uint8_t *read_stdin_all(size_t *out_len) {
     size_t cap = 4096;
     size_t len = 0;
-    uint8_t *buf = malloc(cap);
+    uint8_t *buf = (uint8_t *)malloc(cap);
     if (!buf) return NULL;
 
     while (1) {
         if (len >= cap) {
             cap *= 2;
-            uint8_t *newbuf = realloc(buf, cap);
+            uint8_t *newbuf = (uint8_t *)realloc(buf, cap);
             if (!newbuf) { free(buf); return NULL; }
             buf = newbuf;
         }
@@ -598,7 +633,7 @@ static int cmd_poke_common(const char *prog, int argc, char **argv) {
 
     /* Read archive */
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "%s: poke: cannot open '%s': %s\n",
                 prog, archive_path, strerror(errno));
@@ -711,7 +746,7 @@ static int cmd_to_json_common(const char *prog, int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "%s: to-json: cannot open '%s': %s\n",
                 prog, archive_path, strerror(errno));

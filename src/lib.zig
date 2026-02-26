@@ -111,6 +111,8 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -20 => "invalid entry type",
         -21 => "invalid timestamp",
         -22 => "invalid mode",
+        -23 => "decompression failed",
+        -24 => "compression failed",
         else => "unknown error",
     };
 }
@@ -676,6 +678,56 @@ export fn blip_from_json(
     const json_slice = json_buf[0..json_len];
     const result = json_serde.jsonToArchive(page_allocator, json_slice) catch |e| {
         return jsonSerdeErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// LZMA2 compression C FFI exports
+// ---------------------------------------------------------------------------
+
+const lzma2_mod = blip.lzma2_mod;
+
+/// Compress a BLIP container with LZMA2.
+/// Input: any serialized BLIP container bytes.
+/// Output: an LZMA2 container (0x81 0x09) wrapping the compressed data.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_lzma2_compress(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const result = lzma2_mod.compressContainer(page_allocator, slice) catch |e| switch (e) {
+        error.OutOfMemory => return -13,
+        error.CompressionFailed => return -24,
+        else => return -1,
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Decompress an LZMA2 container, returning the inner container bytes.
+/// Verifies xxHash64 before decompressing.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_lzma2_decompress(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const result = lzma2_mod.decompressContainer(page_allocator, slice) catch |e| switch (e) {
+        error.OutOfMemory => return -13,
+        error.DecompressionFailed => return -23,
+        error.HashMismatch => return -7,
+        else => return -1,
     };
     out_buf.* = result.ptr;
     out_len.* = result.len;

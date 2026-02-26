@@ -221,6 +221,26 @@ int32_t blip_to_json(const uint8_t *buf, size_t buf_len,
 int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
                        uint8_t **out_buf, size_t *out_len);
 
+/* --- LZMA2 compression --- */
+
+#define BLIP_ERR_DECOMPRESSION   -23
+#define BLIP_ERR_COMPRESSION     -24
+
+/* Compress a BLIP container with LZMA2.
+ * Input: any serialized BLIP container bytes.
+ * Output: an LZMA2 container (0x81 0x09) wrapping the compressed data.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_lzma2_compress(const uint8_t *buf, size_t buf_len,
+                             uint8_t **out_buf, size_t *out_len);
+
+/* Decompress an LZMA2 container, returning the inner container bytes.
+ * Verifies xxHash64 before decompressing.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_lzma2_decompress(const uint8_t *buf, size_t buf_len,
+                               uint8_t **out_buf, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

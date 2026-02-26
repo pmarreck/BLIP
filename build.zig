@@ -16,6 +16,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // z7z dependency — provides LZMA2 compression engine
+    const z7z_dep = b.dependency("z7z", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const z7z_module = z7z_dep.module("z7z");
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -23,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
+            .{ .name = "z7z", .module = z7z_module },
         },
     });
 
@@ -35,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
+            .{ .name = "z7z", .module = z7z_module },
         },
     });
 
@@ -44,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
+            .{ .name = "z7z", .module = z7z_module },
         },
     });
 
@@ -158,6 +168,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "printable_binary", .module = pb_module },
+                .{ .name = "z7z", .module = z7z_module },
             },
         }),
     });
@@ -172,6 +183,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "blip", .module = blip_module },
                 .{ .name = "printable_binary", .module = pb_module },
+                .{ .name = "z7z", .module = z7z_module },
             },
         }),
     });

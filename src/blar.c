@@ -284,7 +284,7 @@ static void print_usage(FILE *out) {
         "For flat file-only archives, use 'miniblar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-o <archive>] <files/dirs...>  Create a BLIP archive\n"
+        "  create [-z] [-o <archive>] <files/dirs...>  Create a BLIP archive\n"
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
@@ -311,6 +311,7 @@ static void print_usage(FILE *out) {
         "  P                             Absolute names (preserve leading /)\n"
         "\n"
         "Options:\n"
+        "  -z               Compress archive with LZMA2\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
@@ -327,17 +328,23 @@ static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
     int input_start = 0;
     bool absolute_names = g_absolute_names;
+    bool compress_lzma2 = false;
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
         return EXIT_USAGE;
     }
 
-    /* Scan for --absolute-names and -o before positional parsing.
+    /* Scan for --absolute-names, -z, and -o before positional parsing.
      * Named options can appear anywhere in the argument list. */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--absolute-names") == 0) {
             absolute_names = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "-z") == 0) {
+            compress_lzma2 = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
@@ -446,6 +453,22 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_IO;
     }
 
+    /* Optionally compress with LZMA2 */
+    if (compress_lzma2) {
+        uint8_t *compressed_buf = NULL;
+        size_t compressed_len = 0;
+        rc = blip_lzma2_compress(archive_buf, archive_len,
+                                  &compressed_buf, &compressed_len);
+        blip_free(archive_buf, archive_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: create: compression failed: %s\n",
+                    blip_error_string(rc));
+            return EXIT_IO;
+        }
+        archive_buf = compressed_buf;
+        archive_len = compressed_len;
+    }
+
     if (!write_file(out_path, archive_buf, archive_len)) {
         fprintf(stderr, "blar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
@@ -467,7 +490,7 @@ static int cmd_list(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "blar: list: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -527,7 +550,7 @@ static int cmd_extract(int argc, char **argv) {
     }
 
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "blar: extract: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -708,7 +731,7 @@ static int cmd_verify(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "blar: verify: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -769,7 +792,7 @@ static int cmd_info(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "blar: info: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -876,7 +899,7 @@ static int cmd_cat(int argc, char **argv) {
     const char *file_path = argv[1];
 
     size_t buf_len = 0;
-    uint8_t *buf = read_file(archive_path, &buf_len);
+    uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "blar: cat: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
