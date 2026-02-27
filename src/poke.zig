@@ -5,7 +5,7 @@ const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const array_mod = @import("array.zig");
 const dict_mod = @import("dict.zig");
-const data_mod = @import("data.zig");
+// data_mod removed: data functionality merged into leaf.zig (v2 migration)
 const leaf = @import("leaf.zig");
 const mini_blar = @import("mini_blar.zig");
 const peek = @import("peek.zig");
@@ -35,6 +35,10 @@ pub const PokeError = error{
     BufferTooSmall,
     UnexpectedEndOfInput,
     Overflow,
+    // v2 LP-specific errors
+    MissingSigil,
+    InvalidSigilOrder,
+    MissingDecompLen,
     // Path errors
     UnclosedBracket,
     EmptyBracket,
@@ -425,6 +429,9 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
             error.BufferTooSmall => PokeError.BufferTooSmall,
             error.UnexpectedEndOfInput => PokeError.UnexpectedEndOfInput,
             error.Overflow => PokeError.Overflow,
+            error.MissingSigil => PokeError.MissingSigil,
+            error.InvalidSigilOrder => PokeError.InvalidSigilOrder,
+            error.MissingDecompLen => PokeError.MissingDecompLen,
         };
     };
     defer {
@@ -583,6 +590,9 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
             error.BufferTooSmall => PokeError.BufferTooSmall,
             error.UnexpectedEndOfInput => PokeError.UnexpectedEndOfInput,
             error.Overflow => PokeError.Overflow,
+            error.MissingSigil => PokeError.MissingSigil,
+            error.InvalidSigilOrder => PokeError.InvalidSigilOrder,
+            error.MissingDecompLen => PokeError.MissingDecompLen,
         };
     };
 

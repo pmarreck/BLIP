@@ -6,7 +6,7 @@ const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");
 pub const dict_mod = @import("dict.zig");
-pub const data_mod = @import("data.zig");
+pub const data_mod = @import("leaf.zig"); // data.zig merged into leaf.zig (v2 migration)
 const testing = std.testing;
 
 pub const ContainerError = container.ContainerError;

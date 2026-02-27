@@ -28,6 +28,10 @@ pub const JsonSerdeError = error{
     BufferTooSmall,
     UnexpectedEndOfInput,
     Overflow,
+    // v2 LP-specific errors
+    MissingSigil,
+    InvalidSigilOrder,
+    MissingDecompLen,
 };
 
 // =============================================================================
@@ -602,6 +606,9 @@ fn mapContainerError(err: anytype) JsonSerdeError {
         error.BufferTooSmall => error.BufferTooSmall,
         error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
         error.Overflow => error.Overflow,
+        error.MissingSigil => error.MissingSigil,
+        error.InvalidSigilOrder => error.InvalidSigilOrder,
+        error.MissingDecompLen => error.MissingDecompLen,
     };
 }
 
@@ -620,6 +627,9 @@ fn mapContainerError2(err: anytype) JsonSerdeError {
         error.BufferTooSmall => error.BufferTooSmall,
         error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
         error.Overflow => error.Overflow,
+        error.MissingSigil => error.MissingSigil,
+        error.InvalidSigilOrder => error.InvalidSigilOrder,
+        error.MissingDecompLen => error.MissingDecompLen,
     };
 }
 

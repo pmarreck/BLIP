@@ -64,6 +64,9 @@ fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
+        error.MissingSigil => -23,
+        error.InvalidSigilOrder => -24,
+        error.MissingDecompLen => -25,
     };
 }
 
@@ -82,6 +85,9 @@ fn containerErrorCode(err: ContainerError) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
+        error.MissingSigil => -23,
+        error.InvalidSigilOrder => -24,
+        error.MissingDecompLen => -25,
     };
 }
 
@@ -595,6 +601,9 @@ export fn blip_poke(
             error.UnexpectedEndOfInput => @as(i32, -11),
             error.Overflow => @as(i32, -12),
             error.UnclosedBracket, error.EmptyBracket, error.InvalidIndex, error.UnexpectedCharacter => @as(i32, -15),
+            error.MissingSigil => @as(i32, -23),
+            error.InvalidSigilOrder => @as(i32, -24),
+            error.MissingDecompLen => @as(i32, -25),
         };
     };
 
@@ -645,6 +654,9 @@ fn jsonSerdeErrorCode(err: json_serde.JsonSerdeError) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
+        error.MissingSigil => -23,
+        error.InvalidSigilOrder => -24,
+        error.MissingDecompLen => -25,
     };
 }
 

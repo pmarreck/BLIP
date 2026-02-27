@@ -635,7 +635,7 @@ pub const encoding = @import("encoding.zig");
 pub const bignum_mod = @import("bignum.zig");
 pub const mini_blar_mod = @import("mini_blar.zig");
 pub const array_mod = @import("array.zig");
-pub const data_mod = @import("data.zig");
+// data_mod removed: data functionality merged into leaf.zig (v2 migration)
 pub const peek_mod = @import("peek.zig");
 pub const poke_mod = @import("poke.zig");
 pub const json_serde = @import("json_serde.zig");
@@ -658,7 +658,7 @@ test {
     _ = @import("leaf.zig");
     _ = @import("array.zig");
     _ = @import("dict.zig");
-    _ = @import("data.zig");
+    // data.zig removed: functionality merged into leaf.zig
     _ = @import("peek.zig");
     _ = @import("poke.zig");
     _ = @import("mini_blar.zig");

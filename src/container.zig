@@ -31,15 +31,15 @@ pub const ContainerError = error{
     BufferTooSmall,
     UnexpectedEndOfInput,
     Overflow,
-};
-
-/// Error set for v2 LP container operations.
-/// Extends ContainerError with LP-specific errors.
-pub const LPContainerError = ContainerError || error{
+    // v2 LP-specific errors (merged into ContainerError for backward compat)
     MissingSigil,
     InvalidSigilOrder,
     MissingDecompLen,
 };
+
+/// Error set for v2 LP container operations.
+/// Now identical to ContainerError (LP errors merged in for compatibility).
+pub const LPContainerError = ContainerError;
 
 // =============================================================================
 // v2 LP (Length-Payload) Container Format
