@@ -3,19 +3,38 @@ const Allocator = std.mem.Allocator;
 const blip = @import("blip.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
+const csum_mod = @import("checksum.zig");
 const leaf = @import("leaf.zig");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
-const ContainerType = ct.ContainerType;
-const XxHash64 = std.hash.XxHash64;
+const ContainerTypeId = ct.ContainerTypeId;
+const ChecksumId = ct.ChecksumId;
+const LPOptions = container.LPOptions;
+const LPContainerView = container.LPContainerView;
+const LPContainerError = container.LPContainerError;
 
-/// Serialize an ordered array of pre-serialized container elements with a specified container type sentinel.
-/// This is the generic implementation used by both ARRAY and FILE (ARRAY-layout) containers.
-/// Each element in `elements` must already be a complete TLV container.
+/// Serialize an ordered array of pre-serialized LP container elements with a
+/// specified container type and LP options (including optional checksum).
+///
+/// v2 LP layout:
+///   [BLIP(total)] [TYPE attr] [opt CSUM attr] [VAL sentinel]
+///   [BLIP(index_offset)] [elements...] [INDEX_SECTION] [checksum?]
+///
+/// The VAL payload is: [BLIP(index_offset)] [elements...] [INDEX_SECTION]
+/// Checksum bytes (if any) are appended after the index section, still inside
+/// the container's total length.
+///
+/// Each element in `elements` must already be a complete LP container.
 /// Caller owns returned memory.
-pub fn serializeArrayLike(allocator: Allocator, elements: []const []const u8, container_type: ContainerType) (Allocator.Error || ContainerError)![]u8 {
+pub fn serializeArrayLike(
+    allocator: Allocator,
+    elements: []const []const u8,
+    type_id: ContainerTypeId,
+    options: LPOptions,
+) (Allocator.Error || LPContainerError)![]u8 {
     const n: u64 = elements.len;
+    const csum_size: u64 = if (options.csum_id) |id| ct.checksumLength(id) else 0;
 
     // Compute total data size (sum of all element byte lengths)
     var data_size: u64 = 0;
@@ -23,69 +42,79 @@ pub fn serializeArrayLike(allocator: Allocator, elements: []const []const u8, co
         data_size += elem.len;
     }
 
-    // Fixpoint iteration to determine S (total encoding size) and I (index_offset encoding size)
-    var S: usize = 1; // initial guess for blip.encodedSize(total)
-    var I: usize = 1; // initial guess for blip.encodedSize(index_offset)
-
-    var total: u64 = undefined;
-    var index_offset: u64 = undefined;
-    var offsets: [1024]u64 = undefined; // stack buffer for element offsets; will use allocator if needed
+    // Stack buffer for element offsets; use heap if too many
+    var offsets_stack: [1024]u64 = undefined;
     var heap_offsets: ?[]u64 = null;
     defer if (heap_offsets) |ho| allocator.free(ho);
 
-    // Get offset storage
     const offset_storage: []u64 = if (elements.len <= 1024)
-        offsets[0..elements.len]
+        offsets_stack[0..elements.len]
     else blk: {
         heap_offsets = try allocator.alloc(u64, elements.len);
         break :blk heap_offsets.?;
     };
 
+    // Fixpoint iteration to resolve self-referential sizes.
+    //
+    // For a given I_size (BLIP encoding size of index_offset):
+    //   1. Compute element offsets: offset[k] = val_offset + I_size + cumulative[k]
+    //   2. index_section_size = BLIP(N) + sum(BLIP(offset[k]))
+    //   3. val_payload_size = I_size + data_size + index_section_size
+    //   4. total = computeLPLength(type_id, val_payload_size, options)
+    //   5. val_offset = total - val_payload_size - csum_size
+    //   6. index_offset = val_offset + I_size + data_size
+    //   7. I_size_new = BLIP_size(index_offset)
+    //
+    // We iterate until I_size stabilizes. Within each outer iteration we also
+    // iterate on val_offset since it feeds back into element offsets.
+
+    var I_size: usize = 1;
+    var total: u64 = undefined;
+    var index_offset: u64 = undefined;
+
     for (0..10) |_| {
-        const header_size: u64 = 2 + S + I;
+        // Start with an estimated val_offset (use 0 initially, will converge)
+        var val_offset: u64 = 0;
 
-        // Compute element offsets from container start
-        var running_offset: u64 = header_size;
-        for (elements, 0..) |elem, k| {
-            offset_storage[k] = running_offset;
-            running_offset += elem.len;
+        // Inner loop: converge on val_offset for the current I_size
+        for (0..10) |_| {
+            // Compute element offsets from container start
+            var running_offset: u64 = val_offset + I_size;
+            for (elements, 0..) |elem, k| {
+                offset_storage[k] = running_offset;
+                running_offset += elem.len;
+            }
+            index_offset = running_offset;
+
+            // Compute index section size
+            var index_section_size: u64 = blip.encodedSize(n);
+            for (offset_storage[0..elements.len]) |off| {
+                index_section_size += blip.encodedSize(off);
+            }
+
+            // Compute val_payload_size, total, and new val_offset
+            const val_payload_size: u64 = I_size + data_size + index_section_size;
+            total = container.computeLPLength(type_id, val_payload_size, options);
+            const new_val_offset: u64 = total - val_payload_size - csum_size;
+
+            if (new_val_offset == val_offset) break;
+            val_offset = new_val_offset;
         }
 
-        index_offset = running_offset; // = header_size + data_size
-
-        // Compute index section size: BLIP(N) + sum of BLIP(off_k)
-        var index_size: u64 = blip.encodedSize(n);
-        for (offset_storage[0..elements.len]) |off| {
-            index_size += blip.encodedSize(off);
-        }
-
-        total = running_offset + index_size + 8; // data + index + hash
-
-        const S_new = blip.encodedSize(total);
-        const I_new = blip.encodedSize(index_offset);
-
-        if (S_new == S and I_new == I) break;
-        S = S_new;
-        I = I_new;
+        // Check if I_size is stable
+        const I_size_new = blip.encodedSize(index_offset);
+        if (I_size_new == I_size) break;
+        I_size = I_size_new;
     }
 
     // Allocate the exact buffer
     const buf = try allocator.alloc(u8, @intCast(total));
     errdefer allocator.free(buf);
 
-    var pos: usize = 0;
+    // Write LP header
+    var pos: usize = try container.writeLPHeader(buf, type_id, total, options);
 
-    // Write type sentinel
-    const sentinel = ct.typeSentinel(container_type);
-    buf[pos] = sentinel[0];
-    buf[pos + 1] = sentinel[1];
-    pos += 2;
-
-    // Write BLIP(total)
-    const total_written = blip.encode(total, buf[pos..]) catch return ContainerError.BufferTooSmall;
-    pos += total_written;
-
-    // Write BLIP(index_offset)
+    // Write BLIP(index_offset) - first thing in VAL payload
     const idx_off_written = blip.encode(index_offset, buf[pos..]) catch return ContainerError.BufferTooSmall;
     pos += idx_off_written;
 
@@ -104,70 +133,78 @@ pub fn serializeArrayLike(allocator: Allocator, elements: []const []const u8, co
         pos += off_written;
     }
 
-    // Write xxHash64 (8 bytes, little-endian)
-    const hash_value = XxHash64.hash(0, buf[0 .. total - 8]);
-    std.mem.writeInt(u64, buf[pos..][0..8], hash_value, .little);
-    pos += 8;
+    // Write checksum if requested
+    if (options.csum_id) |csum_id| {
+        const csum_len = ct.checksumLength(csum_id);
+        const hash = csum_mod.compute(csum_id, buf[0..pos]);
+        @memcpy(buf[pos..][0..csum_len], hash[0..csum_len]);
+        pos += csum_len;
+    }
 
     std.debug.assert(pos == total);
 
     return buf;
 }
 
-/// Serialize an ordered array of pre-serialized container elements.
-/// Each element in `elements` must already be a complete TLV container (e.g.,
-/// the output of leaf.serializeUtf8, leaf.serializeRaw, or serializeArray).
+/// Serialize an ordered array of pre-serialized LP container elements.
+/// Each element in `elements` must already be a complete LP container.
+/// No checksum by default (inner container convention).
 /// Caller owns returned memory.
-pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Allocator.Error || ContainerError)![]u8 {
-    return serializeArrayLike(allocator, elements, .array);
+pub fn serializeArray(allocator: Allocator, elements: []const []const u8) (Allocator.Error || LPContainerError)![]u8 {
+    return serializeArrayLike(allocator, elements, .array, .{});
 }
 
-/// Reader for an ARRAY container. Provides random access to elements via the index.
+/// Serialize an ordered array with custom LP options (e.g., checksum).
+/// Caller owns returned memory.
+pub fn serializeArrayWithOptions(allocator: Allocator, elements: []const []const u8, options: LPOptions) (Allocator.Error || LPContainerError)![]u8 {
+    return serializeArrayLike(allocator, elements, .array, options);
+}
+
+/// Reader for an ARRAY container in v2 LP format.
+/// Provides random access to elements via the index section.
 pub const ArrayReader = struct {
-    buf: []const u8,
-    total_length: u64,
-    header_size: usize,
+    lp_view: LPContainerView,
     index_offset: u64,
     count: u64,
+    /// Byte offset from container start to the first element (after BLIP(index_offset))
+    header_size: usize,
 
     /// Parse an ARRAY container from a buffer.
-    /// buf must start at the container's first byte (type sentinel).
-    pub fn init(buf: []const u8) ContainerError!ArrayReader {
-        // Parse outer header: type + total_length
-        const view = try container.parseHeader(buf);
-        if (view.container_type != .array and view.container_type != .file) return ContainerError.InvalidContainerType;
+    /// buf must start at the container's first byte (BLIP total_length).
+    pub fn init(buf: []const u8) LPContainerError!ArrayReader {
+        const lp = try container.parseLPHeader(buf);
+        if (lp.type_id != .array and lp.type_id != .file) return ContainerError.InvalidContainerType;
 
-        const total_length = view.total_length;
-        const value_start = view.value_offset;
+        const total: usize = @intCast(lp.total_length);
 
-        // Read index_offset from the value payload
-        if (value_start >= total_length) return ContainerError.UnexpectedEndOfInput;
-        const idx_result = blip.decode(buf[value_start..@intCast(total_length)]) catch |e| switch (e) {
+        // Read BLIP(index_offset) from start of payload
+        const payload = lp.payloadSlice();
+        if (payload.len == 0) return ContainerError.UnexpectedEndOfInput;
+        const idx_result = blip.decode(payload) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
         };
         const index_offset = idx_result.value;
-        const header_size = value_start + idx_result.bytes_read;
+        const header_size = lp.val_offset + idx_result.bytes_read;
 
         // Validate index_offset
-        if (index_offset >= total_length) return ContainerError.InvalidLength;
+        if (index_offset >= total) return ContainerError.InvalidLength;
 
-        // Jump to index section and read N (element count)
+        // Read count from index section (at buf[index_offset..])
         const idx_start: usize = @intCast(index_offset);
-        if (idx_start >= total_length) return ContainerError.UnexpectedEndOfInput;
-        const n_result = blip.decode(buf[idx_start..@intCast(total_length)]) catch |e| switch (e) {
+        if (idx_start >= total) return ContainerError.UnexpectedEndOfInput;
+        const n_result = blip.decode(buf[idx_start..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
         };
 
         return ArrayReader{
-            .buf = buf,
-            .total_length = total_length,
-            .header_size = header_size,
+            .lp_view = lp,
             .index_offset = index_offset,
             .count = n_result.value,
+            .header_size = header_size,
         };
     }
 
@@ -177,17 +214,15 @@ pub const ArrayReader = struct {
     }
 
     /// Random access: read element at the given index.
-    /// Returns a ContainerView of the element's TLV.
-    pub fn elementAt(self: ArrayReader, index: u64) ContainerError!container.ContainerView {
+    /// Returns an LPContainerView of the element.
+    pub fn elementAt(self: ArrayReader, index: u64) LPContainerError!LPContainerView {
         if (index >= self.count) return ContainerError.IndexOutOfBounds;
 
-        // Walk the index section: start at index_offset, skip past BLIP(N),
-        // then skip `index` BLIP-encoded offsets, decode the target offset.
-        const total: usize = @intCast(self.total_length);
+        const total: usize = @intCast(self.lp_view.total_length);
         var pos: usize = @intCast(self.index_offset);
 
         // Skip past BLIP(N)
-        const n_result = blip.decode(self.buf[pos..total]) catch |e| switch (e) {
+        const n_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
@@ -196,7 +231,7 @@ pub const ArrayReader = struct {
 
         // Skip `index` offset entries
         for (0..index) |_| {
-            const skip_result = blip.decode(self.buf[pos..total]) catch |e| switch (e) {
+            const skip_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
                 error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
                 error.Overflow => return ContainerError.Overflow,
                 error.BufferTooSmall => return ContainerError.BufferTooSmall,
@@ -205,70 +240,39 @@ pub const ArrayReader = struct {
         }
 
         // Decode the target offset
-        const off_result = blip.decode(self.buf[pos..total]) catch |e| switch (e) {
+        const off_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
         };
         const elem_offset: usize = @intCast(off_result.value);
 
-        // Jump to element and parse its header
+        // Jump to element and parse its LP header
         if (elem_offset >= total) return ContainerError.IndexOutOfBounds;
-        return container.parseHeader(self.buf[elem_offset..total]);
+        return container.parseLPHeader(self.lp_view.buf[elem_offset..total]);
     }
 
-    /// Verify the xxHash64 integrity check.
-    /// Returns true if the stored hash matches the computed hash.
-    pub fn verifyHash(self: ArrayReader) ContainerError!bool {
-        const total: usize = @intCast(self.total_length);
-        if (total < 8) return ContainerError.InvalidLength;
-
-        const hash_computed = XxHash64.hash(0, self.buf[0 .. total - 8]);
-        const hash_stored = std.mem.readInt(u64, self.buf[total - 8 ..][0..8], .little);
-        return hash_computed == hash_stored;
+    /// Verify the checksum of this array container.
+    /// If the container has no CSUM attribute, returns true (nothing to check).
+    /// If CSUM is present, recomputes the checksum and compares.
+    pub fn verifyChecksum(self: ArrayReader) LPContainerError!bool {
+        const csum_id = self.lp_view.csum_id orelse return true;
+        const csum_len = ct.checksumLength(csum_id);
+        const total: usize = @intCast(self.lp_view.total_length);
+        const csum_offset = total - csum_len;
+        return csum_mod.verify(csum_id, self.lp_view.buf[0..csum_offset], self.lp_view.checksumSlice());
     }
+
+    /// Legacy alias: equivalent to verifyChecksum().
+    /// Deprecated: use verifyChecksum() instead.
+    pub const verifyHash = verifyChecksum;
 };
 
 // =============================================================================
 // Tests
 // =============================================================================
 
-test "empty array: serialize and verify structure" {
-    const allocator = testing.allocator;
-    const elements = [_][]const u8{};
-    const result = try serializeArray(allocator, &elements);
-    defer allocator.free(result);
-
-    // Should start with ARRAY sentinel
-    try testing.expectEqual(@as(u8, 0x81), result[0]);
-    try testing.expectEqual(@as(u8, 0x01), result[1]);
-
-    // Parse and verify
-    const reader = try ArrayReader.init(result);
-    try testing.expectEqual(@as(u64, 0), reader.elementCount());
-}
-
-test "empty array: total length is correct" {
-    const allocator = testing.allocator;
-    const elements = [_][]const u8{};
-    const result = try serializeArray(allocator, &elements);
-    defer allocator.free(result);
-
-    const reader = try ArrayReader.init(result);
-    try testing.expectEqual(@as(u64, result.len), reader.total_length);
-}
-
-test "empty array: verify hash" {
-    const allocator = testing.allocator;
-    const elements = [_][]const u8{};
-    const result = try serializeArray(allocator, &elements);
-    defer allocator.free(result);
-
-    const reader = try ArrayReader.init(result);
-    try testing.expect(try reader.verifyHash());
-}
-
-test "empty array: round-trip" {
+test "empty array: serialize and read back (count=0)" {
     const allocator = testing.allocator;
     const elements = [_][]const u8{};
     const result = try serializeArray(allocator, &elements);
@@ -276,10 +280,10 @@ test "empty array: round-trip" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 0), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expectEqual(@as(u64, result.len), reader.lp_view.total_length);
 }
 
-test "single element array: serialize with one UTF8 element" {
+test "single UTF8 element round-trip" {
     const allocator = testing.allocator;
     const hello = try leaf.serializeUtf8(allocator, "hello");
     defer allocator.free(hello);
@@ -290,19 +294,18 @@ test "single element array: serialize with one UTF8 element" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 1), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
 
     // Read back the element
     const view = try reader.elementAt(0);
-    try testing.expectEqual(ContainerType.utf8, view.container_type);
-    try testing.expectEqualSlices(u8, "hello", view.valueSlice());
+    try testing.expectEqual(ContainerTypeId.utf8, view.type_id);
+    try testing.expectEqualSlices(u8, "hello", view.payloadSlice());
 }
 
-test "multiple elements: serialize with mixed UTF8/RAW" {
+test "multiple mixed elements (UTF8 + DATA) round-trip" {
     const allocator = testing.allocator;
     const elem0 = try leaf.serializeUtf8(allocator, "alpha");
     defer allocator.free(elem0);
-    const elem1 = try leaf.serializeRaw(allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+    const elem1 = try leaf.serializeData(allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
     defer allocator.free(elem1);
     const elem2 = try leaf.serializeUtf8(allocator, "gamma");
     defer allocator.free(elem2);
@@ -313,14 +316,13 @@ test "multiple elements: serialize with mixed UTF8/RAW" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 3), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
 }
 
 test "elementAt for each index in multi-element array" {
     const allocator = testing.allocator;
     const elem0 = try leaf.serializeUtf8(allocator, "alpha");
     defer allocator.free(elem0);
-    const elem1 = try leaf.serializeRaw(allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+    const elem1 = try leaf.serializeData(allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
     defer allocator.free(elem1);
     const elem2 = try leaf.serializeUtf8(allocator, "gamma");
     defer allocator.free(elem2);
@@ -333,18 +335,18 @@ test "elementAt for each index in multi-element array" {
 
     // Element 0: UTF8 "alpha"
     const v0 = try reader.elementAt(0);
-    try testing.expectEqual(ContainerType.utf8, v0.container_type);
-    try testing.expectEqualSlices(u8, "alpha", v0.valueSlice());
+    try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
+    try testing.expectEqualSlices(u8, "alpha", v0.payloadSlice());
 
-    // Element 1: RAW 0xDEADBEEF
+    // Element 1: DATA 0xDEADBEEF
     const v1 = try reader.elementAt(1);
-    try testing.expectEqual(ContainerType.raw, v1.container_type);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, v1.valueSlice());
+    try testing.expectEqual(ContainerTypeId.data, v1.type_id);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, v1.payloadSlice());
 
     // Element 2: UTF8 "gamma"
     const v2 = try reader.elementAt(2);
-    try testing.expectEqual(ContainerType.utf8, v2.container_type);
-    try testing.expectEqualSlices(u8, "gamma", v2.valueSlice());
+    try testing.expectEqual(ContainerTypeId.utf8, v2.type_id);
+    try testing.expectEqualSlices(u8, "gamma", v2.payloadSlice());
 }
 
 test "elementAt out of bounds returns IndexOutOfBounds" {
@@ -361,11 +363,11 @@ test "elementAt out of bounds returns IndexOutOfBounds" {
     try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementAt(100));
 }
 
-test "verifyHash returns true for valid array" {
+test "verifyChecksum returns true for no checksum (inner container default)" {
     const allocator = testing.allocator;
     const elem0 = try leaf.serializeUtf8(allocator, "check");
     defer allocator.free(elem0);
-    const elem1 = try leaf.serializeRaw(allocator, "hash");
+    const elem1 = try leaf.serializeData(allocator, "hash");
     defer allocator.free(elem1);
 
     const elements = [_][]const u8{ elem0, elem1 };
@@ -373,30 +375,55 @@ test "verifyHash returns true for valid array" {
     defer allocator.free(result);
 
     const reader = try ArrayReader.init(result);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 }
 
-test "verifyHash detects corruption" {
+test "array with BLAKE3-128 checksum" {
+    const allocator = testing.allocator;
+    const elem0 = try leaf.serializeUtf8(allocator, "checked");
+    defer allocator.free(elem0);
+    const elem1 = try leaf.serializeData(allocator, "data");
+    defer allocator.free(elem1);
+
+    const elements = [_][]const u8{ elem0, elem1 };
+    const result = try serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .blake3_128 });
+    defer allocator.free(result);
+
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 2), reader.elementCount());
+    try testing.expect(try reader.verifyChecksum());
+
+    // Verify elements still accessible
+    const v0 = try reader.elementAt(0);
+    try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
+    try testing.expectEqualSlices(u8, "checked", v0.payloadSlice());
+
+    const v1 = try reader.elementAt(1);
+    try testing.expectEqual(ContainerTypeId.data, v1.type_id);
+    try testing.expectEqualSlices(u8, "data", v1.payloadSlice());
+}
+
+test "checksum corruption detection" {
     const allocator = testing.allocator;
     const elem = try leaf.serializeUtf8(allocator, "integrity");
     defer allocator.free(elem);
 
     const elements = [_][]const u8{elem};
-    const result = try serializeArray(allocator, &elements);
+    const result = try serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .blake3_128 });
     defer allocator.free(result);
 
-    // Corrupt a byte in the data section (not the hash itself)
-    // The data starts after sentinel(2) + BLIP(total) + BLIP(index_offset)
-    // Flip a byte somewhere in the middle
-    const corrupt_pos = result.len / 2;
+    // Corrupt a byte in the data section (not the checksum itself)
+    const reader_before = try ArrayReader.init(result);
+    // Flip a byte in the payload region
+    const corrupt_pos = reader_before.lp_view.val_offset + 1;
     result[corrupt_pos] ^= 0xFF;
 
     const reader = try ArrayReader.init(result);
-    const valid = try reader.verifyHash();
+    const valid = try reader.verifyChecksum();
     try testing.expect(!valid);
 }
 
-test "nested array: array containing another array" {
+test "nested arrays (array inside array)" {
     const allocator = testing.allocator;
 
     // Inner array with one element
@@ -416,35 +443,102 @@ test "nested array: array containing another array" {
     // Read outer array
     const outer_reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 2), outer_reader.elementCount());
-    try testing.expect(try outer_reader.verifyHash());
+    try testing.expect(try outer_reader.verifyChecksum());
 
     // Element 0 is UTF8 "outer"
     const v0 = try outer_reader.elementAt(0);
-    try testing.expectEqual(ContainerType.utf8, v0.container_type);
-    try testing.expectEqualSlices(u8, "outer", v0.valueSlice());
+    try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
+    try testing.expectEqualSlices(u8, "outer", v0.payloadSlice());
 
     // Element 1 is an ARRAY
     const v1 = try outer_reader.elementAt(1);
-    try testing.expectEqual(ContainerType.array, v1.container_type);
+    try testing.expectEqual(ContainerTypeId.array, v1.type_id);
 
-    // Parse the inner array from the outer buffer at the right offset
-    const inner_buf = result[@intCast(v1.buf.ptr - result.ptr)..@intCast(v1.total_length + @as(u64, @intCast(v1.buf.ptr - result.ptr)))];
-    const inner_reader = try ArrayReader.init(inner_buf);
+    // Parse the inner array from v1's buffer
+    const inner_reader = try ArrayReader.init(v1.buf);
     try testing.expectEqual(@as(u64, 1), inner_reader.elementCount());
-    try testing.expect(try inner_reader.verifyHash());
+    try testing.expect(try inner_reader.verifyChecksum());
 
     const inner_v0 = try inner_reader.elementAt(0);
-    try testing.expectEqual(ContainerType.utf8, inner_v0.container_type);
-    try testing.expectEqualSlices(u8, "nested", inner_v0.valueSlice());
+    try testing.expectEqual(ContainerTypeId.utf8, inner_v0.type_id);
+    try testing.expectEqualSlices(u8, "nested", inner_v0.payloadSlice());
 }
 
-test "self-referential length at BLIP boundary" {
+test "large element count (50+ elements)" {
+    const allocator = testing.allocator;
+
+    const n = 50;
+    var elem_bufs: [n][]u8 = undefined;
+    var elem_count: usize = 0;
+    defer {
+        for (elem_bufs[0..elem_count]) |buf| allocator.free(buf);
+    }
+
+    for (0..n) |i| {
+        var data: [8]u8 = undefined;
+        for (&data, 0..) |*b, j| {
+            b.* = @intCast((i + j) % 256);
+        }
+        elem_bufs[elem_count] = try leaf.serializeData(allocator, &data);
+        elem_count += 1;
+    }
+
+    var elements: [n][]const u8 = undefined;
+    for (elem_bufs[0..elem_count], 0..) |buf, i| {
+        elements[i] = buf;
+    }
+
+    const result = try serializeArray(allocator, elements[0..elem_count]);
+    defer allocator.free(result);
+
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, n), reader.elementCount());
+    try testing.expect(try reader.verifyChecksum());
+
+    // Spot-check first and last elements
+    const v0 = try reader.elementAt(0);
+    try testing.expectEqual(ContainerTypeId.data, v0.type_id);
+
+    const v49 = try reader.elementAt(49);
+    try testing.expectEqual(ContainerTypeId.data, v49.type_id);
+}
+
+test "serializeArrayLike with .file type" {
+    const allocator = testing.allocator;
+    const elem = try leaf.serializeUtf8(allocator, "hello");
+    defer allocator.free(elem);
+
+    const elements = [_][]const u8{elem};
+    const result = try serializeArrayLike(allocator, &elements, .file, .{});
+    defer allocator.free(result);
+
+    // Parse as LP and verify type_id is .file
+    const lp = try container.parseLPHeader(result);
+    try testing.expectEqual(ContainerTypeId.file, lp.type_id);
+
+    // ArrayReader should accept .file type
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 1), reader.elementCount());
+    try testing.expect(try reader.verifyChecksum());
+
+    // Read back element
+    const view = try reader.elementAt(0);
+    try testing.expectEqual(ContainerTypeId.utf8, view.type_id);
+    try testing.expectEqualSlices(u8, "hello", view.payloadSlice());
+}
+
+test "ArrayReader rejects non-array container" {
+    const allocator = testing.allocator;
+    const utf8_buf = try leaf.serializeUtf8(allocator, "not an array");
+    defer allocator.free(utf8_buf);
+
+    try testing.expectError(ContainerError.InvalidContainerType, ArrayReader.init(utf8_buf));
+}
+
+test "BLIP boundary crossing (total > 128)" {
     const allocator = testing.allocator;
 
     // Create enough small elements so total crosses the 128-byte BLIP boundary
-    // Each UTF8 element "x" is 3+1 = 4 bytes (sentinel 2 + length 1 + "x" 1 = 4)
-    // Actually: total = header + data + index + hash
-    // With ~20 small elements we should be well past 128 bytes
     var elem_bufs: [25][]u8 = undefined;
     var elem_count: usize = 0;
 
@@ -472,13 +566,13 @@ test "self-referential length at BLIP boundary" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 25), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
     // Verify each element
     for (0..25) |i| {
         const v = try reader.elementAt(@intCast(i));
-        try testing.expectEqual(ContainerType.utf8, v.container_type);
-        try testing.expectEqualSlices(u8, "x", v.valueSlice());
+        try testing.expectEqual(ContainerTypeId.utf8, v.type_id);
+        try testing.expectEqualSlices(u8, "x", v.payloadSlice());
     }
 }
 
@@ -514,16 +608,16 @@ test "round-trip: serialize N elements then read back and compare" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 5), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
     for (texts, 0..) |text, i| {
         const v = try reader.elementAt(@intCast(i));
-        try testing.expectEqual(ContainerType.utf8, v.container_type);
-        try testing.expectEqualSlices(u8, text, v.valueSlice());
+        try testing.expectEqual(ContainerTypeId.utf8, v.type_id);
+        try testing.expectEqualSlices(u8, text, v.payloadSlice());
     }
 }
 
-test "five RAW elements round-trip" {
+test "five DATA elements round-trip" {
     const allocator = testing.allocator;
 
     const data = [_][]const u8{
@@ -541,7 +635,7 @@ test "five RAW elements round-trip" {
     }
 
     for (data) |d| {
-        serialized[count] = try leaf.serializeRaw(allocator, d);
+        serialized[count] = try leaf.serializeData(allocator, d);
         count += 1;
     }
 
@@ -555,21 +649,13 @@ test "five RAW elements round-trip" {
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 5), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
     for (data, 0..) |d, i| {
         const v = try reader.elementAt(@intCast(i));
-        try testing.expectEqual(ContainerType.raw, v.container_type);
-        try testing.expectEqualSlices(u8, d, v.valueSlice());
+        try testing.expectEqual(ContainerTypeId.data, v.type_id);
+        try testing.expectEqualSlices(u8, d, v.payloadSlice());
     }
-}
-
-test "array reader rejects non-array container" {
-    const allocator = testing.allocator;
-    const utf8_buf = try leaf.serializeUtf8(allocator, "not an array");
-    defer allocator.free(utf8_buf);
-
-    try testing.expectError(ContainerError.InvalidContainerType, ArrayReader.init(utf8_buf));
 }
 
 test "elementAt on empty array returns IndexOutOfBounds" {
@@ -582,65 +668,24 @@ test "elementAt on empty array returns IndexOutOfBounds" {
     try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementAt(0));
 }
 
-test "verifyHash with corrupted hash bytes" {
+test "verifyChecksum with corrupted checksum bytes" {
     const allocator = testing.allocator;
     const elem = try leaf.serializeUtf8(allocator, "test");
     defer allocator.free(elem);
 
     const elements = [_][]const u8{elem};
-    const result = try serializeArray(allocator, &elements);
+    const result = try serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .blake3_128 });
     defer allocator.free(result);
 
-    // Corrupt the last byte (part of the hash)
+    // Corrupt the last byte (part of the checksum)
     result[result.len - 1] ^= 0x01;
 
     const reader = try ArrayReader.init(result);
-    const valid = try reader.verifyHash();
+    const valid = try reader.verifyChecksum();
     try testing.expect(!valid);
 }
 
-test "large element count exercises BLIP encoding for offsets" {
-    const allocator = testing.allocator;
-
-    // Use 50 elements to exercise bigger offset values
-    const n = 50;
-    var elem_bufs: [n][]u8 = undefined;
-    var elem_count: usize = 0;
-    defer {
-        for (elem_bufs[0..elem_count]) |buf| allocator.free(buf);
-    }
-
-    for (0..n) |i| {
-        // Create varying-size elements
-        var data: [8]u8 = undefined;
-        for (&data, 0..) |*b, j| {
-            b.* = @intCast((i + j) % 256);
-        }
-        elem_bufs[elem_count] = try leaf.serializeRaw(allocator, &data);
-        elem_count += 1;
-    }
-
-    var elements: [n][]const u8 = undefined;
-    for (elem_bufs[0..elem_count], 0..) |buf, i| {
-        elements[i] = buf;
-    }
-
-    const result = try serializeArray(allocator, elements[0..elem_count]);
-    defer allocator.free(result);
-
-    const reader = try ArrayReader.init(result);
-    try testing.expectEqual(@as(u64, n), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
-
-    // Spot-check a few elements
-    const v0 = try reader.elementAt(0);
-    try testing.expectEqual(ContainerType.raw, v0.container_type);
-
-    const v49 = try reader.elementAt(49);
-    try testing.expectEqual(ContainerType.raw, v49.container_type);
-}
-
-test "deeply nested arrays" {
+test "deeply nested arrays (3 levels)" {
     const allocator = testing.allocator;
 
     // Build 3 levels of nesting: array(array(array(leaf)))
@@ -662,55 +707,31 @@ test "deeply nested arrays" {
     // Navigate down
     const r3 = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 1), r3.elementCount());
-    try testing.expect(try r3.verifyHash());
+    try testing.expect(try r3.verifyChecksum());
 
     const v3 = try r3.elementAt(0);
-    try testing.expectEqual(ContainerType.array, v3.container_type);
-}
-
-test "serializeArrayLike with .file type produces FILE sentinel with ARRAY layout" {
-    const allocator = testing.allocator;
-    const elem = try leaf.serializeUtf8(allocator, "hello");
-    defer allocator.free(elem);
-
-    const elements = [_][]const u8{elem};
-    const result = try serializeArrayLike(allocator, &elements, .file);
-    defer allocator.free(result);
-
-    // Should start with FILE sentinel (0x81 0x05)
-    try testing.expectEqual(@as(u8, 0x81), result[0]);
-    try testing.expectEqual(@as(u8, 0x05), result[1]);
-
-    // ArrayReader should accept .file type and read elements correctly
-    const reader = try ArrayReader.init(result);
-    try testing.expectEqual(@as(u64, 1), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
-
-    // Read back element
-    const view = try reader.elementAt(0);
-    try testing.expectEqual(ContainerType.utf8, view.container_type);
-    try testing.expectEqualSlices(u8, "hello", view.valueSlice());
+    try testing.expectEqual(ContainerTypeId.array, v3.type_id);
 }
 
 test "serializeArrayLike with .file type multi-element round-trip" {
     const allocator = testing.allocator;
     const elem0 = try leaf.serializeUtf8(allocator, "metadata");
     defer allocator.free(elem0);
-    const elem1 = try leaf.serializeRaw(allocator, "content");
+    const elem1 = try leaf.serializeData(allocator, "content");
     defer allocator.free(elem1);
 
     const elements = [_][]const u8{ elem0, elem1 };
-    const result = try serializeArrayLike(allocator, &elements, .file);
+    const result = try serializeArrayLike(allocator, &elements, .file, .{});
     defer allocator.free(result);
 
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 2), reader.elementCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
     const v0 = try reader.elementAt(0);
-    try testing.expectEqualSlices(u8, "metadata", v0.valueSlice());
+    try testing.expectEqualSlices(u8, "metadata", v0.payloadSlice());
     const v1 = try reader.elementAt(1);
-    try testing.expectEqualSlices(u8, "content", v1.valueSlice());
+    try testing.expectEqualSlices(u8, "content", v1.payloadSlice());
 }
 
 test "array total_length matches buffer length" {
@@ -722,7 +743,38 @@ test "array total_length matches buffer length" {
     const result = try serializeArray(allocator, &elements);
     defer allocator.free(result);
 
-    // Decode the total length from the buffer
-    const len_result = blip.decode(result[2..]) catch unreachable;
-    try testing.expectEqual(@as(u64, result.len), len_result.value);
+    const lp = try container.parseLPHeader(result);
+    try testing.expectEqual(@as(u64, result.len), lp.total_length);
+}
+
+test "array with xxHash64 checksum" {
+    const allocator = testing.allocator;
+    const elem = try leaf.serializeUtf8(allocator, "hashed");
+    defer allocator.free(elem);
+
+    const elements = [_][]const u8{elem};
+    const result = try serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .xxhash64 });
+    defer allocator.free(result);
+
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 1), reader.elementCount());
+    try testing.expect(try reader.verifyChecksum());
+
+    const v0 = try reader.elementAt(0);
+    try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
+    try testing.expectEqualSlices(u8, "hashed", v0.payloadSlice());
+}
+
+test "array with CRC32 checksum" {
+    const allocator = testing.allocator;
+    const elem = try leaf.serializeUtf8(allocator, "crc");
+    defer allocator.free(elem);
+
+    const elements = [_][]const u8{elem};
+    const result = try serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .crc32 });
+    defer allocator.free(result);
+
+    const reader = try ArrayReader.init(result);
+    try testing.expectEqual(@as(u64, 1), reader.elementCount());
+    try testing.expect(try reader.verifyChecksum());
 }

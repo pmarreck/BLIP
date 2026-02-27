@@ -65,6 +65,9 @@ pub const LPContainerView = struct {
     val_size: usize,
     /// The full container buffer.
     buf: []const u8,
+    /// Legacy v1 container type, mapped from the v2 type_id.
+    /// Deprecated: use `.type_id` instead.
+    container_type: ContainerType,
 
     /// Returns the payload excluding checksum bytes.
     pub fn payloadSlice(self: LPContainerView) []const u8 {
@@ -78,6 +81,12 @@ pub const LPContainerView = struct {
         if (csum_len == 0) return self.buf[0..0];
         const end = self.val_offset + self.val_size;
         return self.buf[end - csum_len .. end];
+    }
+
+    /// Legacy alias: equivalent to payloadSlice().
+    /// Deprecated: use payloadSlice() instead.
+    pub fn valueSlice(self: LPContainerView) []const u8 {
+        return self.payloadSlice();
     }
 };
 
@@ -189,6 +198,20 @@ pub fn writeLPHeader(buf: []u8, type_id: ContainerTypeId, total_length: u64, opt
     return pos;
 }
 
+/// Map a v2 ContainerTypeId to the legacy v1 ContainerType.
+/// Used by backward-compatibility shims in LPContainerView.
+fn typeIdToLegacy(type_id: ContainerTypeId) ContainerType {
+    return switch (type_id) {
+        .array => .array,
+        .dict => .dict,
+        .utf8 => .utf8,
+        .data => .raw,
+        .file => .file,
+        .map => .map,
+        .dir => .dir,
+    };
+}
+
 /// Parse an LP container header from a buffer.
 ///
 /// Expects buf to start at the container's first byte (BLIP total_length).
@@ -261,6 +284,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                 .val_offset = val_offset,
                 .val_size = val_size,
                 .buf = container_buf,
+                .container_type = typeIdToLegacy(type_id),
             };
         }
 

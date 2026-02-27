@@ -250,12 +250,12 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, forks_dict);
 
         const elements = [_][]const u8{ metadata_dict, data_container, forks_dict };
-        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file);
+        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file, .{});
         try to_free.append(allocator, file_bytes);
         return file_bytes;
     } else {
         const elements = [_][]const u8{ metadata_dict, data_container };
-        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file);
+        const file_bytes = try array_mod.serializeArrayLike(allocator, &elements, .file, .{});
         try to_free.append(allocator, file_bytes);
         return file_bytes;
     }

@@ -1055,7 +1055,7 @@ test "navigate: FILE container (ARRAY layout) traversal" {
     defer allocator.free(data_container);
 
     const file_elems = [_][]const u8{ meta_dict, data_container };
-    const file_container = try array_mod.serializeArrayLike(allocator, &file_elems, .file);
+    const file_container = try array_mod.serializeArrayLike(allocator, &file_elems, .file, .{});
     defer allocator.free(file_container);
 
     // FILE type
