@@ -129,7 +129,7 @@ int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry
                                   uint32_t flags,
                                   uint8_t **out_buf, size_t *out_len);
 
-/* Get the container type of an entry (0x05 = FILE, 0x07 = DIR). */
+/* Get the container type of an entry (5 = FILE, 7 = DIR — v2 ContainerTypeId). */
 int32_t blip_archive_entry_type(const uint8_t *buf, size_t buf_len,
                                  uint64_t index, uint8_t *out_type);
 
@@ -151,7 +151,7 @@ void blip_normalize_path(const char *path, size_t path_len,
 
 /* Navigate to a container within a BLIP buffer using a path expression.
  * Path syntax: [N] for array index, [key] for dict key.
- * Returns 0 on success. out_type receives the container type byte (0x01-0x08).
+ * Returns 0 on success. out_type receives the v2 container type ID (1-7).
  * out_data/out_data_len receive a zero-copy pointer to the container bytes. */
 int32_t blip_peek(const uint8_t *buf, size_t buf_len,
                   const char *path, size_t path_len,
@@ -223,19 +223,22 @@ int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
 
 /* --- LZMA2 compression --- */
 
-#define BLIP_ERR_DECOMPRESSION   -23
-#define BLIP_ERR_COMPRESSION     -24
+#define BLIP_ERR_DECOMPRESSION      -23
+#define BLIP_ERR_COMPRESSION        -24
+#define BLIP_ERR_MISSING_SIGIL      -25
+#define BLIP_ERR_INVALID_SIGIL_ORDER -26
+#define BLIP_ERR_MISSING_DECOMP_LEN -27
 
 /* Compress a BLIP container with LZMA2.
  * Input: any serialized BLIP container bytes.
- * Output: an LZMA2 container (0x81 0x09) wrapping the compressed data.
+ * Output: a DATA container with COMP=lzma2, DECOMP_LEN, CSUM=blake3_128 attributes.
  * Returns 0 on success, negative error code on failure.
  * Caller must free output buffer with blip_free(). */
 int32_t blip_lzma2_compress(const uint8_t *buf, size_t buf_len,
                              uint8_t **out_buf, size_t *out_len);
 
-/* Decompress an LZMA2 container, returning the inner container bytes.
- * Verifies xxHash64 before decompressing.
+/* Decompress an LP container with COMP attribute.
+ * Verifies checksum before decompressing.
  * Returns 0 on success, negative error code on failure.
  * Caller must free output buffer with blip_free(). */
 int32_t blip_lzma2_decompress(const uint8_t *buf, size_t buf_len,

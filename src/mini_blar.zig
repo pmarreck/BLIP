@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const container = @import("container.zig");
+pub const container_mod = @import("container.zig");
+const container = container_mod;
 const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");

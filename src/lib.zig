@@ -64,9 +64,9 @@ fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
-        error.MissingSigil => -23,
-        error.InvalidSigilOrder => -24,
-        error.MissingDecompLen => -25,
+        error.MissingSigil => -25,
+        error.InvalidSigilOrder => -26,
+        error.MissingDecompLen => -27,
     };
 }
 
@@ -85,9 +85,9 @@ fn containerErrorCode(err: ContainerError) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
-        error.MissingSigil => -23,
-        error.InvalidSigilOrder => -24,
-        error.MissingDecompLen => -25,
+        error.MissingSigil => -25,
+        error.InvalidSigilOrder => -26,
+        error.MissingDecompLen => -27,
     };
 }
 
@@ -119,6 +119,9 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -22 => "invalid mode",
         -23 => "decompression failed",
         -24 => "compression failed",
+        -25 => "missing attribute sigil",
+        -26 => "invalid attribute sigil order",
+        -27 => "missing decompressed length",
         else => "unknown error",
     };
 }
@@ -359,7 +362,7 @@ export fn blip_archive_file_verify(
 }
 
 /// Get the container type of an entry at the given index.
-/// Returns 0 on success. out_type will be 0x05 (FILE) or 0x07 (DIR).
+/// Returns 0 on success. out_type will be 5 (FILE) or 7 (DIR) (v2 ContainerTypeId).
 export fn blip_archive_entry_type(
     buf: [*]const u8,
     buf_len: usize,
@@ -460,7 +463,7 @@ const peek_mod = blip.peek_mod;
 
 /// Navigate to a container within a BLIP buffer using a path expression.
 /// Path syntax: [N] for array index, [key] for dict key.
-/// Returns 0 on success. out_type receives the container type byte (0x01-0x08).
+/// Returns 0 on success. out_type receives the v2 container type ID (1-7).
 /// out_data/out_data_len receive a zero-copy pointer to the container bytes.
 export fn blip_peek(
     buf: [*]const u8,
@@ -471,6 +474,7 @@ export fn blip_peek(
     out_data: *[*]const u8,
     out_data_len: *usize,
 ) callconv(.c) i32 {
+    const container_mod = mini_blar.container_mod;
     const slice = buf[0..buf_len];
     const path_str = path[0..path_len];
 
@@ -481,10 +485,9 @@ export fn blip_peek(
     // Navigate
     const result = peek_mod.navigate(slice, parsed.segments) catch |e| return containerErrorCode(e);
 
-    // Get the type from the sentinel (first 2 bytes of any container)
-    if (result.len < 2) return -11; // unexpected end of input
-    // Type byte is result[1] (second byte of sentinel 0x81 0xNN)
-    out_type.* = result[1];
+    // Parse the LP header to get the type ID
+    const lp_view = container_mod.parseLPHeader(result) catch |e| return containerErrorCode(e);
+    out_type.* = @intFromEnum(lp_view.type_id);
     out_data.* = result.ptr;
     out_data_len.* = result.len;
     return 0;
@@ -601,9 +604,9 @@ export fn blip_poke(
             error.UnexpectedEndOfInput => @as(i32, -11),
             error.Overflow => @as(i32, -12),
             error.UnclosedBracket, error.EmptyBracket, error.InvalidIndex, error.UnexpectedCharacter => @as(i32, -15),
-            error.MissingSigil => @as(i32, -23),
-            error.InvalidSigilOrder => @as(i32, -24),
-            error.MissingDecompLen => @as(i32, -25),
+            error.MissingSigil => @as(i32, -25),
+            error.InvalidSigilOrder => @as(i32, -26),
+            error.MissingDecompLen => @as(i32, -27),
         };
     };
 
@@ -654,9 +657,9 @@ fn jsonSerdeErrorCode(err: json_serde.JsonSerdeError) i32 {
         error.BufferTooSmall => -10,
         error.UnexpectedEndOfInput => -11,
         error.Overflow => -12,
-        error.MissingSigil => -23,
-        error.InvalidSigilOrder => -24,
-        error.MissingDecompLen => -25,
+        error.MissingSigil => -25,
+        error.InvalidSigilOrder => -26,
+        error.MissingDecompLen => -27,
     };
 }
 
@@ -1097,9 +1100,9 @@ test "C FFI: blip_peek navigates to known container" {
     try std.testing.expectEqual(@as(i32, 0), blip_peek(out_buf, out_len, "[1][0][0]", 9, &out_type, &data_ptr, &data_len));
     try std.testing.expectEqual(@as(u8, 0x02), out_type); // DICT
 
-    // [1][0][1] -> DATA (content)
+    // [1][0][1] -> DATA (content) — v2 type_id = 4
     try std.testing.expectEqual(@as(i32, 0), blip_peek(out_buf, out_len, "[1][0][1]", 9, &out_type, &data_ptr, &data_len));
-    try std.testing.expectEqual(@as(u8, 0x08), out_type); // DATA
+    try std.testing.expectEqual(@as(u8, 4), out_type); // DATA (v2 ContainerTypeId.data = 4)
 }
 
 test "C FFI: blip_container_count returns correct count" {
@@ -1132,11 +1135,11 @@ test "C FFI: blip_container_hash returns correct hash bytes" {
     try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
-    // Get hash of outer array
+    // Get hash of outer array — v2 uses BLAKE3-128 (16 bytes), containerHash returns first 8
     var hash: [8]u8 = undefined;
     try std.testing.expectEqual(@as(i32, 0), blip_container_hash(out_buf, out_len, &hash));
-    // Hash should match last 8 bytes of the archive
-    try std.testing.expectEqualSlices(u8, out_buf[out_len - 8 .. out_len], &hash);
+    // Hash should match first 8 bytes of the 16-byte BLAKE3-128 checksum (at [total-16..total-8])
+    try std.testing.expectEqualSlices(u8, out_buf[out_len - 16 .. out_len - 8], &hash);
 }
 
 test "C FFI: blip_container_key_at returns correct key" {
