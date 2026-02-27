@@ -1,101 +1,93 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const blip = @import("blip.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
+const csum_mod = @import("checksum.zig");
 const z7z = @import("z7z");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
-const XxHash64 = std.hash.XxHash64;
+const LPContainerError = container.LPContainerError;
 
 pub const Lzma2Error = error{
     CompressionFailed,
     DecompressionFailed,
 };
 
-/// Serialize an LZMA2 container (0x81 0x09): compressed wrapper for any container.
-/// Layout: [0x81 0x09][BLIP(total)][BLIP(uncompressed_size)][lzma2_data][xxHash64 8B LE]
-/// Hash covers everything from container start to total - 8 (i.e. the compressed data).
+/// Compress arbitrary bytes (typically a serialized archive) into a DATA
+/// container with the COMP=lzma2, DECOMP_LEN, and CSUM=blake3_128 attributes.
+///
+/// v2 LP layout:
+///   [BLIP(total)] [TYPE=data(4)] [COMP=lzma2(1)] [DECOMP_LEN=N]
+///   [CSUM=blake3_128(3)] [VAL sentinel] [compressed_bytes] [BLAKE3-128 16B]
+///
 /// Caller owns returned memory.
 pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || Lzma2Error)![]u8 {
-    // Compress with LZMA2
+    // 1. Compress with LZMA2
     const compressed = z7z.lzma2_encoder.compress(container_bytes, .{}, allocator) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return Lzma2Error.CompressionFailed,
     };
     defer allocator.free(compressed);
 
-    const uncompressed_size: u64 = container_bytes.len;
-    const uncomp_encoded_size = blip.encodedSize(uncompressed_size);
+    // 2. Build LP container: TYPE=data, COMP=lzma2, DECOMP_LEN, CSUM=blake3_128
+    const options: container.LPOptions = .{
+        .comp_id = .lzma2,
+        .decomp_len = container_bytes.len,
+        .csum_id = .blake3_128,
+    };
 
-    // value = BLIP(uncompressed_size) + compressed_data + 8 (hash)
-    const value_len: u64 = uncomp_encoded_size + compressed.len + 8;
-    const total = container.computeTotalLength(value_len);
-
+    const total = container.computeLPLength(.data, compressed.len, options);
     const buf = try allocator.alloc(u8, @intCast(total));
     errdefer allocator.free(buf);
 
-    var pos: usize = 0;
+    // 3. Write LP header
+    const header_len = try container.writeLPHeader(buf, .data, total, options);
 
-    // Write type sentinel (LZMA2 = 0x81 0x09)
-    const sentinel = ct.typeSentinel(.lzma2);
-    buf[pos] = sentinel[0];
-    buf[pos + 1] = sentinel[1];
-    pos += 2;
+    // 4. Write compressed data
+    @memcpy(buf[header_len..][0..compressed.len], compressed);
 
-    // Write BLIP(total)
-    const total_written = blip.encode(total, buf[pos..]) catch return ContainerError.BufferTooSmall;
-    pos += total_written;
+    // 5. Compute and write BLAKE3-128 checksum over everything before the checksum
+    const csum_len = ct.checksumLength(.blake3_128);
+    const csum_result = csum_mod.compute(.blake3_128, buf[0..@as(usize, @intCast(total)) - csum_len]);
+    @memcpy(buf[@as(usize, @intCast(total)) - csum_len .. @as(usize, @intCast(total))], csum_result[0..csum_len]);
 
-    // Write BLIP(uncompressed_size)
-    const uncomp_written = blip.encode(uncompressed_size, buf[pos..]) catch return ContainerError.BufferTooSmall;
-    pos += uncomp_written;
-
-    // Write compressed data
-    @memcpy(buf[pos..][0..compressed.len], compressed);
-    pos += compressed.len;
-
-    // Write xxHash64 over everything except the hash itself
-    const hash_value = XxHash64.hash(0, buf[0 .. @as(usize, @intCast(total)) - 8]);
-    std.mem.writeInt(u64, buf[pos..][0..8], hash_value, .little);
-    pos += 8;
-
-    std.debug.assert(pos == total);
     return buf;
 }
 
-/// Decompress an LZMA2 container, returning the inner container bytes.
-/// Verifies xxHash64 before decompressing.
+/// Decompress an LP container with COMP=lzma2 attribute, verifying checksum
+/// before decompression.
+/// Returns the decompressed inner bytes (typically a serialized archive).
 /// Caller owns returned memory.
 pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Error || ContainerError || Lzma2Error)![]u8 {
-    const view = try container.parseHeader(buf);
-    if (view.container_type != .lzma2) return ContainerError.InvalidContainerType;
+    // 1. Parse LP header
+    const view = try container.parseLPHeader(buf);
 
-    const total: usize = @intCast(view.total_length);
+    // 2. Check COMP attribute exists and is LZMA2
+    if (view.comp_id == null) return ContainerError.InvalidContainerType;
+    if (view.comp_id.? != .lzma2) return ContainerError.InvalidContainerType;
 
-    // Verify hash first
-    if (total < 8) return ContainerError.InvalidLength;
-    const hash_computed = XxHash64.hash(0, buf[0 .. total - 8]);
-    const hash_stored = std.mem.readInt(u64, buf[total - 8 ..][0..8], .little);
-    if (hash_computed != hash_stored) return ContainerError.HashMismatch;
+    // 3. Verify checksum if present
+    if (view.csum_id) |csum_id| {
+        const csum_bytes = view.checksumSlice();
+        const csum_len = ct.checksumLength(csum_id);
+        const data_to_check = buf[0..@as(usize, @intCast(view.total_length)) - csum_len];
+        if (!csum_mod.verify(csum_id, data_to_check, csum_bytes)) {
+            return ContainerError.HashMismatch;
+        }
+    }
 
-    // Parse uncompressed size
-    const value = view.valueSlice();
-    if (value.len < 9) return ContainerError.InvalidLength; // at minimum: 1 byte uncomp_size + 0 bytes data + 8 bytes hash
-    const uncomp_result = blip.decode(value) catch return ContainerError.InvalidLength;
-    const uncompressed_size: usize = @intCast(uncomp_result.value);
+    // 4. Get decompressed size
+    const decomp_len = view.decomp_len orelse return ContainerError.InvalidLength;
 
-    // Extract compressed data (between uncompressed_size field and hash)
-    const compressed_start = uncomp_result.bytes_read;
-    if (value.len < compressed_start + 8) return ContainerError.InvalidLength;
-    const compressed_data = value[compressed_start .. value.len - 8];
+    // 5. Get compressed payload
+    const compressed = view.payloadSlice();
 
-    // Decompress using Zig stdlib LZMA2 decoder
-    const out_buf = try allocator.alloc(u8, uncompressed_size);
+    // 6. Decompress using Zig stdlib LZMA2 decoder
+    const out_buf = try allocator.alloc(u8, @intCast(decomp_len));
     errdefer allocator.free(out_buf);
 
-    var input_stream = std.io.fixedBufferStream(compressed_data);
+    var input_stream = std.io.fixedBufferStream(compressed);
     var output_stream = std.io.fixedBufferStream(out_buf);
 
     std.compress.lzma2.decompress(allocator, input_stream.reader(), output_stream.writer()) catch {
@@ -103,7 +95,7 @@ pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Err
         return Lzma2Error.DecompressionFailed;
     };
 
-    if (output_stream.pos != uncompressed_size) {
+    if (output_stream.pos != @as(usize, @intCast(decomp_len))) {
         allocator.free(out_buf);
         return Lzma2Error.DecompressionFailed;
     }
@@ -111,47 +103,53 @@ pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Err
     return out_buf;
 }
 
+/// Quick check if a buffer starts with an LP container that has a COMP attribute.
+pub fn isCompressed(buf: []const u8) bool {
+    const view = container.parseLPHeader(buf) catch return false;
+    return view.comp_id != null;
+}
+
 /// Reader for zero-copy header inspection without decompressing.
 pub const Lzma2Reader = struct {
-    buf: []const u8,
-    total: usize,
-    uncompressed_size: u64,
-    compressed_data_offset: usize,
-    compressed_data_len: usize,
+    lp_view: container.LPContainerView,
 
     pub fn init(buf: []const u8) (ContainerError || Lzma2Error)!Lzma2Reader {
-        const view = try container.parseHeader(buf);
-        if (view.container_type != .lzma2) return ContainerError.InvalidContainerType;
-
-        const total: usize = @intCast(view.total_length);
-        const value = view.valueSlice();
-        if (value.len < 9) return ContainerError.InvalidLength;
-
-        const uncomp_result = blip.decode(value) catch return ContainerError.InvalidLength;
-        const compressed_start = view.value_offset + uncomp_result.bytes_read;
-        const compressed_len = total - 8 - compressed_start;
-
-        return .{
-            .buf = buf,
-            .total = total,
-            .uncompressed_size = uncomp_result.value,
-            .compressed_data_offset = compressed_start,
-            .compressed_data_len = compressed_len,
+        const view = container.parseLPHeader(buf) catch |e| switch (e) {
+            // Map LP-specific errors to ContainerError variants
+            inline else => |err| return err,
         };
+        if (view.comp_id == null) return ContainerError.InvalidContainerType;
+        if (view.comp_id.? != .lzma2) return ContainerError.InvalidContainerType;
+        return .{ .lp_view = view };
     }
 
+    /// Verify the embedded checksum (BLAKE3-128 or other CSUM attribute).
+    pub fn verifyChecksum(self: Lzma2Reader) bool {
+        const csum_id = self.lp_view.csum_id orelse return true; // no checksum = valid
+        const csum_len = ct.checksumLength(csum_id);
+        const total: usize = @intCast(self.lp_view.total_length);
+        const data_to_check = self.lp_view.buf[0 .. total - csum_len];
+        return csum_mod.verify(csum_id, data_to_check, self.lp_view.checksumSlice());
+    }
+
+    /// Legacy alias for verifyChecksum.
     pub fn verifyHash(self: Lzma2Reader) bool {
-        const hash_computed = XxHash64.hash(0, self.buf[0 .. self.total - 8]);
-        const hash_stored = std.mem.readInt(u64, self.buf[self.total - 8 ..][0..8], .little);
-        return hash_computed == hash_stored;
+        return self.verifyChecksum();
     }
 
+    /// Returns the size of the compressed payload (bytes).
     pub fn compressedSize(self: Lzma2Reader) usize {
-        return self.compressed_data_len;
+        return self.lp_view.payloadSlice().len;
+    }
+
+    /// Returns the decompressed (original) size.
+    pub fn uncompressedSize(self: Lzma2Reader) u64 {
+        return self.lp_view.decomp_len orelse 0;
     }
 };
 
-/// Verify the embedded xxHash64 of an LZMA2 container.
+/// Verify the embedded checksum of a compressed LP container.
+/// Legacy alias — delegates to Lzma2Reader.
 pub fn verifyHash(buf: []const u8) (ContainerError || Lzma2Error)!bool {
     const reader = try Lzma2Reader.init(buf);
     return reader.verifyHash();
@@ -161,19 +159,15 @@ pub fn verifyHash(buf: []const u8) (ContainerError || Lzma2Error)!bool {
 // Tests
 // =============================================================================
 
-test "LZMA2 round-trip: compress and decompress a RAW container" {
+test "LZMA2 round-trip: compress and decompress a DATA container" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
-    const inner = try leaf.serializeRaw(allocator, "Hello, LZMA2!");
+    const inner = try leaf.serializeData(allocator, "Hello, LZMA2!");
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
     defer allocator.free(compressed);
-
-    // Verify sentinel
-    try testing.expectEqual(@as(u8, 0x81), compressed[0]);
-    try testing.expectEqual(@as(u8, 0x09), compressed[1]);
 
     // Decompress and compare
     const decompressed = try decompressContainer(allocator, compressed);
@@ -181,11 +175,11 @@ test "LZMA2 round-trip: compress and decompress a RAW container" {
     try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
-test "LZMA2 hash verification" {
+test "LZMA2 hash/checksum verification" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
-    const inner = try leaf.serializeRaw(allocator, "integrity test");
+    const inner = try leaf.serializeData(allocator, "integrity test");
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
@@ -194,17 +188,17 @@ test "LZMA2 hash verification" {
     try testing.expect(try verifyHash(compressed));
 }
 
-test "LZMA2 hash detects corruption" {
+test "LZMA2 checksum detects corruption" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
-    const inner = try leaf.serializeRaw(allocator, "corrupt me");
+    const inner = try leaf.serializeData(allocator, "corrupt me");
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
     defer allocator.free(compressed);
 
-    // Corrupt a byte in the compressed data
+    // Corrupt a byte in the compressed data (not in checksum area)
     compressed[compressed.len / 2] ^= 0xFF;
 
     try testing.expect(!(try verifyHash(compressed)));
@@ -237,19 +231,19 @@ test "LZMA2 Reader: header inspection without decompression" {
     const leaf = @import("leaf.zig");
 
     const content = "Hello, world! This is some compressible text content.";
-    const inner = try leaf.serializeRaw(allocator, content);
+    const inner = try leaf.serializeData(allocator, content);
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
     defer allocator.free(compressed);
 
     const reader = try Lzma2Reader.init(compressed);
-    try testing.expectEqual(@as(u64, inner.len), reader.uncompressed_size);
+    try testing.expectEqual(@as(u64, inner.len), reader.uncompressedSize());
     try testing.expect(reader.verifyHash());
     try testing.expect(reader.compressedSize() > 0);
 }
 
-test "LZMA2 compression actually shrinks compressible data" {
+test "LZMA2 compression shrinks compressible data" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -260,7 +254,7 @@ test "LZMA2 compression actually shrinks compressible data" {
         byte.* = pattern[i % pattern.len];
     }
 
-    const inner = try leaf.serializeRaw(allocator, &big_content);
+    const inner = try leaf.serializeData(allocator, &big_content);
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
@@ -279,7 +273,7 @@ test "LZMA2 empty container round-trip" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
-    const inner = try leaf.serializeRaw(allocator, "");
+    const inner = try leaf.serializeData(allocator, "");
     defer allocator.free(inner);
 
     const compressed = try compressContainer(allocator, inner);
@@ -290,12 +284,53 @@ test "LZMA2 empty container round-trip" {
     try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
-test "LZMA2 rejects non-LZMA2 container" {
+test "LZMA2 rejects non-compressed container (no COMP attribute)" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
-    const raw = try leaf.serializeRaw(allocator, "not lzma2");
+    const raw = try leaf.serializeData(allocator, "not compressed");
     defer allocator.free(raw);
 
     try testing.expectError(ContainerError.InvalidContainerType, decompressContainer(allocator, raw));
+}
+
+test "isCompressed returns true for LZMA2 container" {
+    const allocator = testing.allocator;
+    const leaf = @import("leaf.zig");
+
+    const inner = try leaf.serializeData(allocator, "test");
+    defer allocator.free(inner);
+
+    const compressed = try compressContainer(allocator, inner);
+    defer allocator.free(compressed);
+
+    try testing.expect(isCompressed(compressed));
+}
+
+test "isCompressed returns false for plain container" {
+    const allocator = testing.allocator;
+    const leaf = @import("leaf.zig");
+
+    const plain = try leaf.serializeData(allocator, "test");
+    defer allocator.free(plain);
+
+    try testing.expect(!isCompressed(plain));
+}
+
+test "Verify LP attributes are correct (TYPE=data, COMP=lzma2, DECOMP_LEN present, CSUM=blake3_128)" {
+    const allocator = testing.allocator;
+    const leaf = @import("leaf.zig");
+
+    const inner = try leaf.serializeData(allocator, "attribute check");
+    defer allocator.free(inner);
+
+    const compressed = try compressContainer(allocator, inner);
+    defer allocator.free(compressed);
+
+    const view = try container.parseLPHeader(compressed);
+    try testing.expectEqual(ct.ContainerTypeId.data, view.type_id);
+    try testing.expectEqual(@as(?ct.CompressionId, .lzma2), view.comp_id);
+    try testing.expect(view.decomp_len != null);
+    try testing.expectEqual(@as(u64, inner.len), view.decomp_len.?);
+    try testing.expectEqual(@as(?ct.ChecksumId, .blake3_128), view.csum_id);
 }

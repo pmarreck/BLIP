@@ -761,11 +761,11 @@ fn handleDefaultMode(
                 return;
             };
             if (flags.json) {
-                const s = try std.fmt.allocPrint(allocator, "{{\"type\":\"LZMA2\",\"compressed_size\":{d},\"uncompressed_size\":{d}}}\n", .{ reader.compressedSize(), reader.uncompressed_size });
+                const s = try std.fmt.allocPrint(allocator, "{{\"type\":\"LZMA2\",\"compressed_size\":{d},\"uncompressed_size\":{d}}}\n", .{ reader.compressedSize(), reader.uncompressedSize() });
                 defer allocator.free(s);
                 try stdout_list.appendSlice(allocator, s);
             } else {
-                const s = try std.fmt.allocPrint(allocator, "LZMA2 ({d} -> {d} bytes)\n", .{ reader.compressedSize(), reader.uncompressed_size });
+                const s = try std.fmt.allocPrint(allocator, "LZMA2 ({d} -> {d} bytes)\n", .{ reader.compressedSize(), reader.uncompressedSize() });
                 defer allocator.free(s);
                 try stdout_list.appendSlice(allocator, s);
             }
