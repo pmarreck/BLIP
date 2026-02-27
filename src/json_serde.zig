@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const XxHash64 = std.hash.XxHash64;
 const blip = @import("blip.zig");
 const mini_blar = @import("mini_blar.zig");
 const poke_mod = @import("poke.zig");
@@ -485,10 +486,11 @@ fn computeDirMerkleHashes(allocator: Allocator, entries: []mini_blar.ArchiveEntr
                 const file_bytes = mini_blar.serializeFileEntry(allocator, f, &to_free) catch |e| {
                     return mapContainerError2(e);
                 };
-                // ARRAY hash is last 8 bytes
-                if (file_bytes.len >= 8) {
+                // v2: FILE containers have no trailing checksum, so compute
+                // xxHash64 of the full serialized entry for the Merkle tree.
+                if (file_bytes.len > 0) {
                     var hash: [8]u8 = undefined;
-                    @memcpy(&hash, file_bytes[file_bytes.len - 8 ..]);
+                    std.mem.writeInt(u64, &hash, XxHash64.hash(0, file_bytes), .little);
                     file_hashes.put(f.path, hash) catch return error.OutOfMemory;
                 }
             },
