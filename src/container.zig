@@ -294,6 +294,10 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                     return ContainerError.InvalidContainerType;
                 pos += csum_result.bytes_read;
             },
+            .enc => {
+                // Future: parse encryption attribute. For now, return error.
+                return error.MissingSigil;
+            },
             .sig => {
                 // Future: skip sig bytes. For now, we don't know the length
                 // so we can't parse past it. Return error.

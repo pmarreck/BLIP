@@ -18,6 +18,8 @@ pub const AttributeSigil = enum(u7) {
     decomp_len = 0x11,
     /// Checksum algorithm ID
     csum = 0x12,
+    /// Encryption algorithm ID
+    enc = 0x13,
     /// Digital signature (future)
     sig = 0x20,
     /// Value/payload (required, always last attribute)
@@ -52,6 +54,18 @@ pub const ChecksumId = enum(u7) {
     blake3_128 = 3,
 };
 
+/// Encryption algorithm IDs — the value after an ENC attribute sigil.
+pub const EncryptionId = enum(u7) {
+    aes_256_gcm = 1,
+    chacha20_poly1305 = 2,
+};
+
+/// Key derivation function IDs — used within the ENC attribute payload.
+pub const KdfId = enum(u7) {
+    argon2id = 1,
+    pbkdf2_sha256 = 2,
+};
+
 /// Sentinel byte constant — first byte of every 2-byte sentinel.
 pub const SENTINEL_BYTE: u8 = 0x81;
 
@@ -66,6 +80,25 @@ pub fn checksumLength(id: ChecksumId) u8 {
         .blake3_128 => 16,
     };
 }
+
+/// Return the byte length of an authentication tag for the given encryption algorithm.
+pub fn authTagLength(id: EncryptionId) u8 {
+    return switch (id) {
+        .aes_256_gcm => 16,
+        .chacha20_poly1305 => 16,
+    };
+}
+
+/// Return the byte length of a nonce/IV for the given encryption algorithm.
+pub fn encNonceLength(id: EncryptionId) u8 {
+    return switch (id) {
+        .aes_256_gcm => 12,
+        .chacha20_poly1305 => 12,
+    };
+}
+
+/// Salt length for key derivation (bytes).
+pub const ENC_SALT_LEN: u8 = 16;
 
 /// Produce the 2-byte sentinel for an attribute sigil.
 pub fn attrSentinel(attr: AttributeSigil) [2]u8 {
@@ -90,6 +123,7 @@ test "AttributeSigil values match design spec" {
     try testing.expectEqual(@as(u7, 0x10), @intFromEnum(AttributeSigil.comp));
     try testing.expectEqual(@as(u7, 0x11), @intFromEnum(AttributeSigil.decomp_len));
     try testing.expectEqual(@as(u7, 0x12), @intFromEnum(AttributeSigil.csum));
+    try testing.expectEqual(@as(u7, 0x13), @intFromEnum(AttributeSigil.enc));
     try testing.expectEqual(@as(u7, 0x20), @intFromEnum(AttributeSigil.sig));
     try testing.expectEqual(@as(u7, 0x7F), @intFromEnum(AttributeSigil.val));
 }
@@ -128,6 +162,7 @@ test "attrSentinel produces correct bytes" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x10 }, &attrSentinel(.comp));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x11 }, &attrSentinel(.decomp_len));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x12 }, &attrSentinel(.csum));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x13 }, &attrSentinel(.enc));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x20 }, &attrSentinel(.sig));
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x7F }, &attrSentinel(.val));
 }
@@ -161,11 +196,37 @@ test "all attribute sentinels are valid BLIP sentinels" {
     }
 }
 
-test "attribute sigils are sorted (TYPE < COMP < DECOMP_LEN < CSUM < SIG < VAL)" {
+test "attribute sigils are sorted (TYPE < COMP < DECOMP_LEN < CSUM < ENC < SIG < VAL)" {
     try testing.expect(@intFromEnum(AttributeSigil.type_attr) < @intFromEnum(AttributeSigil.comp));
     try testing.expect(@intFromEnum(AttributeSigil.comp) < @intFromEnum(AttributeSigil.decomp_len));
     try testing.expect(@intFromEnum(AttributeSigil.decomp_len) < @intFromEnum(AttributeSigil.csum));
-    try testing.expect(@intFromEnum(AttributeSigil.csum) < @intFromEnum(AttributeSigil.sig));
+    try testing.expect(@intFromEnum(AttributeSigil.csum) < @intFromEnum(AttributeSigil.enc));
+    try testing.expect(@intFromEnum(AttributeSigil.enc) < @intFromEnum(AttributeSigil.sig));
     try testing.expect(@intFromEnum(AttributeSigil.sig) < @intFromEnum(AttributeSigil.val));
+}
+
+test "EncryptionId values match design spec" {
+    try testing.expectEqual(@as(u7, 1), @intFromEnum(EncryptionId.aes_256_gcm));
+    try testing.expectEqual(@as(u7, 2), @intFromEnum(EncryptionId.chacha20_poly1305));
+}
+
+test "KdfId values match design spec" {
+    try testing.expectEqual(@as(u7, 1), @intFromEnum(KdfId.argon2id));
+    try testing.expectEqual(@as(u7, 2), @intFromEnum(KdfId.pbkdf2_sha256));
+}
+
+test "ENC sigil fits in sorted order" {
+    try testing.expect(@intFromEnum(AttributeSigil.csum) < @intFromEnum(AttributeSigil.enc));
+    try testing.expect(@intFromEnum(AttributeSigil.enc) < @intFromEnum(AttributeSigil.sig));
+}
+
+test "authTagLength returns correct sizes" {
+    try testing.expectEqual(@as(u8, 16), authTagLength(.aes_256_gcm));
+    try testing.expectEqual(@as(u8, 16), authTagLength(.chacha20_poly1305));
+}
+
+test "encNonceLength returns correct sizes" {
+    try testing.expectEqual(@as(u8, 12), encNonceLength(.aes_256_gcm));
+    try testing.expectEqual(@as(u8, 12), encNonceLength(.chacha20_poly1305));
 }
 
