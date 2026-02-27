@@ -12,7 +12,7 @@ const peek = @import("peek.zig");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
-const ContainerType = ct.ContainerType;
+const ContainerTypeId = ct.ContainerTypeId;
 
 // =============================================================================
 // Poke error types
@@ -125,7 +125,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read mode (md)
     if (try meta_reader.findKey("md")) |md_idx| {
         const md_container = try meta_reader.valueAt(md_idx);
-        const md_val = try leaf.readRaw(md_container);
+        const md_val = try leaf.readData(md_container);
         if (md_val.len >= 2) {
             entry.mode = std.mem.readInt(u16, md_val[0..2], .little);
         }
@@ -134,7 +134,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read mtime (mt)
     if (try meta_reader.findKey("mt")) |mt_idx| {
         const mt_container = try meta_reader.valueAt(mt_idx);
-        const mt_val = try leaf.readRaw(mt_container);
+        const mt_val = try leaf.readData(mt_container);
         if (mt_val.len >= 8) {
             entry.mtime_ns = std.mem.readInt(i64, mt_val[0..8], .little);
         }
@@ -143,7 +143,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read ctime (ct)
     if (try meta_reader.findKey("ct")) |ct_idx| {
         const ct_container = try meta_reader.valueAt(ct_idx);
-        const ct_val = try leaf.readRaw(ct_container);
+        const ct_val = try leaf.readData(ct_container);
         if (ct_val.len >= 8) {
             entry.ctime_ns = std.mem.readInt(i64, ct_val[0..8], .little);
         }
@@ -152,7 +152,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read birthtime (bt)
     if (try meta_reader.findKey("bt")) |bt_idx| {
         const bt_container = try meta_reader.valueAt(bt_idx);
-        const bt_val = try leaf.readRaw(bt_container);
+        const bt_val = try leaf.readData(bt_container);
         if (bt_val.len >= 8) {
             entry.birthtime_ns = std.mem.readInt(i64, bt_val[0..8], .little);
         }
@@ -161,7 +161,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read uid (ui)
     if (try meta_reader.findKey("ui")) |ui_idx| {
         const ui_container = try meta_reader.valueAt(ui_idx);
-        const ui_val = try leaf.readRaw(ui_container);
+        const ui_val = try leaf.readData(ui_container);
         if (ui_val.len >= 4) {
             entry.uid = std.mem.readInt(u32, ui_val[0..4], .little);
         }
@@ -170,7 +170,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     // Read gid (gi)
     if (try meta_reader.findKey("gi")) |gi_idx| {
         const gi_container = try meta_reader.valueAt(gi_idx);
-        const gi_val = try leaf.readRaw(gi_container);
+        const gi_val = try leaf.readData(gi_container);
         if (gi_val.len >= 4) {
             entry.gid = std.mem.readInt(u32, gi_val[0..4], .little);
         }
@@ -195,7 +195,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
     if (elem_count >= 3) {
         const forks_view = arr.elementAt(2) catch null;
         if (forks_view) |fv| {
-            if (fv.container_type == .dict) {
+            if (fv.type_id == .dict) {
                 const forks_start = @intFromPtr(fv.buf.ptr) - @intFromPtr(reader.buf.ptr);
                 const forks_end = forks_start + @as(usize, @intCast(fv.total_length));
                 const forks_buf = reader.buf[forks_start..forks_end];
@@ -205,7 +205,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
                 // Check for resource fork
                 if (try forks_reader.findKey("rf")) |rf_idx| {
                     const rf_container = try forks_reader.valueAt(rf_idx);
-                    const rf_val = try leaf.readRaw(rf_container);
+                    const rf_val = try leaf.readData(rf_container);
                     entry.resource_fork = try allocator.dupe(u8, rf_val);
                 }
 
@@ -227,7 +227,7 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
                         const key_bytes = try dict_mod.extractKeyBytes(key_container);
                         if (!std.mem.eql(u8, key_bytes, "rf")) {
                             const val_container = try forks_reader.valueAt(fi);
-                            const val_bytes = try leaf.readRaw(val_container);
+                            const val_bytes = try leaf.readData(val_container);
                             xattrs[xi] = .{
                                 .name = try allocator.dupe(u8, key_bytes),
                                 .value = try allocator.dupe(u8, val_bytes),
@@ -262,7 +262,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read xh (Merkle hash)
     if (try dict_reader.findKey("xh")) |xh_idx| {
         const xh_container = try dict_reader.valueAt(xh_idx);
-        const xh_val = try leaf.readRaw(xh_container);
+        const xh_val = try leaf.readData(xh_container);
         if (xh_val.len >= 8) {
             @memcpy(&entry.xh64, xh_val[0..8]);
         }
@@ -271,7 +271,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read mode (md)
     if (try dict_reader.findKey("md")) |md_idx| {
         const md_container = try dict_reader.valueAt(md_idx);
-        const md_val = try leaf.readRaw(md_container);
+        const md_val = try leaf.readData(md_container);
         if (md_val.len >= 2) {
             entry.mode = std.mem.readInt(u16, md_val[0..2], .little);
         }
@@ -280,7 +280,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read mtime (mt)
     if (try dict_reader.findKey("mt")) |mt_idx| {
         const mt_container = try dict_reader.valueAt(mt_idx);
-        const mt_val = try leaf.readRaw(mt_container);
+        const mt_val = try leaf.readData(mt_container);
         if (mt_val.len >= 8) {
             entry.mtime_ns = std.mem.readInt(i64, mt_val[0..8], .little);
         }
@@ -289,7 +289,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read ctime (ct)
     if (try dict_reader.findKey("ct")) |ct_idx| {
         const ct_container = try dict_reader.valueAt(ct_idx);
-        const ct_val = try leaf.readRaw(ct_container);
+        const ct_val = try leaf.readData(ct_container);
         if (ct_val.len >= 8) {
             entry.ctime_ns = std.mem.readInt(i64, ct_val[0..8], .little);
         }
@@ -298,7 +298,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read birthtime (bt)
     if (try dict_reader.findKey("bt")) |bt_idx| {
         const bt_container = try dict_reader.valueAt(bt_idx);
-        const bt_val = try leaf.readRaw(bt_container);
+        const bt_val = try leaf.readData(bt_container);
         if (bt_val.len >= 8) {
             entry.birthtime_ns = std.mem.readInt(i64, bt_val[0..8], .little);
         }
@@ -307,7 +307,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read uid (ui)
     if (try dict_reader.findKey("ui")) |ui_idx| {
         const ui_container = try dict_reader.valueAt(ui_idx);
-        const ui_val = try leaf.readRaw(ui_container);
+        const ui_val = try leaf.readData(ui_container);
         if (ui_val.len >= 4) {
             entry.uid = std.mem.readInt(u32, ui_val[0..4], .little);
         }
@@ -316,7 +316,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
     // Read gid (gi)
     if (try dict_reader.findKey("gi")) |gi_idx| {
         const gi_container = try dict_reader.valueAt(gi_idx);
-        const gi_val = try leaf.readRaw(gi_container);
+        const gi_val = try leaf.readData(gi_container);
         if (gi_val.len >= 4) {
             entry.gid = std.mem.readInt(u32, gi_val[0..4], .little);
         }
@@ -347,7 +347,7 @@ fn reconstructDirEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, in
                 const key_container = try xa_reader.keyAt(xi);
                 const key_bytes = try dict_mod.extractKeyBytes(key_container);
                 const val_container = try xa_reader.valueAt(xi);
-                const val_bytes = try leaf.readRaw(val_container);
+                const val_bytes = try leaf.readData(val_container);
                 xattrs[xi] = .{
                     .name = try allocator.dupe(u8, key_bytes),
                     .value = try allocator.dupe(u8, val_bytes),
