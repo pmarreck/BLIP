@@ -43,12 +43,14 @@ else
   fail "blar create -z produces output file"
 fi
 
-# 2. Compressed archive starts with LZMA2 sentinel (0x81 0x09)
-MAGIC=$(xxd -l 2 -p "$TMPDIR_TEST/compressed.blar")
-if [ "$MAGIC" = "8109" ]; then
-  pass "blar create -z: LZMA2 sentinel 0x81 0x09"
+# 2. Compressed archive has COMP attribute (0x81 0x10) in v2 LP header
+# In v2 LP format, compressed containers use a COMP attribute instead of a type sentinel.
+# The first ~15 bytes contain: BLIP(total_length), TYPE attr (0x81 0x01 0x04), COMP attr (0x81 0x10 0x01)
+HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/compressed.blar" | tr -d '\n')
+if echo "$HEADER_HEX" | grep -q "8110"; then
+  pass "blar create -z: COMP attribute (0x81 0x10) present in LP header"
 else
-  fail "blar create -z: LZMA2 sentinel 0x81 0x09 (got $MAGIC)"
+  fail "blar create -z: COMP attribute (0x81 0x10) not found in header (got $HEADER_HEX)"
 fi
 
 # 3. Compressed archive is smaller than uncompressed (for text files)
@@ -166,12 +168,12 @@ else
   fail "miniblar create -z produces output file"
 fi
 
-# 15. miniblar compressed archive has LZMA2 sentinel
-MINI_MAGIC=$(xxd -l 2 -p "$TMPDIR_TEST/mini_compressed.mblar")
-if [ "$MINI_MAGIC" = "8109" ]; then
-  pass "miniblar create -z: LZMA2 sentinel 0x81 0x09"
+# 15. miniblar compressed archive has COMP attribute in v2 LP header
+MINI_HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/mini_compressed.mblar" | tr -d '\n')
+if echo "$MINI_HEADER_HEX" | grep -q "8110"; then
+  pass "miniblar create -z: COMP attribute (0x81 0x10) present in LP header"
 else
-  fail "miniblar create -z: LZMA2 sentinel 0x81 0x09 (got $MINI_MAGIC)"
+  fail "miniblar create -z: COMP attribute (0x81 0x10) not found in header (got $MINI_HEADER_HEX)"
 fi
 
 # ── Transparent decompression: miniblar ──────────────────────────────────

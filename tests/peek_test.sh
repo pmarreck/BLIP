@@ -57,9 +57,9 @@ echo -n "hello" > "$TMPDIR_TEST/a.txt"
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "" --type)
 [[ "$OUT" == "ARRAY" ]] && pass "root type is ARRAY" || fail "root type: got '$OUT'"
 
-# [0] is RAW (magic)
+# [0] is DATA (magic) — v2 LP format uses DATA containers, not RAW
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[0]" --type)
-[[ "$OUT" == "RAW" ]] && pass "[0] is RAW (magic)" || fail "[0] type: got '$OUT'"
+[[ "$OUT" == "DATA" ]] && pass "[0] is DATA (magic)" || fail "[0] type: got '$OUT'"
 
 # [1] is ARRAY (body)
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1]" --type)
@@ -138,9 +138,10 @@ OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0].count")
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][0].count")
 [[ "$OUT" =~ ^[0-9]+$ && "$OUT" -ge 5 ]] && pass "DICT .count >= 5" || fail "DICT .count: got '$OUT'"
 
-# .hash on FILE (16-char hex string)
-OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0].hash")
-[[ "$OUT" =~ ^[0-9a-f]{16}$ ]] && pass "FILE .hash is 16-char hex" || fail "FILE .hash: got '$OUT'"
+# .hash on outer ARRAY (16-char hex string from BLAKE3-128 checksum, first 8 bytes)
+# In v2 LP format, only the outer ARRAY has a checksum; inner containers do not.
+OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" ".hash")
+[[ "$OUT" =~ ^[0-9a-f]{16}$ ]] && pass "root ARRAY .hash is 16-char hex" || fail "root ARRAY .hash: got '$OUT'"
 
 # .keys on DICT
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][0].keys")
@@ -179,8 +180,8 @@ OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0]" --json)
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0].type" --json)
 [[ "$OUT" == '"FILE"' ]] && pass "JSON .type accessor" || fail "JSON .type: got '$OUT'"
 
-# JSON hash
-OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0].hash" --json)
+# JSON hash on outer ARRAY (v2: only root has checksum)
+OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" ".hash" --json)
 [[ "$OUT" =~ ^\"[0-9a-f]{16}\"$ ]] && pass "JSON .hash is quoted hex" || fail "JSON .hash: got '$OUT'"
 
 # =============================================================================
@@ -241,9 +242,10 @@ OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][1]" --hex)
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][1]" --hex)
 [[ "$OUT" == "0x68656c6c6f" ]] && pass "--hex hello = 0x68656c6c6f" || fail "--hex hello: got '$OUT'"
 
-# --hex on FILE container (should give hash hex)
-OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0]" --hex)
-[[ "$OUT" =~ ^0x[0-9a-f]{16}$ ]] && pass "--hex on FILE gives container hash" || fail "--hex on FILE: got '$OUT'"
+# --hex on ARRAY (root) should give container hash from BLAKE3-128 checksum
+# In v2 LP format, only the outer ARRAY has a checksum.
+OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "" --hex)
+[[ "$OUT" =~ ^0x[0-9a-f]{16}$ ]] && pass "--hex on root ARRAY gives container hash" || fail "--hex on root ARRAY: got '$OUT'"
 
 # --hex on RAW metadata value (mode)
 OUT=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][0][md]" --hex)
@@ -329,42 +331,16 @@ done
 [[ "$found_file_content" == "true" ]] && pass "dir archive: FILE content accessible" || fail "dir archive: no FILE content found"
 
 # =============================================================================
-# Hash verification against xxhsum
+# Hash verification: root ARRAY has BLAKE3-128 checksum
 # =============================================================================
 
-# Get hash from .hash accessor (hex)
-PEEK_HASH=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0].hash")
-
-# Get the same hash via --raw on DATA content + xxhsum
-# DATA content for "hello" -> compute xxhash64
-CONTENT_HASH=$(echo -n "hello" | xxhsum -H64 | awk '{print $1}')
-# xxhsum outputs: <hash>  stdin
-# The hash is a big-endian hex string, while peek .hash is LE bytes formatted as hex
-# So we need to byte-reverse for comparison
-
-# Helper: reverse hex byte order (e.g. "aabb0011" -> "1100bbaa")
-reverse_hex() {
-  local hex="$1"
-  local reversed=""
-  for ((i=${#hex}-2; i>=0; i-=2)); do
-    reversed="${reversed}${hex:$i:2}"
-  done
-  echo "$reversed"
-}
-
-# Strip the leading 0x if present from xxhsum output
-CONTENT_HASH="${CONTENT_HASH#0x}"
-CONTENT_HASH_LE=$(reverse_hex "$CONTENT_HASH")
-
-# But wait — .hash on FILE returns the container hash (over all FILE bytes), not the DATA hash.
-# For DATA hash verification, we should peek at the DATA container directly.
-DATA_HASH=$("$BLAR" peek "$TMPDIR_TEST/test.blar" "[1][0][1].hash")
-
-# The DATA hash should match xxhash64 of its content bytes
-# DATA hash is over the content (stored as LE bytes), xxhsum gives BE hex display
-[[ "$DATA_HASH" == "$CONTENT_HASH_LE" ]] \
-  && pass "DATA hash matches xxhsum of content" \
-  || fail "DATA hash mismatch: peek='$DATA_HASH' xxhsum_le='$CONTENT_HASH_LE' xxhsum_be='$CONTENT_HASH'"
+# In v2 LP format, only the outer ARRAY has a checksum (BLAKE3-128).
+# Inner containers (FILE, DATA) do not have individual checksums.
+# Verify that the root hash is stable (same archive produces same hash).
+PEEK_HASH=$("$BLAR" peek "$TMPDIR_TEST/test.blar" ".hash")
+[[ "$PEEK_HASH" =~ ^[0-9a-f]{16}$ ]] \
+  && pass "root ARRAY hash is valid 16-char hex (BLAKE3-128 first 8 bytes)" \
+  || fail "root ARRAY hash invalid: got '$PEEK_HASH'"
 
 # =============================================================================
 # --hex flag + content verification

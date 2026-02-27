@@ -77,18 +77,19 @@ echo -n "hello" > "$BFT/a.txt"
 
 RAW_HEX=$(xxd -p "$BFT/single.blip" | tr -d '\n')
 
-# FILE sentinel (0x81 0x05) should be present (FILE is now ARRAY-based)
-if [[ "$RAW_HEX" == *"8105"* ]]; then
-  pass "miniblar single file: FILE sentinel (0x81 0x05) present"
+# In v2 LP format, containers use TYPE attribute (0x81 0x01) followed by type ID.
+# FILE type ID = 5, so look for TYPE attr + file ID: 81 01 05
+if [[ "$RAW_HEX" == *"810105"* ]]; then
+  pass "miniblar single file: FILE type (TYPE attr 0x81 0x01 + ID 0x05) present"
 else
-  fail "miniblar single file: FILE sentinel not found"
+  fail "miniblar single file: FILE type not found"
 fi
 
-# DATA sentinel (0x81 0x08) should be present (content container)
-if [[ "$RAW_HEX" == *"8108"* ]]; then
-  pass "miniblar single file: DATA sentinel (0x81 0x08) present"
+# DATA type ID = 4, so look for TYPE attr + data ID: 81 01 04
+if [[ "$RAW_HEX" == *"810104"* ]]; then
+  pass "miniblar single file: DATA type (TYPE attr 0x81 0x01 + ID 0x04) present"
 else
-  fail "miniblar single file: DATA sentinel not found"
+  fail "miniblar single file: DATA type not found"
 fi
 
 # Verify roundtrip works
@@ -121,12 +122,12 @@ cleanup && mkdir -p "$BFT"
 touch "$BFT/empty.txt"
 "$MINIBLAR" create -o "$BFT/empty.blip" "$BFT/empty.txt" 2>/dev/null
 
-# DATA sentinel should be present even for empty content
+# DATA type (TYPE attr 0x81 0x01 + ID 0x04) should be present even for empty content
 RAW_HEX=$(xxd -p "$BFT/empty.blip" | tr -d '\n')
-if [[ "$RAW_HEX" == *"8108"* ]]; then
-  pass "miniblar empty file: DATA sentinel present for empty content"
+if [[ "$RAW_HEX" == *"810104"* ]]; then
+  pass "miniblar empty file: DATA type present for empty content"
 else
-  fail "miniblar empty file: DATA sentinel not found"
+  fail "miniblar empty file: DATA type not found"
 fi
 
 "$MINIBLAR" verify "$BFT/empty.blip" >/dev/null 2>&1 \
@@ -134,26 +135,27 @@ fi
   || fail "miniblar empty file: verify failed"
 
 # --------------- Test 4: Magic bytes check (structural) ---------------
-# Every archive starts with outer ARRAY sentinel 0x81 0x01
-# and contains the magic RAW("BLIP\x01") somewhere early
+# In v2 LP format, archives start with BLIP(total_length), then have
+# TYPE attribute (0x81 0x01) followed by array type ID (0x01).
+# Magic "MBAR\x02" appears inside a DATA container element.
 cleanup && mkdir -p "$BFT"
 echo -n "hello" > "$BFT/a.txt"
 "$MINIBLAR" create -o "$BFT/magic.blip" "$BFT/a.txt" 2>/dev/null
 
-# Check first 2 bytes are ARRAY sentinel
-FIRST_TWO=$(xxd -l 2 -p "$BFT/magic.blip")
-if [[ "$FIRST_TWO" == "8101" ]]; then
-  pass "miniblar magic: outer ARRAY sentinel 0x81 0x01"
+# Check that TYPE attr + array type ID (810101) appears in first ~10 bytes
+FIRST_TEN=$(xxd -l 10 -p "$BFT/magic.blip")
+if [[ "$FIRST_TEN" == *"810101"* ]]; then
+  pass "miniblar magic: outer ARRAY type (0x81 0x01 0x01) in header"
 else
-  fail "miniblar magic: expected ARRAY sentinel 0x8101, got 0x$FIRST_TWO"
+  fail "miniblar magic: expected ARRAY type 810101 in header, got $FIRST_TEN"
 fi
 
-# Check that MBAR\x01 magic appears in the archive
-PB_OUT="$($PB "$BFT/magic.blip" 2>/dev/null)"
-if [[ "$PB_OUT" == *"MBAR¯"* ]]; then
-  pass "miniblar magic: MBAR magic bytes present"
+# Check that MBAR\x02 magic appears in the archive (hex: 4d42415202)
+RAW_HEX=$(xxd -p "$BFT/magic.blip" | tr -d '\n')
+if [[ "$RAW_HEX" == *"4d42415202"* ]]; then
+  pass "miniblar magic: MBAR\\x02 magic bytes present"
 else
-  fail "miniblar magic: MBAR magic bytes not found in archive"
+  fail "miniblar magic: MBAR\\x02 magic bytes not found in archive"
 fi
 
 # =============================================================================
@@ -165,47 +167,49 @@ cleanup && mkdir -p "$BFT/mydir"
 echo -n "test" > "$BFT/mydir/file.txt"
 "$BLAR" create -o "$BFT/blar.blar" "$BFT/mydir" 2>/dev/null
 
-FIRST_TWO=$(xxd -l 2 -p "$BFT/blar.blar")
-if [[ "$FIRST_TWO" == "8101" ]]; then
-  pass "blar header: outer ARRAY sentinel 0x81 0x01"
+# Check that TYPE attr + array type ID (810101) appears in first ~10 bytes
+FIRST_TEN=$(xxd -l 10 -p "$BFT/blar.blar")
+if [[ "$FIRST_TEN" == *"810101"* ]]; then
+  pass "blar header: outer ARRAY type (0x81 0x01 0x01) in header"
 else
-  fail "blar header: expected ARRAY sentinel 0x8101, got 0x$FIRST_TWO"
+  fail "blar header: expected ARRAY type 810101 in header, got $FIRST_TEN"
 fi
 
+# Check that BLAR\x02 magic appears in the archive (hex: 424c415202)
+RAW_BLAR_HEX_FULL=$(xxd -p "$BFT/blar.blar" | tr -d '\n')
 PB_OUT="$($PB "$BFT/blar.blar" 2>/dev/null)"
-if [[ "$PB_OUT" == *"BLAR¯"* ]]; then
-  pass "blar header: BLAR magic bytes present"
+if [[ "$RAW_BLAR_HEX_FULL" == *"424c415202"* ]]; then
+  pass "blar header: BLAR\\x02 magic bytes present"
 else
-  fail "blar header: BLAR magic bytes not found"
+  fail "blar header: BLAR\\x02 magic bytes not found"
 fi
 
-# --------------- Test 6: DIR entry sentinel present ---------------
-# DIR sentinel in printable-binary is "Ăª" (0x81 0x07)
-if [[ "$PB_OUT" == *"Ăª"* ]]; then
-  pass "blar structure: DIR sentinel (0x81 0x07) present"
+# --------------- Test 6: DIR entry type present ---------------
+# In v2 LP format, DIR type = TYPE attr (0x81 0x01) + dir ID (0x07) = 810107
+RAW_BLAR_HEX=$(xxd -p "$BFT/blar.blar" | tr -d '\n')
+if [[ "$RAW_BLAR_HEX" == *"810107"* ]]; then
+  pass "blar structure: DIR type (0x81 0x01 0x07) present"
 else
-  fail "blar structure: DIR sentinel not found"
+  fail "blar structure: DIR type not found"
 fi
 
-# --------------- Test 7: FILE entry sentinel present ---------------
-# FILE sentinel in printable-binary is "Ă¿" (0x81 0x05)
-if [[ "$PB_OUT" == *"Ă¿"* ]]; then
-  pass "blar structure: FILE sentinel (0x81 0x05) present"
+# --------------- Test 7: FILE entry type present ---------------
+# In v2 LP format, FILE type = TYPE attr (0x81 0x01) + file ID (0x05) = 810105
+if [[ "$RAW_BLAR_HEX" == *"810105"* ]]; then
+  pass "blar structure: FILE type (0x81 0x01 0x05) present"
 else
-  fail "blar structure: FILE sentinel not found"
+  fail "blar structure: FILE type not found"
 fi
 
 # --------------- Test 8: 2-char key names and DATA sentinel ---------------
 # DIR entries use 2-char keys: md, mt, pa, un, xh
 # FILE entries are ARRAY-based with metadata DICT + DATA container
 
-RAW_BLAR_HEX=$(xxd -p "$BFT/blar.blar" | tr -d '\n')
-
-# Check for DATA sentinel (0x81 0x08) in FILE entries
-if [[ "$RAW_BLAR_HEX" == *"8108"* ]]; then
-  pass "blar structure: DATA sentinel (0x81 0x08) present in FILE"
+# Check for DATA type (TYPE attr 0x81 0x01 + data ID 0x04) in FILE entries
+if [[ "$RAW_BLAR_HEX" == *"810104"* ]]; then
+  pass "blar structure: DATA type (0x81 0x01 0x04) present in FILE"
 else
-  fail "blar structure: DATA sentinel not found"
+  fail "blar structure: DATA type not found"
 fi
 
 # Check that 2-char key "pa" is present (path key in both FILE metadata and DIR)
