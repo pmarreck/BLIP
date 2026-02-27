@@ -664,4 +664,5 @@ test {
     _ = @import("mini_blar.zig");
     _ = @import("json_serde.zig");
     _ = @import("lzma2.zig");
+    _ = @import("checksum.zig");
 }
