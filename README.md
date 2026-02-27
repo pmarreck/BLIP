@@ -76,11 +76,11 @@ nix develop -c zig build -Doptimize=ReleaseFast
 nix develop -c zig build bench -Doptimize=ReleaseFast
 ```
 
-## Container Format
+## Container Format (v2 LP)
 
-BLIP also defines a recursive binary container format (TLV) for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
+BLIP also defines a recursive binary container format for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
 
-Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8, RAW — each identified by a 2-byte BLIP sentinel. Features include end-of-container index tables for O(1) random access, xxHash64 integrity verification, Merkle hash trees for directories, and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming (content-only and whole-file). All metadata uses compact 2-character key names.
+Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8. Each container uses the LP (Length-Payload) envelope: `[BLIP(total_length)] [sorted attributes] [VAL payload + checksum]`. Attributes include TYPE (container type ID), COMP (compression algorithm), DECOMP_LEN (decompressed length), CSUM (checksum algorithm), and SIG (digital signature). Features include end-of-container index tables for O(1) random access, BLAKE3-128 integrity at the archive level with xxHash64 for inner containers, Merkle hash trees for directories, built-in LZMA2 compression, and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming. All metadata uses compact 2-character key names.
 
 ## C FFI
 
@@ -128,7 +128,7 @@ blar list archive.blar
 # Extract all files, restoring directory structure + permissions
 blar extract archive.blar -C output_dir/
 
-# Verify integrity (outer + per-file xxHash64 + Merkle hashes)
+# Verify integrity (BLAKE3-128 outer + per-file hashes + Merkle hashes)
 blar verify archive.blar
 
 # Show metadata (file count, directory count, sizes)
@@ -192,11 +192,11 @@ blar peek archive.blar "[1][0]" --type          # FILE (shorthand for .type)
 **Output flags:**
 
 - `--raw` — Output raw payload bytes. When stdout is a terminal, data is automatically piped through printable-binary encoding for safety, with a warning on stderr. When piped to a file or another command, raw bytes are emitted directly.
-- `--hex` — Output payload bytes as `0x`-prefixed hex string. For leaf containers (UTF8, RAW, DATA), shows the payload hex. For aggregate containers (ARRAY, DICT, FILE, DIR), shows the container's xxHash64 as hex.
+- `--hex` — Output payload bytes as `0x`-prefixed hex string. For leaf containers (UTF8, DATA), shows the payload hex. For aggregate containers (ARRAY, DICT, FILE, DIR), shows the container's checksum as hex.
 - `--json` — JSON output. Strings use printable-binary identity check: if the value contains only printable bytes it appears as-is; if it contains non-printable bytes, it is encoded via printable-binary and a warning is emitted on stderr.
 - `--type` — Shorthand for the `.type` accessor.
 
-Archive structure: `ARRAY[RAW magic, ARRAY[FILE[DICT{metadata}, DATA{content}], ...]]`. So `[0]` is the magic, `[1]` is the body array, `[1][0]` is the first file entry, `[1][0][0]` is its metadata dict, and `[1][0][1]` is its content. Known metadata keys (md, mt, ct, bt, ui, gi, xh) get semantic display (octal, ISO 8601, decimal, hex).
+Archive structure: `ARRAY[DATA(magic), ARRAY[FILE[DICT{metadata}, DATA{content}], ...]]`. So `[0]` is the magic, `[1]` is the body array, `[1][0]` is the first file entry, `[1][0][0]` is its metadata dict, and `[1][0][1]` is its content. Known metadata keys (md, mt, ct, bt, ui, gi, xh) get semantic display (octal, ISO 8601, decimal, hex).
 
 `miniblar peek` works identically.
 
@@ -241,8 +241,8 @@ FILE
 $ blar peek archive.blar "[1][0][0].keys"
 bt ct gi gn md mt pa ui un
 
-# What is the stored xxHash64 of the file content?
-$ blar peek archive.blar "[1][0][1].hash"
+# What is the stored checksum of the archive?
+$ blar peek archive.blar ".hash"
 a1b2c3d4e5f6a7b8
 
 # Timestamps are displayed as ISO 8601 with nanosecond precision
@@ -262,7 +262,7 @@ $ blar peek archive.blar "[1][0][1]" --hex
 0x68656c6c6f20776f726c640a
 ```
 
-This isn't just a debugging tool — it's a **verification tool**. You can extract the stored hash of any container and independently verify it against `xxhsum`. You can inspect metadata without extracting. You can trace the Merkle hash tree of a directory archive from leaf to root. No other archive format gives you this level of structural transparency.
+This isn't just a debugging tool — it's a **verification tool**. You can extract the stored checksum of any container and independently verify it. You can inspect metadata without extracting. You can trace the Merkle hash tree of a directory archive from leaf to root. No other archive format gives you this level of structural transparency.
 
 **`poke` — the write counterpart to peek.** Same path syntax, but *sets* values. C64 PEEK/POKE for binary archives — read any value, write any value, with automatic hash recomputation across the entire archive. See [Modifying archives](#modifying-archives-poke) above.
 
@@ -309,21 +309,21 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 | | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |
 |---|---|---|
 | **Determinism** | Byte-identical output guaranteed by spec (canonical key ordering, canonical BLIP encoding, caller-controlled entry order) | Format-dependent — GNU, BSD, and POSIX tar produce different bytes from the same inputs; header fields vary by implementation |
-| **Integrity** | Built-in xxHash64 on every array and dictionary container; Merkle hash trees for directories propagate changes from any leaf to the root | None built-in; users layer external checksums (`sha256sum`) or signatures after the fact |
+| **Integrity** | Built-in BLAKE3-128 on the outer archive with xxHash64 on inner containers; Merkle hash trees for directories propagate changes from any leaf to the root | None built-in; users layer external checksums (`sha256sum`) or signatures after the fact |
 | **Random access** | O(1) via index tables at the end of each container; jump directly to element K without scanning | Sequential scan only — must read every 512-byte header from the beginning to find a file |
 | **Per-file overhead** | ~165 bytes (metadata DICT + DATA container + ARRAY index + dual hashes) | 512-byte header + content padded to 512-byte boundary; minimum 1024 bytes per file regardless of content size |
 | **Metadata** | Extensible key-value pairs — any key name, any container type as value; applications define what they need | Fixed set defined by the header format (mtime, uid, gid, mode, size, linkname, uname, gname); pax extended headers add flexibility but are complex |
-| **Typed values** | First-class types: UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR | Everything is byte ranges within fixed-width header fields; no type system |
+| **Typed values** | First-class types: UTF8, DATA, ARRAY, DICT, MAP, FILE, DIR | Everything is byte ranges within fixed-width header fields; no type system |
 | **Nesting** | Recursive — containers nest arbitrarily (ARRAY of DICTs of ARRAYs...) | Flat — one level of file entries; no structured nesting |
 | **Path encoding** | UTF-8 only, normalized (no leading `/`, forward slashes, no `.`/`..`) | ASCII (POSIX) or UTF-8 (pax); leading `/` handling varies by implementation; `..` components are a known security risk |
-| **Streaming** | Supported via padded BLIPs with backfill; streaming reads ignore the index and process TLVs sequentially | Native strength — append headers + data sequentially, finalize with two zero blocks |
+| **Streaming** | Supported via padded BLIPs with backfill; streaming reads ignore the index and process containers sequentially | Native strength — append headers + data sequentially, finalize with two zero blocks |
 | **Ecosystem** | New — requires a BLIP-aware tool | Universal — every Unix system has tar; decades of tooling, documentation, and interoperability |
 | **Specification** | Single spec, one canonical encoding | Multiple incompatible specs (v7, ustar, pax, GNU, BSD); real-world archives mix formats |
 | **Empty directories** | Explicit DIR container type with its own metadata and Merkle hash | Representable but inconsistently handled across implementations |
 
 **Where tar wins:** Ubiquity. tar is everywhere, understood by every tool, and has decades of battle-tested interoperability. If you need an archive that any system can unpack without installing anything, tar is the right choice.
 
-**Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in dual-level integrity verification (content-only DATA hash + whole-file ARRAY hash) catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. And ~3x lower per-file overhead matters when archiving many small files.
+**Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in BLAKE3-128 integrity verification catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. Built-in LZMA2 compression via the LP attribute system keeps archives compact. And ~3x lower per-file overhead matters when archiving many small files.
 
 ## miniblar: Minimal BLIP Archive Tool
 

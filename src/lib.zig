@@ -426,7 +426,7 @@ fn readMetadataFromDict(
     // Try to read md (mode)
     if (try dict_reader.findKey("md")) |md_idx| {
         const md_container = try dict_reader.valueAt(md_idx);
-        const md_val = try leaf.readRaw(md_container);
+        const md_val = try leaf.readData(md_container);
         if (md_val.len >= 2) {
             out_mode.* = std.mem.readInt(u16, md_val[0..2], .little);
         }
@@ -435,7 +435,7 @@ fn readMetadataFromDict(
     // Try to read mt (mtime)
     if (try dict_reader.findKey("mt")) |mt_idx| {
         const mt_container = try dict_reader.valueAt(mt_idx);
-        const mt_val = try leaf.readRaw(mt_container);
+        const mt_val = try leaf.readData(mt_container);
         if (mt_val.len >= 8) {
             out_mtime_ns.* = std.mem.readInt(i64, mt_val[0..8], .little);
         }
