@@ -12,6 +12,8 @@ pub const ChecksumId = ct.ChecksumId;
 pub const checksumLength = ct.checksumLength;
 pub const attrSentinel = ct.attrSentinel;
 pub const parseAttrSigil = ct.parseAttrSigil;
+pub const EncryptionId = ct.EncryptionId;
+pub const KdfId = ct.KdfId;
 
 pub const ContainerError = error{
     InvalidContainerType,
@@ -45,6 +47,10 @@ pub const LPOptions = struct {
     comp_id: ?CompressionId = null,
     decomp_len: ?u64 = null,
     csum_id: ?ChecksumId = null,
+    enc_id: ?ct.EncryptionId = null,
+    kdf_id: ?ct.KdfId = null,
+    enc_salt: ?[ct.ENC_SALT_LEN]u8 = null,
+    enc_nonce: ?[12]u8 = null,
 };
 
 /// Parsed view of an LP container.
@@ -54,6 +60,10 @@ pub const LPContainerView = struct {
     comp_id: ?CompressionId,
     decomp_len: ?u64,
     csum_id: ?ChecksumId,
+    enc_id: ?ct.EncryptionId,
+    kdf_id: ?ct.KdfId,
+    enc_salt: ?[ct.ENC_SALT_LEN]u8,
+    enc_nonce: ?[12]u8,
     /// Byte offset from container start to first byte after VAL sentinel.
     val_offset: usize,
     /// Total bytes in VAL region (payload + checksum if present).
@@ -102,6 +112,14 @@ pub fn computeLPLength(type_id: ContainerTypeId, val_payload_size: u64, options:
     // CSUM sentinel + BLIP(csum_id) -- optional
     if (options.csum_id) |csum_id| {
         attr_overhead += 2 + blip.encodedSize(@intFromEnum(csum_id));
+    }
+
+    // ENC sentinel + BLIP(enc_id) + BLIP(kdf_id) + salt + nonce -- optional
+    if (options.enc_id) |enc_id| {
+        attr_overhead += 2 + blip.encodedSize(@intFromEnum(enc_id));
+        attr_overhead += blip.encodedSize(@intFromEnum(options.kdf_id orelse .argon2id));
+        attr_overhead += ct.ENC_SALT_LEN; // salt
+        attr_overhead += ct.encNonceLength(enc_id); // nonce
     }
 
     // VAL sentinel (0x81 0x7F) -- always present
@@ -175,7 +193,30 @@ pub fn writeLPHeader(buf: []u8, type_id: ContainerTypeId, total_length: u64, opt
         pos += csum_bytes;
     }
 
-    // 6. VAL sentinel
+    // 6. ENC sentinel + BLIP(enc_id) + BLIP(kdf_id) + salt + nonce -- optional
+    if (options.enc_id) |enc_id| {
+        const enc_sentinel = ct.attrSentinel(.enc);
+        if (pos + 2 > buf.len) return ContainerError.BufferTooSmall;
+        buf[pos] = enc_sentinel[0];
+        buf[pos + 1] = enc_sentinel[1];
+        pos += 2;
+        const enc_bytes = blip.encode(@intFromEnum(enc_id), buf[pos..]) catch return ContainerError.BufferTooSmall;
+        pos += enc_bytes;
+        const kdf_id = options.kdf_id orelse .argon2id;
+        const kdf_bytes = blip.encode(@intFromEnum(kdf_id), buf[pos..]) catch return ContainerError.BufferTooSmall;
+        pos += kdf_bytes;
+        // Write salt
+        const salt = options.enc_salt orelse @as([ct.ENC_SALT_LEN]u8, @splat(0));
+        @memcpy(buf[pos..][0..ct.ENC_SALT_LEN], &salt);
+        pos += ct.ENC_SALT_LEN;
+        // Write nonce
+        const nonce_len = ct.encNonceLength(enc_id);
+        const nonce = options.enc_nonce orelse @as([12]u8, @splat(0));
+        @memcpy(buf[pos..][0..nonce_len], nonce[0..nonce_len]);
+        pos += nonce_len;
+    }
+
+    // 7. VAL sentinel
     const val_sentinel = ct.attrSentinel(.val);
     if (pos + 2 > buf.len) return ContainerError.BufferTooSmall;
     buf[pos] = val_sentinel[0];
@@ -230,6 +271,10 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
     var comp_id: ?CompressionId = null;
     var decomp_len: ?u64 = null;
     var csum_id: ?ChecksumId = null;
+    var enc_id: ?ct.EncryptionId = null;
+    var kdf_id: ?ct.KdfId = null;
+    var enc_salt: ?[ct.ENC_SALT_LEN]u8 = null;
+    var enc_nonce: ?[12]u8 = null;
     var last_sigil_value: u8 = @intFromEnum(AttributeSigil.type_attr);
 
     while (pos + 2 <= container_buf.len) {
@@ -254,6 +299,10 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                 .comp_id = comp_id,
                 .decomp_len = decomp_len,
                 .csum_id = csum_id,
+                .enc_id = enc_id,
+                .kdf_id = kdf_id,
+                .enc_salt = enc_salt,
+                .enc_nonce = enc_nonce,
                 .val_offset = val_offset,
                 .val_size = val_size,
                 .buf = container_buf,
@@ -295,8 +344,40 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                 pos += csum_result.bytes_read;
             },
             .enc => {
-                // Future: parse encryption attribute. For now, return error.
-                return error.MissingSigil;
+                // BLIP(enc_id)
+                const enc_result = blip.decode(container_buf[pos..]) catch |e| switch (e) {
+                    error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
+                    error.Overflow => return ContainerError.Overflow,
+                    error.BufferTooSmall => return ContainerError.BufferTooSmall,
+                };
+                enc_id = std.meta.intToEnum(ct.EncryptionId, @as(u7, @truncate(enc_result.value))) catch
+                    return ContainerError.InvalidContainerType;
+                pos += enc_result.bytes_read;
+
+                // BLIP(kdf_id)
+                const kdf_result = blip.decode(container_buf[pos..]) catch |e| switch (e) {
+                    error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
+                    error.Overflow => return ContainerError.Overflow,
+                    error.BufferTooSmall => return ContainerError.BufferTooSmall,
+                };
+                kdf_id = std.meta.intToEnum(ct.KdfId, @as(u7, @truncate(kdf_result.value))) catch
+                    return ContainerError.InvalidContainerType;
+                pos += kdf_result.bytes_read;
+
+                // 16-byte salt
+                if (pos + ct.ENC_SALT_LEN > container_buf.len) return ContainerError.UnexpectedEndOfInput;
+                var salt_buf: [ct.ENC_SALT_LEN]u8 = undefined;
+                @memcpy(&salt_buf, container_buf[pos..][0..ct.ENC_SALT_LEN]);
+                enc_salt = salt_buf;
+                pos += ct.ENC_SALT_LEN;
+
+                // nonce (length depends on enc_id)
+                const nonce_len = ct.encNonceLength(enc_id.?);
+                if (pos + nonce_len > container_buf.len) return ContainerError.UnexpectedEndOfInput;
+                var nonce_buf: [12]u8 = .{0} ** 12;
+                @memcpy(nonce_buf[0..nonce_len], container_buf[pos..][0..nonce_len]);
+                enc_nonce = nonce_buf;
+                pos += nonce_len;
             },
             .sig => {
                 // Future: skip sig bytes. For now, we don't know the length
@@ -630,6 +711,107 @@ test "writeLPHeader returns correct offset for all container types" {
         try testing.expectEqual(type_id, view.type_id);
         try testing.expectEqual(header_size, view.val_offset);
     }
+}
+
+test "LP container with ENC attribute round-trips" {
+    const allocator = testing.allocator;
+    const payload = "secret data";
+
+    var salt: [16]u8 = undefined;
+    @memset(&salt, 0xAA);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0xBB);
+
+    const opts = LPOptions{
+        .enc_id = .aes_256_gcm,
+        .kdf_id = .argon2id,
+        .enc_salt = salt,
+        .enc_nonce = nonce,
+    };
+    const total = computeLPLength(.data, payload.len, opts);
+    const buf = try allocator.alloc(u8, @intCast(total));
+    defer allocator.free(buf);
+
+    const header_len = try writeLPHeader(buf, .data, total, opts);
+    @memcpy(buf[header_len..][0..payload.len], payload);
+
+    const view = try parseLPHeader(buf);
+    try testing.expectEqual(@as(?ct.EncryptionId, .aes_256_gcm), view.enc_id);
+    try testing.expectEqual(@as(?ct.KdfId, .argon2id), view.kdf_id);
+    try testing.expectEqualSlices(u8, &salt, &view.enc_salt.?);
+    try testing.expectEqualSlices(u8, &nonce, &view.enc_nonce.?);
+    try testing.expectEqualSlices(u8, payload, view.payloadSlice());
+}
+
+test "ENC attribute overhead is correct" {
+    var salt: [16]u8 = undefined;
+    @memset(&salt, 0);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0);
+
+    const with_enc = computeLPLength(.data, 10, .{
+        .enc_id = .aes_256_gcm,
+        .kdf_id = .argon2id,
+        .enc_salt = salt,
+        .enc_nonce = nonce,
+    });
+    const without_enc = computeLPLength(.data, 10, .{});
+    // Difference should be 32 bytes (2 sentinel + 1 enc_id + 1 kdf_id + 16 salt + 12 nonce)
+    try testing.expectEqual(@as(u64, 32), with_enc - without_enc);
+}
+
+test "LP container with ENC + CSUM round-trips" {
+    const allocator = testing.allocator;
+    const payload = "encrypted with checksum";
+
+    var salt: [16]u8 = undefined;
+    @memset(&salt, 0xCC);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0xDD);
+
+    const opts = LPOptions{
+        .csum_id = .blake3_128,
+        .enc_id = .chacha20_poly1305,
+        .kdf_id = .pbkdf2_sha256,
+        .enc_salt = salt,
+        .enc_nonce = nonce,
+    };
+    const total = computeLPLength(.data, payload.len, opts);
+    const buf = try allocator.alloc(u8, @intCast(total));
+    defer allocator.free(buf);
+
+    const header_len = try writeLPHeader(buf, .data, total, opts);
+    @memcpy(buf[header_len..][0..payload.len], payload);
+
+    // Write checksum
+    const csum_len = ct.checksumLength(.blake3_128);
+    const csum_offset = @as(usize, @intCast(total)) - csum_len;
+    const hash = checksum.compute(.blake3_128, buf[0..csum_offset]);
+    @memcpy(buf[csum_offset..@intCast(total)], hash[0..csum_len]);
+
+    const view = try parseLPHeader(buf);
+    try testing.expectEqual(@as(?ChecksumId, .blake3_128), view.csum_id);
+    try testing.expectEqual(@as(?ct.EncryptionId, .chacha20_poly1305), view.enc_id);
+    try testing.expectEqual(@as(?ct.KdfId, .pbkdf2_sha256), view.kdf_id);
+    try testing.expectEqualSlices(u8, &salt, &view.enc_salt.?);
+    try testing.expectEqualSlices(u8, &nonce, &view.enc_nonce.?);
+    try testing.expectEqualSlices(u8, payload, view.payloadSlice());
+    try testing.expect(checksum.verify(.blake3_128, buf[0..csum_offset], view.checksumSlice()));
+}
+
+test "existing containers without ENC still parse (enc fields null)" {
+    var buf: [128]u8 = undefined;
+    const payload = "no encryption";
+    const total = computeLPLength(.utf8, payload.len, .{});
+    const header_size = try writeLPHeader(&buf, .utf8, total, .{});
+    @memcpy(buf[header_size .. header_size + payload.len], payload);
+
+    const view = try parseLPHeader(&buf);
+    try testing.expectEqual(@as(?ct.EncryptionId, null), view.enc_id);
+    try testing.expectEqual(@as(?ct.KdfId, null), view.kdf_id);
+    try testing.expectEqual(@as(?[ct.ENC_SALT_LEN]u8, null), view.enc_salt);
+    try testing.expectEqual(@as(?[12]u8, null), view.enc_nonce);
+    try testing.expectEqualSlices(u8, payload, view.payloadSlice());
 }
 
 test {
