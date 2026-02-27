@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const blip = @import("blip.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const array_mod = @import("array.zig");
@@ -11,8 +10,7 @@ const pb = @import("printable_binary");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
-const ContainerType = ct.ContainerType;
-const XxHash64 = std.hash.XxHash64;
+const ContainerTypeId = ct.ContainerTypeId;
 
 // =============================================================================
 // Path parsing types
@@ -131,12 +129,12 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
     var current = buf;
 
     for (segments) |seg| {
-        const view = try container.parseHeader(current);
+        const view = try container.parseLPHeader(current);
 
         switch (seg) {
             .index => |idx| {
                 // For ARRAY/FILE containers, use ArrayReader
-                switch (view.container_type) {
+                switch (view.type_id) {
                     .array, .file => {
                         const reader = try array_mod.ArrayReader.init(current[0..@intCast(view.total_length)]);
                         const elem_view = try reader.elementAt(idx);
@@ -152,24 +150,24 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
                         const dict_reader = try dict_mod.DictReader.init(current[0..@intCast(view.total_length)]);
                         const val_container = try dict_reader.valueAt(idx);
                         const val_offset = @intFromPtr(val_container.ptr) - @intFromPtr(current.ptr);
-                        const val_view = try container.parseHeader(val_container);
+                        const val_view = try container.parseLPHeader(val_container);
                         current = current[val_offset..][0..@intCast(val_view.total_length)];
                     },
-                    else => return ContainerError.InvalidContainerType,
+                    .utf8, .data => return ContainerError.InvalidContainerType,
                 }
             },
             .key => |key_bytes| {
                 // For DICT/MAP/DIR containers, use DictReader to find by key
-                switch (view.container_type) {
+                switch (view.type_id) {
                     .dict, .map, .dir => {
                         const dict_reader = try dict_mod.DictReader.init(current[0..@intCast(view.total_length)]);
                         const pair_idx = (try dict_reader.findKey(key_bytes)) orelse return ContainerError.IndexOutOfBounds;
                         const val_container = try dict_reader.valueAt(pair_idx);
                         const val_offset = @intFromPtr(val_container.ptr) - @intFromPtr(current.ptr);
-                        const val_view = try container.parseHeader(val_container);
+                        const val_view = try container.parseLPHeader(val_container);
                         current = current[val_offset..][0..@intCast(val_view.total_length)];
                     },
-                    else => return ContainerError.InvalidContainerType,
+                    .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
                 }
             },
         }
@@ -186,8 +184,8 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
 /// For ARRAY/FILE: returns element count.
 /// For DICT/MAP/DIR: returns pair count.
 pub fn containerCount(buf: []const u8) ContainerError!u64 {
-    const view = try container.parseHeader(buf);
-    switch (view.container_type) {
+    const view = try container.parseLPHeader(buf);
+    switch (view.type_id) {
         .array, .file => {
             const reader = try array_mod.ArrayReader.init(buf[0..@intCast(view.total_length)]);
             return reader.elementCount();
@@ -196,74 +194,60 @@ pub fn containerCount(buf: []const u8) ContainerError!u64 {
             const reader = try dict_mod.DictReader.init(buf[0..@intCast(view.total_length)]);
             return reader.pairCount();
         },
-        else => return ContainerError.InvalidContainerType,
+        .utf8, .data => return ContainerError.InvalidContainerType,
     }
 }
 
-/// Read the trailing xxHash64 from a container.
-/// Works for ARRAY, DICT, MAP, FILE, DIR (all have trailing 8-byte hash).
-/// For DATA, reads the embedded hash after the content bytes.
+/// Read the checksum from a container (v2 LP format).
+/// Returns the first 8 bytes of whatever checksum is present.
+/// Returns error if the container has no checksum attribute.
 pub fn containerHash(buf: []const u8) ContainerError![8]u8 {
-    const view = try container.parseHeader(buf);
-    const total: usize = @intCast(view.total_length);
-    if (total < 8) return ContainerError.InvalidLength;
-
-    switch (view.container_type) {
-        .array, .file, .dict, .map, .dir => {
-            // Hash is the last 8 bytes of the container
-            var hash: [8]u8 = undefined;
-            @memcpy(&hash, buf[total - 8 .. total]);
-            return hash;
-        },
-        .data => {
-            // DATA hash is also the last 8 bytes of the value payload
-            var hash: [8]u8 = undefined;
-            @memcpy(&hash, buf[total - 8 .. total]);
-            return hash;
-        },
-        else => return ContainerError.InvalidContainerType,
-    }
+    const view = try container.parseLPHeader(buf);
+    const csum_slice = view.checksumSlice();
+    var hash: [8]u8 = .{0} ** 8;
+    if (csum_slice.len == 0) return ContainerError.InvalidLength;
+    const copy_len = @min(csum_slice.len, 8);
+    @memcpy(hash[0..copy_len], csum_slice[0..copy_len]);
+    return hash;
 }
 
 /// Get the key payload bytes at a given pair index from a DICT/MAP/DIR container.
 /// Returns the raw key bytes (stripped of TLV header).
 pub fn containerKeyAt(buf: []const u8, index: u64) ContainerError![]const u8 {
-    const view = try container.parseHeader(buf);
-    switch (view.container_type) {
+    const view = try container.parseLPHeader(buf);
+    switch (view.type_id) {
         .dict, .map, .dir => {
             const reader = try dict_mod.DictReader.init(buf[0..@intCast(view.total_length)]);
             const key_container = try reader.keyAt(index);
             return dict_mod.extractKeyBytes(key_container);
         },
-        else => return ContainerError.InvalidContainerType,
+        .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
     }
 }
 
 /// Get pair count from a DICT/MAP/DIR container.
 pub fn containerKeyCount(buf: []const u8) ContainerError!u64 {
-    const view = try container.parseHeader(buf);
-    switch (view.container_type) {
+    const view = try container.parseLPHeader(buf);
+    switch (view.type_id) {
         .dict, .map, .dir => {
             const reader = try dict_mod.DictReader.init(buf[0..@intCast(view.total_length)]);
             return reader.pairCount();
         },
-        else => return ContainerError.InvalidContainerType,
+        .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
     }
 }
 
 /// Get the container type name as a string.
 pub fn containerTypeName(buf: []const u8) ContainerError![]const u8 {
-    const view = try container.parseHeader(buf);
-    return switch (view.container_type) {
+    const view = try container.parseLPHeader(buf);
+    return switch (view.type_id) {
         .array => "ARRAY",
         .dict => "DICT",
         .utf8 => "UTF8",
-        .raw => "RAW",
+        .data => "DATA",
         .file => "FILE",
         .map => "MAP",
         .dir => "DIR",
-        .data => "DATA",
-        .lzma2 => "LZMA2",
     };
 }
 
@@ -291,19 +275,13 @@ pub const PeekResult = struct {
     }
 };
 
-/// Extract the payload bytes from a leaf/data container.
-/// For UTF8/RAW: returns value bytes (after TLV header).
-/// For DATA: returns value bytes minus trailing 8-byte hash.
+/// Extract the payload bytes from a leaf container (UTF8 or DATA).
+/// In v2 LP format, payloadSlice() already excludes checksum bytes.
 pub fn extractPayload(buf: []const u8) ContainerError![]const u8 {
-    const view = try container.parseHeader(buf);
-    switch (view.container_type) {
-        .utf8, .raw => return view.valueSlice(),
-        .data => {
-            const value = view.valueSlice();
-            if (value.len < 8) return ContainerError.InvalidLength;
-            return value[0 .. value.len - 8];
-        },
-        else => return ContainerError.InvalidContainerType,
+    const view = try container.parseLPHeader(buf);
+    switch (view.type_id) {
+        .utf8, .data => return view.payloadSlice(),
+        .array, .dict, .file, .map, .dir => return ContainerError.InvalidContainerType,
     }
 }
 
@@ -406,14 +384,14 @@ pub fn pbIdentityCheck(allocator: Allocator, bytes: []const u8) !PbCheckResult {
 pub fn formatKnownKey(
     allocator: Allocator,
     key: []const u8,
-    container_type: ContainerType,
+    type_id: ContainerTypeId,
     payload: []const u8,
     json_mode: bool,
 ) Allocator.Error!?[]u8 {
     if (key.len != 2) return null;
 
     // md: mode (u16 LE) → octal
-    if (std.mem.eql(u8, key, "md") and container_type == .raw and payload.len == 2) {
+    if (std.mem.eql(u8, key, "md") and type_id == .data and payload.len == 2) {
         const m = std.mem.readInt(u16, payload[0..2], .little);
         if (json_mode) {
             return try std.fmt.allocPrint(allocator, "{d}", .{m});
@@ -423,7 +401,7 @@ pub fn formatKnownKey(
     }
 
     // mt, ct, bt: timestamps (i64 LE nanoseconds) → ISO 8601
-    if (container_type == .raw and payload.len == 8 and
+    if (type_id == .data and payload.len == 8 and
         (std.mem.eql(u8, key, "mt") or std.mem.eql(u8, key, "ct") or std.mem.eql(u8, key, "bt")))
     {
         const ns = std.mem.readInt(i64, payload[0..8], .little);
@@ -435,7 +413,7 @@ pub fn formatKnownKey(
     }
 
     // ui, gi: IDs (u32 LE) → decimal
-    if (container_type == .raw and payload.len == 4 and
+    if (type_id == .data and payload.len == 4 and
         (std.mem.eql(u8, key, "ui") or std.mem.eql(u8, key, "gi")))
     {
         const id = std.mem.readInt(u32, payload[0..4], .little);
@@ -443,12 +421,12 @@ pub fn formatKnownKey(
     }
 
     // xh: hash (8 bytes) → hex
-    if (std.mem.eql(u8, key, "xh") and container_type == .raw and payload.len == 8) {
+    if (std.mem.eql(u8, key, "xh") and type_id == .data and payload.len == 8) {
         return try formatHex(allocator, payload);
     }
 
     // pa, un, gn: UTF8 strings
-    if (container_type == .utf8 and
+    if (type_id == .utf8 and
         (std.mem.eql(u8, key, "pa") or std.mem.eql(u8, key, "un") or std.mem.eql(u8, key, "gn")))
     {
         if (json_mode) {
@@ -509,8 +487,8 @@ pub fn peekDisplay(
     };
 
     // Get container info
-    const view = try container.parseHeader(target);
-    const ctype = view.container_type;
+    const view = try container.parseLPHeader(target);
+    const ctype = view.type_id;
 
     // Dispatch on accessor
     switch (parsed.accessor) {
@@ -587,13 +565,13 @@ pub fn peekDisplay(
 fn handleRawMode(
     allocator: Allocator,
     target: []const u8,
-    ctype: ContainerType,
+    ctype: ContainerTypeId,
     flags: PeekFlags,
     stdout_list: *std.ArrayListUnmanaged(u8),
     stderr_list: *std.ArrayListUnmanaged(u8),
 ) !void {
     switch (ctype) {
-        .utf8, .raw, .data => {
+        .utf8, .data => {
             const payload = try extractPayload(target);
             if (flags.is_tty) {
                 // Pipe through printable-binary for terminal safety
@@ -605,7 +583,7 @@ fn handleRawMode(
                 try stdout_list.appendSlice(allocator, payload);
             }
         },
-        else => {
+        .array, .file, .dict, .map, .dir => {
             // Container type: output raw container bytes
             try stdout_list.appendSlice(allocator, target);
         },
@@ -615,11 +593,11 @@ fn handleRawMode(
 fn handleHexMode(
     allocator: Allocator,
     target: []const u8,
-    ctype: ContainerType,
+    ctype: ContainerTypeId,
     stdout_list: *std.ArrayListUnmanaged(u8),
 ) !void {
     switch (ctype) {
-        .utf8, .raw, .data => {
+        .utf8, .data => {
             const payload = try extractPayload(target);
             const hex = try formatHex(allocator, payload);
             defer allocator.free(hex);
@@ -627,8 +605,8 @@ fn handleHexMode(
             try stdout_list.appendSlice(allocator, hex);
             try stdout_list.appendSlice(allocator, "\n");
         },
-        else => {
-            // For containers, hex-dump the hash
+        .array, .file, .dict, .map, .dir => {
+            // For containers, hex-dump the checksum (first 8 bytes)
             const hash = containerHash(target) catch {
                 try stdout_list.appendSlice(allocator, "0x\n");
                 return;
@@ -645,7 +623,7 @@ fn handleHexMode(
 fn handleDefaultMode(
     allocator: Allocator,
     target: []const u8,
-    ctype: ContainerType,
+    ctype: ContainerTypeId,
     path: []const u8,
     flags: PeekFlags,
     stdout_list: *std.ArrayListUnmanaged(u8),
@@ -656,7 +634,7 @@ fn handleDefaultMode(
 
     // Check for semantic display of known metadata keys
     if (lastKeyFromPath(nav_path)) |last_key| {
-        if (ctype == .utf8 or ctype == .raw) {
+        if (ctype == .utf8 or ctype == .data) {
             const payload = extractPayload(target) catch null;
             if (payload) |p| {
                 const formatted = try formatKnownKey(allocator, last_key, ctype, p, flags.json);
@@ -688,23 +666,6 @@ fn handleDefaultMode(
                 try stdout_list.appendSlice(allocator, "\"\n");
             } else {
                 try stdout_list.appendSlice(allocator, payload);
-                try stdout_list.appendSlice(allocator, "\n");
-            }
-        },
-        .raw => {
-            const payload = try extractPayload(target);
-            if (flags.json) {
-                // JSON: hex-encode raw bytes
-                const hex = try formatHex(allocator, payload);
-                defer allocator.free(hex);
-                try stdout_list.appendSlice(allocator, "\"");
-                try stdout_list.appendSlice(allocator, hex);
-                try stdout_list.appendSlice(allocator, "\"\n");
-            } else {
-                // Default: printable-binary encode
-                const encoded = try pb.encode(allocator, payload, .{});
-                defer allocator.free(encoded);
-                try stdout_list.appendSlice(allocator, encoded);
                 try stdout_list.appendSlice(allocator, "\n");
             }
         },
@@ -750,22 +711,6 @@ fn handleDefaultMode(
                 try stdout_list.appendSlice(allocator, s);
             } else {
                 const s = try std.fmt.allocPrint(allocator, "{s} ({d} pairs)\n", .{ name, count });
-                defer allocator.free(s);
-                try stdout_list.appendSlice(allocator, s);
-            }
-        },
-        .lzma2 => {
-            const lzma2_mod = @import("lzma2.zig");
-            const reader = lzma2_mod.Lzma2Reader.init(target) catch {
-                try stdout_list.appendSlice(allocator, "LZMA2 (invalid)\n");
-                return;
-            };
-            if (flags.json) {
-                const s = try std.fmt.allocPrint(allocator, "{{\"type\":\"LZMA2\",\"compressed_size\":{d},\"uncompressed_size\":{d}}}\n", .{ reader.compressedSize(), reader.uncompressedSize() });
-                defer allocator.free(s);
-                try stdout_list.appendSlice(allocator, s);
-            } else {
-                const s = try std.fmt.allocPrint(allocator, "LZMA2 ({d} -> {d} bytes)\n", .{ reader.compressedSize(), reader.uncompressedSize() });
                 defer allocator.free(s);
                 try stdout_list.appendSlice(allocator, s);
             }
@@ -939,7 +884,7 @@ test "containerCount on DICT -> correct pair count" {
     const allocator = testing.allocator;
     const key = try leaf.serializeUtf8(allocator, "k");
     defer allocator.free(key);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
 
     const pairs = [_]dict_mod.KeyValue{.{ .key = key, .value = val }};
@@ -949,22 +894,22 @@ test "containerCount on DICT -> correct pair count" {
     try testing.expectEqual(@as(u64, 1), try containerCount(dict_buf));
 }
 
-test "containerHash on ARRAY -> matches expected xxHash64" {
+test "containerHash on ARRAY with BLAKE3-128 checksum" {
     const allocator = testing.allocator;
     const elem = try leaf.serializeUtf8(allocator, "test");
     defer allocator.free(elem);
 
     const elements = [_][]const u8{elem};
-    const arr = try array_mod.serializeArray(allocator, &elements);
+    const arr = try array_mod.serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .blake3_128 });
     defer allocator.free(arr);
 
     const hash = try containerHash(arr);
-    // Verify it matches what ArrayReader reports
+    // Verify checksum is valid
     const reader = try array_mod.ArrayReader.init(arr);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
-    // The hash bytes should be the last 8 bytes of the array
-    try testing.expectEqualSlices(u8, arr[arr.len - 8 ..], &hash);
+    // containerHash returns first 8 bytes of the 16-byte BLAKE3-128 checksum
+    try testing.expectEqualSlices(u8, arr[arr.len - 16 ..][0..8], &hash);
 }
 
 test "containerKeyAt on DICT -> returns correct key bytes" {
@@ -973,7 +918,7 @@ test "containerKeyAt on DICT -> returns correct key bytes" {
     defer allocator.free(key_a);
     const key_b = try leaf.serializeUtf8(allocator, "beta");
     defer allocator.free(key_b);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
 
     const pairs = [_]dict_mod.KeyValue{
@@ -995,10 +940,10 @@ test "containerTypeName returns correct names" {
     defer allocator.free(utf8);
     try testing.expectEqualSlices(u8, "UTF8", try containerTypeName(utf8));
 
-    // RAW
-    const raw = try leaf.serializeRaw(allocator, "data");
-    defer allocator.free(raw);
-    try testing.expectEqualSlices(u8, "RAW", try containerTypeName(raw));
+    // DATA
+    const data = try leaf.serializeData(allocator, "data");
+    defer allocator.free(data);
+    try testing.expectEqualSlices(u8, "DATA", try containerTypeName(data));
 
     // ARRAY
     const elements = [_][]const u8{utf8};
@@ -1009,7 +954,7 @@ test "containerTypeName returns correct names" {
     // DICT
     const key = try leaf.serializeUtf8(allocator, "k");
     defer allocator.free(key);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
     const pairs = [_]dict_mod.KeyValue{.{ .key = key, .value = val }};
     const dict_buf = try dict_mod.serializeDict(allocator, &pairs);
@@ -1023,7 +968,7 @@ test "containerKeyCount on DICT -> correct pair count" {
     defer allocator.free(key_a);
     const key_b = try leaf.serializeUtf8(allocator, "bb");
     defer allocator.free(key_b);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
 
     const pairs = [_]dict_mod.KeyValue{
@@ -1080,16 +1025,25 @@ test "navigate: FILE container (ARRAY layout) traversal" {
     try testing.expectEqual(@as(u64, 2), try containerCount(file_container));
 }
 
-test "containerHash on DATA -> returns embedded hash" {
+test "containerHash on DATA with xxHash64 checksum" {
     const allocator = testing.allocator;
-    const data_container = try data_mod.serializeData(allocator, "test content");
+    const data_container = try leaf.serializeDataWithOptions(allocator, "test content", .{ .csum_id = .xxhash64 });
     defer allocator.free(data_container);
 
     const hash = try containerHash(data_container);
-    // Verify it's the same as the last 8 bytes
+    // xxHash64 checksum is 8 bytes, so containerHash returns all 8 bytes
     try testing.expectEqualSlices(u8, data_container[data_container.len - 8 ..], &hash);
-    // And that the DATA hash verifies
-    try testing.expect(try data_mod.verifyDataHash(data_container));
+    // And that the checksum verifies
+    try testing.expect(try leaf.verifyLeafChecksum(data_container));
+}
+
+test "containerHash on container without checksum returns error" {
+    const allocator = testing.allocator;
+    // serializeData without options has no checksum
+    const data_container = try data_mod.serializeData(allocator, "test content");
+    defer allocator.free(data_container);
+
+    try testing.expectError(ContainerError.InvalidLength, containerHash(data_container));
 }
 
 // =============================================================================
@@ -1187,7 +1141,7 @@ test "formatKnownKey: md as octal" {
     const allocator = testing.allocator;
     var mode_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &mode_bytes, 0o755, .little);
-    const result = (try formatKnownKey(allocator, "md", .raw, &mode_bytes, false)).?;
+    const result = (try formatKnownKey(allocator, "md", .data, &mode_bytes, false)).?;
     defer allocator.free(result);
     try testing.expectEqualSlices(u8, "0755", result);
 }
@@ -1196,7 +1150,7 @@ test "formatKnownKey: md as json decimal" {
     const allocator = testing.allocator;
     var mode_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &mode_bytes, 0o644, .little);
-    const result = (try formatKnownKey(allocator, "md", .raw, &mode_bytes, true)).?;
+    const result = (try formatKnownKey(allocator, "md", .data, &mode_bytes, true)).?;
     defer allocator.free(result);
     try testing.expectEqualSlices(u8, "420", result);
 }
@@ -1205,14 +1159,14 @@ test "formatKnownKey: ui as decimal" {
     const allocator = testing.allocator;
     var uid_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &uid_bytes, 501, .little);
-    const result = (try formatKnownKey(allocator, "ui", .raw, &uid_bytes, false)).?;
+    const result = (try formatKnownKey(allocator, "ui", .data, &uid_bytes, false)).?;
     defer allocator.free(result);
     try testing.expectEqualSlices(u8, "501", result);
 }
 
 test "formatKnownKey: unknown key returns null" {
     const allocator = testing.allocator;
-    const result = try formatKnownKey(allocator, "zz", .raw, "test", false);
+    const result = try formatKnownKey(allocator, "zz", .data, "test", false);
     try testing.expectEqual(@as(?[]u8, null), result);
 }
 
@@ -1245,17 +1199,17 @@ test "peekDisplay: .count accessor on ARRAY" {
     try testing.expectEqualSlices(u8, "2\n", result.stdout_buf);
 }
 
-test "peekDisplay: .hash accessor on ARRAY" {
+test "peekDisplay: .hash accessor on ARRAY with checksum" {
     const allocator = testing.allocator;
     const elem = try leaf.serializeUtf8(allocator, "test");
     defer allocator.free(elem);
     const elements = [_][]const u8{elem};
-    const arr = try array_mod.serializeArray(allocator, &elements);
+    const arr = try array_mod.serializeArrayWithOptions(allocator, &elements, .{ .csum_id = .blake3_128 });
     defer allocator.free(arr);
 
     var result = try peekDisplay(allocator, arr, ".hash", .{});
     defer result.deinit();
-    // Should be 16 hex chars + newline
+    // containerHash returns 8 bytes -> 16 hex chars + newline
     try testing.expectEqual(@as(usize, 17), result.stdout_buf.len);
     try testing.expectEqual(@as(u8, '\n'), result.stdout_buf[16]);
 }
@@ -1266,7 +1220,7 @@ test "peekDisplay: .keys accessor on DICT" {
     defer allocator.free(key_a);
     const key_b = try leaf.serializeUtf8(allocator, "bb");
     defer allocator.free(key_b);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
     const pairs = [_]dict_mod.KeyValue{
         .{ .key = key_a, .value = val },
@@ -1286,7 +1240,7 @@ test "peekDisplay: .keys --json on DICT" {
     defer allocator.free(key_a);
     const key_b = try leaf.serializeUtf8(allocator, "bb");
     defer allocator.free(key_b);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
     const pairs = [_]dict_mod.KeyValue{
         .{ .key = key_a, .value = val },
@@ -1371,7 +1325,7 @@ test "peekDisplay: DICT --json summary" {
     const allocator = testing.allocator;
     const key = try leaf.serializeUtf8(allocator, "k");
     defer allocator.free(key);
-    const val = try leaf.serializeRaw(allocator, "v");
+    const val = try leaf.serializeData(allocator, "v");
     defer allocator.free(val);
     const pairs = [_]dict_mod.KeyValue{.{ .key = key, .value = val }};
     const dict_buf = try dict_mod.serializeDict(allocator, &pairs);
