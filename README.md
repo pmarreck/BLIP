@@ -1,7 +1,7 @@
 # BLIP: Byte Length Integer Prefix
 
 [![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2FBLIP)](https://garnix.io/repo/pmarreck/BLIP)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/pmarreck/BLIP/actions/workflows/ci.yml/badge.svg)](https://github.com/pmarreck/BLIP/actions/workflows/ci.yml)
 
 A variable-length integer encoding optimized for CPU-friendly decoding of small values, with a built-in sentinel channel for format extensibility.
 
