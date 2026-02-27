@@ -284,7 +284,7 @@ static void print_usage(FILE *out) {
         "For flat file-only archives, use 'miniblar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-z] [-o <archive>] <files/dirs...>  Create a BLIP archive\n"
+        "  create [-z] [-e [cipher]] [-o <archive>] <files/dirs...>  Create archive\n"
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
@@ -312,6 +312,8 @@ static void print_usage(FILE *out) {
         "\n"
         "Options:\n"
         "  -z               Compress archive with LZMA2\n"
+        "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
+        "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
@@ -329,6 +331,9 @@ static int cmd_create(int argc, char **argv) {
     int input_start = 0;
     bool absolute_names = g_absolute_names;
     bool compress_lzma2 = false;
+    bool do_encrypt = false;
+    uint8_t enc_id = 1;   /* default: AES-256-GCM */
+    uint8_t kdf_id = 1;   /* default: Argon2id */
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
@@ -347,6 +352,44 @@ static int cmd_create(int argc, char **argv) {
             compress_lzma2 = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
+            i--;
+        } else if (strcmp(argv[i], "-e") == 0) {
+            do_encrypt = true;
+            /* Check for optional cipher argument */
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                const char *cipher = argv[i+1];
+                if (strcmp(cipher, "aes") == 0 || strcmp(cipher, "aes-256-gcm") == 0) {
+                    enc_id = 1;
+                    /* Consume the cipher arg */
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                } else if (strcmp(cipher, "chacha") == 0 || strcmp(cipher, "chacha20") == 0 ||
+                           strcmp(cipher, "chacha20-poly1305") == 0) {
+                    enc_id = 2;
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                }
+                /* else: not a cipher name, don't consume it */
+            }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "--kdf") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: create: --kdf requires an argument\n");
+                return EXIT_USAGE;
+            }
+            const char *kdf_name = argv[i+1];
+            if (strcmp(kdf_name, "argon2") == 0 || strcmp(kdf_name, "argon2id") == 0) {
+                kdf_id = 1;
+            } else if (strcmp(kdf_name, "pbkdf2") == 0 || strcmp(kdf_name, "pbkdf2-sha256") == 0) {
+                kdf_id = 2;
+            } else {
+                fprintf(stderr, "blar: create: unknown KDF '%s' (use 'argon2' or 'pbkdf2')\n", kdf_name);
+                return EXIT_USAGE;
+            }
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -467,6 +510,30 @@ static int cmd_create(int argc, char **argv) {
         }
         archive_buf = compressed_buf;
         archive_len = compressed_len;
+    }
+
+    /* Optionally encrypt (outermost layer — after compression) */
+    if (do_encrypt) {
+        const char *password = get_password();
+        if (!password) {
+            fprintf(stderr, "blar: create: password required for encryption\n");
+            blip_free(archive_buf, archive_len);
+            return EXIT_IO;
+        }
+        uint8_t *encrypted_buf = NULL;
+        size_t encrypted_len = 0;
+        rc = blip_encrypt_container(archive_buf, archive_len,
+                                     password, strlen(password),
+                                     enc_id, kdf_id,
+                                     &encrypted_buf, &encrypted_len);
+        blip_free(archive_buf, archive_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: create: encryption failed: %s\n",
+                    blip_error_string(rc));
+            return EXIT_IO;
+        }
+        archive_buf = encrypted_buf;
+        archive_len = encrypted_len;
     }
 
     if (!write_file(out_path, archive_buf, archive_len)) {

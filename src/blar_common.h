@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <termios.h>
 
 #if defined(__APPLE__)
 #include <sys/time.h>
@@ -97,16 +98,84 @@ static bool write_file(const char *path, const uint8_t *data, size_t len) {
     return true;
 }
 
-/* ── Utility: read archive with transparent decompression ─────────────── */
+/* ── Password helpers ─────────────────────────────────────────────────── */
 
-/* Read an archive file, transparently decompressing if compressed.
+/* Prompt for a password on stderr with echo disabled.
+ * Returns a pointer to a static buffer (overwritten on next call). */
+static const char *prompt_password(const char *prompt) {
+    static char pw_buf[256];
+    fprintf(stderr, "%s", prompt);
+    struct termios old, new_term;
+    bool tty = (tcgetattr(fileno(stdin), &old) == 0);
+    if (tty) {
+        new_term = old;
+        new_term.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(fileno(stdin), TCSANOW, &new_term);
+    }
+    if (!fgets(pw_buf, sizeof(pw_buf), stdin)) {
+        if (tty) tcsetattr(fileno(stdin), TCSANOW, &old);
+        return NULL;
+    }
+    if (tty) {
+        tcsetattr(fileno(stdin), TCSANOW, &old);
+        fprintf(stderr, "\n");
+    }
+    size_t len = strlen(pw_buf);
+    if (len > 0 && pw_buf[len-1] == '\n') pw_buf[--len] = '\0';
+    return pw_buf;
+}
+
+/* Get password from BLIP_PASSWORD env var, or prompt interactively.
+ * Returns NULL if no password available. */
+static const char *get_password(void) {
+    const char *pw = getenv("BLIP_PASSWORD");
+    if (pw && pw[0] != '\0') return pw;
+    return prompt_password("Password: ");
+}
+
+/* ── Utility: read archive with transparent decryption/decompression ──── */
+
+/* Read an archive file, transparently decrypting and/or decompressing.
  * Always returns a malloc'd buffer — caller frees with free().
- * Detects compressed LP containers via COMP attribute. */
+ * Layering order on disk: compress → encrypt (innermost to outermost).
+ * So on read: decrypt (outer) → decompress (inner). */
 static uint8_t *read_archive(const char *path, size_t *out_len) {
     uint8_t *buf = read_file(path, out_len);
     if (!buf) return NULL;
 
-    /* Check for compressed LP container (COMP attribute) */
+    /* Check for encrypted LP container (ENC attribute) — outermost layer */
+    if (blip_is_encrypted(buf, *out_len)) {
+        const char *password = get_password();
+        if (!password) {
+            fprintf(stderr, "Password required for encrypted archive\n");
+            free(buf);
+            return NULL;
+        }
+        uint8_t *decrypted = NULL;
+        size_t dec_len = 0;
+        int32_t rc = blip_decrypt_container(buf, *out_len,
+                                             password, strlen(password),
+                                             &decrypted, &dec_len);
+        free(buf);
+        if (rc != BLIP_OK) {
+            if (rc == BLIP_ERR_AUTH_FAILED)
+                fprintf(stderr, "Wrong password or corrupted archive\n");
+            else
+                fprintf(stderr, "Decryption failed: %s\n", blip_error_string(rc));
+            return NULL;
+        }
+        /* Copy into malloc'd buffer so caller can free() uniformly */
+        buf = (uint8_t *)malloc(dec_len);
+        if (!buf) {
+            blip_free(decrypted, dec_len);
+            return NULL;
+        }
+        memcpy(buf, decrypted, dec_len);
+        blip_free(decrypted, dec_len);
+        *out_len = dec_len;
+    }
+
+    /* Check for compressed LP container (COMP attribute) — inner layer */
     if (blip_is_compressed(buf, *out_len)) {
         uint8_t *decompressed = NULL;
         size_t decomp_len = 0;
@@ -118,15 +187,14 @@ static uint8_t *read_archive(const char *path, size_t *out_len) {
             return NULL;
         }
         /* Copy into malloc'd buffer so caller can free() uniformly */
-        uint8_t *result = (uint8_t *)malloc(decomp_len);
-        if (!result) {
+        buf = (uint8_t *)malloc(decomp_len);
+        if (!buf) {
             blip_free(decompressed, decomp_len);
             return NULL;
         }
-        memcpy(result, decompressed, decomp_len);
+        memcpy(buf, decompressed, decomp_len);
         blip_free(decompressed, decomp_len);
         *out_len = decomp_len;
-        return result;
     }
 
     return buf;
