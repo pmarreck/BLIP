@@ -229,6 +229,9 @@ int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
 #define BLIP_ERR_INVALID_SIGIL_ORDER -26
 #define BLIP_ERR_MISSING_DECOMP_LEN -27
 
+/* Check if a buffer is a compressed LP container (has COMP attribute). */
+bool blip_is_compressed(const uint8_t *buf, size_t buf_len);
+
 /* Compress a BLIP container with LZMA2.
  * Input: any serialized BLIP container bytes.
  * Output: a DATA container with COMP=lzma2, DECOMP_LEN, CSUM=blake3_128 attributes.

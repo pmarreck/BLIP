@@ -97,23 +97,23 @@ static bool write_file(const char *path, const uint8_t *data, size_t len) {
     return true;
 }
 
-/* ── Utility: read archive with transparent LZMA2 decompression ──────── */
+/* ── Utility: read archive with transparent decompression ─────────────── */
 
-/* Read an archive file, transparently decompressing if LZMA2-wrapped.
+/* Read an archive file, transparently decompressing if compressed.
  * Always returns a malloc'd buffer — caller frees with free().
- * If the file is LZMA2-compressed (sentinel 0x81 0x09), decompresses first. */
+ * Detects compressed LP containers via COMP attribute. */
 static uint8_t *read_archive(const char *path, size_t *out_len) {
     uint8_t *buf = read_file(path, out_len);
     if (!buf) return NULL;
 
-    /* Check for LZMA2 container sentinel */
-    if (*out_len >= 2 && buf[0] == 0x81 && buf[1] == 0x09) {
+    /* Check for compressed LP container (COMP attribute) */
+    if (blip_is_compressed(buf, *out_len)) {
         uint8_t *decompressed = NULL;
         size_t decomp_len = 0;
         int32_t rc = blip_lzma2_decompress(buf, *out_len, &decompressed, &decomp_len);
         free(buf);
         if (rc != BLIP_OK) {
-            fprintf(stderr, "Failed to decompress LZMA2 archive: %s\n",
+            fprintf(stderr, "Failed to decompress archive: %s\n",
                     blip_error_string(rc));
             return NULL;
         }
@@ -396,7 +396,7 @@ static void peek_usage(FILE *out, const char *prog) {
         "  --type    Shorthand for .type accessor\n"
         "\n"
         "Archive structure:\n"
-        "  ARRAY[ RAW(magic), ARRAY[ FILE[DICT{meta}, DATA{content}], ... ] ]\n"
+        "  ARRAY[ DATA(magic), ARRAY[ FILE[DICT{meta}, DATA{content}], ... ] ]\n"
         "  [0]           magic bytes\n"
         "  [1]           body array (all entries)\n"
         "  [1][0]        first entry (FILE or DIR)\n"

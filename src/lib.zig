@@ -705,9 +705,14 @@ export fn blip_from_json(
 
 const lzma2_mod = blip.lzma2_mod;
 
+/// Check if a buffer is a compressed LP container (has COMP attribute).
+export fn blip_is_compressed(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return blip.compression_mod.isCompressed(buf[0..buf_len]);
+}
+
 /// Compress a BLIP container with LZMA2.
 /// Input: any serialized BLIP container bytes.
-/// Output: an LZMA2 container (0x81 0x09) wrapping the compressed data.
+/// Output: a DATA container with COMP=lzma2, DECOMP_LEN, and CSUM=blake3_128 attributes.
 /// Returns 0 on success, negative error code on failure.
 /// Caller must free output buffer with blip_free().
 export fn blip_lzma2_compress(
@@ -727,8 +732,8 @@ export fn blip_lzma2_compress(
     return 0;
 }
 
-/// Decompress an LZMA2 container, returning the inner container bytes.
-/// Verifies xxHash64 before decompressing.
+/// Decompress a compressed LP container, returning the inner container bytes.
+/// Verifies checksum before decompressing.
 /// Returns 0 on success, negative error code on failure.
 /// Caller must free output buffer with blip_free().
 export fn blip_lzma2_decompress(
