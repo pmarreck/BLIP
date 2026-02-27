@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const XxHash64 = std.hash.XxHash64;
 const blip = @import("blip.zig");
+const container_mod = @import("container.zig");
 const mini_blar = @import("mini_blar.zig");
 const poke_mod = @import("poke.zig");
 const pb = @import("printable_binary");
@@ -486,12 +486,18 @@ fn computeDirMerkleHashes(allocator: Allocator, entries: []mini_blar.ArchiveEntr
                 const file_bytes = mini_blar.serializeFileEntry(allocator, f, &to_free) catch |e| {
                     return mapContainerError2(e);
                 };
-                // v2: FILE containers have no trailing checksum, so compute
-                // xxHash64 of the full serialized entry for the Merkle tree.
+                // Extract xxHash64 from the FILE ARRAY's LP header checksum.
+                // With per-file checksums, the FILE ARRAY has a trailing xxHash64
+                // that we use directly for the Merkle tree.
                 if (file_bytes.len > 0) {
-                    var hash: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &hash, XxHash64.hash(0, file_bytes), .little);
-                    file_hashes.put(f.path, hash) catch return error.OutOfMemory;
+                    const file_view = container_mod.parseLPHeader(file_bytes) catch
+                        return error.InvalidContainerType;
+                    const csum_slice = file_view.checksumSlice();
+                    if (csum_slice.len == 8) {
+                        var hash: [8]u8 = undefined;
+                        @memcpy(&hash, csum_slice[0..8]);
+                        file_hashes.put(f.path, hash) catch return error.OutOfMemory;
+                    }
                 }
             },
             .dir => {},
