@@ -3,12 +3,14 @@ const Allocator = std.mem.Allocator;
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const csum_mod = @import("checksum.zig");
-const z7z = @import("z7z");
+const compression = @import("compression.zig");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
 const LPContainerError = container.LPContainerError;
 
+/// Legacy error type — kept for backward compatibility.
+/// New code should use compression.CompressionError.
 pub const Lzma2Error = error{
     CompressionFailed,
     DecompressionFailed,
@@ -17,97 +19,24 @@ pub const Lzma2Error = error{
 /// Compress arbitrary bytes (typically a serialized archive) into a DATA
 /// container with the COMP=lzma2, DECOMP_LEN, and CSUM=blake3_128 attributes.
 ///
-/// v2 LP layout:
-///   [BLIP(total)] [TYPE=data(4)] [COMP=lzma2(1)] [DECOMP_LEN=N]
-///   [CSUM=blake3_128(3)] [VAL sentinel] [compressed_bytes] [BLAKE3-128 16B]
-///
+/// Delegates to the unified compression module.
 /// Caller owns returned memory.
-pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || Lzma2Error)![]u8 {
-    // 1. Compress with LZMA2
-    const compressed = z7z.lzma2_encoder.compress(container_bytes, .{}, allocator) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return Lzma2Error.CompressionFailed,
-    };
-    defer allocator.free(compressed);
-
-    // 2. Build LP container: TYPE=data, COMP=lzma2, DECOMP_LEN, CSUM=blake3_128
-    const options: container.LPOptions = .{
-        .comp_id = .lzma2,
-        .decomp_len = container_bytes.len,
-        .csum_id = .blake3_128,
-    };
-
-    const total = container.computeLPLength(.data, compressed.len, options);
-    const buf = try allocator.alloc(u8, @intCast(total));
-    errdefer allocator.free(buf);
-
-    // 3. Write LP header
-    const header_len = try container.writeLPHeader(buf, .data, total, options);
-
-    // 4. Write compressed data
-    @memcpy(buf[header_len..][0..compressed.len], compressed);
-
-    // 5. Compute and write BLAKE3-128 checksum over everything before the checksum
-    const csum_len = ct.checksumLength(.blake3_128);
-    const csum_result = csum_mod.compute(.blake3_128, buf[0..@as(usize, @intCast(total)) - csum_len]);
-    @memcpy(buf[@as(usize, @intCast(total)) - csum_len .. @as(usize, @intCast(total))], csum_result[0..csum_len]);
-
-    return buf;
+pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || Lzma2Error || compression.CompressionError)![]u8 {
+    return compression.compressContainer(allocator, .lzma2, container_bytes);
 }
 
 /// Decompress an LP container with COMP=lzma2 attribute, verifying checksum
 /// before decompression.
-/// Returns the decompressed inner bytes (typically a serialized archive).
+///
+/// Delegates to the unified compression module.
 /// Caller owns returned memory.
-pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Error || ContainerError || Lzma2Error)![]u8 {
-    // 1. Parse LP header
-    const view = try container.parseLPHeader(buf);
-
-    // 2. Check COMP attribute exists and is LZMA2
-    if (view.comp_id == null) return ContainerError.InvalidContainerType;
-    if (view.comp_id.? != .lzma2) return ContainerError.InvalidContainerType;
-
-    // 3. Verify checksum if present
-    if (view.csum_id) |csum_id| {
-        const csum_bytes = view.checksumSlice();
-        const csum_len = ct.checksumLength(csum_id);
-        const data_to_check = buf[0..@as(usize, @intCast(view.total_length)) - csum_len];
-        if (!csum_mod.verify(csum_id, data_to_check, csum_bytes)) {
-            return ContainerError.HashMismatch;
-        }
-    }
-
-    // 4. Get decompressed size
-    const decomp_len = view.decomp_len orelse return ContainerError.InvalidLength;
-
-    // 5. Get compressed payload
-    const compressed = view.payloadSlice();
-
-    // 6. Decompress using Zig stdlib LZMA2 decoder
-    const out_buf = try allocator.alloc(u8, @intCast(decomp_len));
-    errdefer allocator.free(out_buf);
-
-    var input_stream = std.io.fixedBufferStream(compressed);
-    var output_stream = std.io.fixedBufferStream(out_buf);
-
-    std.compress.lzma2.decompress(allocator, input_stream.reader(), output_stream.writer()) catch {
-        allocator.free(out_buf);
-        return Lzma2Error.DecompressionFailed;
-    };
-
-    if (output_stream.pos != @as(usize, @intCast(decomp_len))) {
-        allocator.free(out_buf);
-        return Lzma2Error.DecompressionFailed;
-    }
-
-    return out_buf;
+pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Error || ContainerError || Lzma2Error || compression.CompressionError)![]u8 {
+    return compression.decompressContainer(allocator, buf);
 }
 
 /// Quick check if a buffer starts with an LP container that has a COMP attribute.
-pub fn isCompressed(buf: []const u8) bool {
-    const view = container.parseLPHeader(buf) catch return false;
-    return view.comp_id != null;
-}
+/// Delegates to the unified compression module.
+pub const isCompressed = compression.isCompressed;
 
 /// Reader for zero-copy header inspection without decompressing.
 pub const Lzma2Reader = struct {
