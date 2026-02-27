@@ -1,12 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const blip = @import("blip.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");
 pub const dict_mod = @import("dict.zig");
-pub const data_mod = @import("leaf.zig"); // data.zig merged into leaf.zig (v2 migration)
+// data_mod removed in v2 — use leaf directly (data.zig merged into leaf.zig)
 const testing = std.testing;
 
 pub const ContainerError = container.ContainerError;
@@ -79,15 +78,15 @@ pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
     return result;
 }
 
-/// Magic bytes for full blar archives (with DIR support): "BLAR" + version 1.
-pub const MAGIC_BLAR: *const [5]u8 = "BLAR\x01";
-/// Magic bytes for miniblar archives (flat files only): "MBAR" + version 1.
-pub const MAGIC_MBAR: *const [5]u8 = "MBAR\x01";
+/// Magic bytes for full blar archives (with DIR support): "BLAR" + version 2.
+pub const MAGIC_BLAR: *const [5]u8 = "BLAR\x02";
+/// Magic bytes for miniblar archives (flat files only): "MBAR" + version 2.
+pub const MAGIC_MBAR: *const [5]u8 = "MBAR\x02";
 
 /// Serialize a FILE entry as an ARRAY-based container.
 /// Layout: FILE (0x81 0x05, ARRAY layout)
 ///   [0]: DICT — metadata (required keys: pa, md, mt)
-///   [1]: DATA — content + embedded xxHash64
+///   [1]: DATA — content bytes
 ///   [2]: DICT — forks (optional, only if xattrs or resource fork present)
 /// Caller owns returned memory.
 pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
@@ -203,7 +202,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
     try to_free.append(allocator, metadata_dict);
 
     // --- Element 1: DATA container ---
-    const data_container = try data_mod.serializeData(allocator, file.content);
+    const data_container = try leaf.serializeData(allocator, file.content);
     try to_free.append(allocator, data_container);
 
     // --- Element 2: forks DICT (optional) ---
@@ -434,7 +433,7 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
         try file_elements.append(allocator, file_bytes);
     }
 
-    // Serialize magic: RAW("MBAR\x01")
+    // Serialize magic: DATA("MBAR\x02")
     const magic_bytes = try leaf.serializeRaw(allocator, MAGIC_MBAR);
     try to_free.append(allocator, magic_bytes);
 
@@ -442,9 +441,9 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
     const body_array = try array_mod.serializeArray(allocator, file_elements.items);
     try to_free.append(allocator, body_array);
 
-    // Serialize outer array: [magic, body_array]
+    // Serialize outer array: [magic, body_array] with BLAKE3-128 checksum
     const outer_elements = [_][]const u8{ magic_bytes, body_array };
-    const result = try array_mod.serializeArray(allocator, &outer_elements);
+    const result = try array_mod.serializeArrayWithOptions(allocator, &outer_elements, .{ .csum_id = .blake3_128 });
 
     return result;
 }
@@ -492,9 +491,9 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
     const body_array = try array_mod.serializeArray(allocator, entry_elements.items);
     try to_free.append(allocator, body_array);
 
-    // Serialize outer array: [magic, body_array]
+    // Serialize outer array: [magic, body_array] with BLAKE3-128 checksum
     const outer_elements = [_][]const u8{ magic_bytes, body_array };
-    const result = try array_mod.serializeArray(allocator, &outer_elements);
+    const result = try array_mod.serializeArrayWithOptions(allocator, &outer_elements, .{ .csum_id = .blake3_128 });
 
     return result;
 }
@@ -518,8 +517,8 @@ pub const ArchiveReader = struct {
     pub fn verifyMagic(self: ArchiveReader) ContainerError!bool {
         if (self.outer.elementCount() < 1) return false;
         const view = try self.outer.elementAt(0);
-        if (view.container_type != .raw) return false;
-        const value = view.valueSlice();
+        if (view.type_id != .data) return false;
+        const value = view.payloadSlice();
         return std.mem.eql(u8, value, MAGIC_BLAR) or std.mem.eql(u8, value, MAGIC_MBAR);
     }
 
@@ -527,26 +526,23 @@ pub const ArchiveReader = struct {
     pub fn isBlar(self: ArchiveReader) ContainerError!bool {
         if (self.outer.elementCount() < 1) return false;
         const view = try self.outer.elementAt(0);
-        if (view.container_type != .raw) return false;
-        return std.mem.eql(u8, view.valueSlice(), MAGIC_BLAR);
+        if (view.type_id != .data) return false;
+        return std.mem.eql(u8, view.payloadSlice(), MAGIC_BLAR);
     }
 
     /// Check if this archive has miniblar magic (MBAR).
     pub fn isMiniblar(self: ArchiveReader) ContainerError!bool {
         if (self.outer.elementCount() < 1) return false;
         const view = try self.outer.elementAt(0);
-        if (view.container_type != .raw) return false;
-        return std.mem.eql(u8, view.valueSlice(), MAGIC_MBAR);
+        if (view.type_id != .data) return false;
+        return std.mem.eql(u8, view.payloadSlice(), MAGIC_MBAR);
     }
 
     /// Returns the number of entries in the archive.
     pub fn entryCount(self: ArchiveReader) ContainerError!u64 {
         if (self.outer.elementCount() < 2) return 0;
         const body_view = try self.outer.elementAt(1);
-        const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const body_end = body_start + @as(usize, @intCast(body_view.total_length));
-        const body_buf = self.buf[body_start..body_end];
-        const body_reader = try array_mod.ArrayReader.init(body_buf);
+        const body_reader = try array_mod.ArrayReader.init(body_view.buf);
         return body_reader.elementCount();
     }
 
@@ -558,10 +554,7 @@ pub const ArchiveReader = struct {
     /// Get the container type of an entry at the given index.
     pub fn entryTypeAt(self: ArchiveReader, index: u64) ContainerError!ct.ContainerType {
         const body_view = try self.outer.elementAt(1);
-        const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const body_end = body_start + @as(usize, @intCast(body_view.total_length));
-        const body_buf = self.buf[body_start..body_end];
-        const body_reader = try array_mod.ArrayReader.init(body_buf);
+        const body_reader = try array_mod.ArrayReader.init(body_view.buf);
 
         const entry_view = try body_reader.elementAt(index);
         return entry_view.container_type;
@@ -570,15 +563,10 @@ pub const ArchiveReader = struct {
     /// Get raw bytes of the entry at the given index.
     fn entryBufAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
         const body_view = try self.outer.elementAt(1);
-        const body_start = @intFromPtr(body_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const body_end = body_start + @as(usize, @intCast(body_view.total_length));
-        const body_buf = self.buf[body_start..body_end];
-        const body_reader = try array_mod.ArrayReader.init(body_buf);
+        const body_reader = try array_mod.ArrayReader.init(body_view.buf);
 
         const entry_view = try body_reader.elementAt(index);
-        const entry_start = @intFromPtr(entry_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const entry_end = entry_start + @as(usize, @intCast(entry_view.total_length));
-        return self.buf[entry_start..entry_end];
+        return entry_view.buf;
     }
 
     /// For FILE entries (ARRAY-based): get an ArrayReader for the entry.
@@ -611,10 +599,7 @@ pub const ArchiveReader = struct {
             // FILE: ARRAY[0] is metadata DICT, look for "pa" key
             const arr = try self.fileArrayAt(index);
             const meta_view = try arr.elementAt(0);
-            const meta_start = @intFromPtr(meta_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-            const meta_end = meta_start + @as(usize, @intCast(meta_view.total_length));
-            const meta_buf = self.buf[meta_start..meta_end];
-            const meta_reader = try dict_mod.DictReader.init(meta_buf);
+            const meta_reader = try dict_mod.DictReader.init(meta_view.buf);
             const pa_idx = (try meta_reader.findKey("pa")) orelse return ContainerError.MissingRequiredKey;
             const pa_container = try meta_reader.valueAt(pa_idx);
             return leaf.readUtf8(pa_container);
@@ -628,43 +613,43 @@ pub const ArchiveReader = struct {
     }
 
     /// Get the content of a FILE entry at the given index.
-    /// Reads the DATA container (element 1 of the FILE ARRAY) and returns data minus hash.
+    /// Reads the DATA container (element 1 of the FILE ARRAY) and returns payload bytes.
     pub fn fileContentAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
         const arr = try self.fileArrayAt(index);
         const data_view = try arr.elementAt(1);
-        const data_start = @intFromPtr(data_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const data_end = data_start + @as(usize, @intCast(data_view.total_length));
-        const data_buf = self.buf[data_start..data_end];
-        return data_mod.readDataContent(data_buf);
+        return leaf.readData(data_view.buf);
     }
 
-    /// Verify a FILE entry's DATA hash and ARRAY hash.
+    /// Verify a FILE entry's DATA checksum and ARRAY checksum.
     pub fn verifyFileAt(self: ArchiveReader, index: u64) ContainerError!bool {
         const entry_buf = try self.entryBufAt(index);
         const entry_type = try self.entryTypeAt(index);
 
         if (entry_type == .dir) {
-            // For DIR entries, verify the container hash
+            // For DIR entries, verify the container checksum
             const dict_reader = try dict_mod.DictReader.init(entry_buf);
-            return dict_reader.verifyHash();
+            return dict_reader.verifyChecksum();
         }
 
-        // FILE: verify both ARRAY hash and DATA hash
+        // FILE: verify both ARRAY checksum and DATA checksum
         const arr = try array_mod.ArrayReader.init(entry_buf);
-        const arr_hash_ok = try arr.verifyHash();
-        if (!arr_hash_ok) return false;
+        const arr_ok = try arr.verifyChecksum();
+        if (!arr_ok) return false;
 
-        // Verify the DATA container's embedded hash
+        // Verify the DATA container's embedded checksum
         const data_view = try arr.elementAt(1);
-        const data_start = @intFromPtr(data_view.buf.ptr) - @intFromPtr(self.buf.ptr);
-        const data_end = data_start + @as(usize, @intCast(data_view.total_length));
-        const data_buf = self.buf[data_start..data_end];
-        return data_mod.verifyDataHash(data_buf);
+        return leaf.verifyLeafChecksum(data_view.buf);
     }
 
-    /// Verify the outer array's xxHash64 integrity check.
+    /// Verify the outer array's BLAKE3-128 integrity checksum.
+    pub fn verifyChecksum(self: ArchiveReader) ContainerError!bool {
+        return self.outer.verifyChecksum();
+    }
+
+    /// Legacy alias: equivalent to verifyChecksum().
+    /// Deprecated: use verifyChecksum() instead.
     pub fn verifyHash(self: ArchiveReader) ContainerError!bool {
-        return self.outer.verifyHash();
+        return self.verifyChecksum();
     }
 
     /// Find a file by its path.
@@ -890,11 +875,7 @@ test "FILE metadata round-trip: mode, mtime, username" {
     try testing.expectEqual(ContainerType.dict, meta_view.container_type);
 
     // Parse metadata dict
-    const buf = reader.buf;
-    const meta_start = @intFromPtr(meta_view.buf.ptr) - @intFromPtr(buf.ptr);
-    const meta_end = meta_start + @as(usize, @intCast(meta_view.total_length));
-    const meta_buf = buf[meta_start..meta_end];
-    const meta_reader = try dict_mod.DictReader.init(meta_buf);
+    const meta_reader = try dict_mod.DictReader.init(meta_view.buf);
 
     // Verify md (mode)
     const md_idx = (try meta_reader.findKey("md")).?;
