@@ -263,9 +263,6 @@ pub const ArrayReader = struct {
         return csum_mod.verify(csum_id, self.lp_view.buf[0..csum_offset], self.lp_view.checksumSlice());
     }
 
-    /// Legacy alias: equivalent to verifyChecksum().
-    /// Deprecated: use verifyChecksum() instead.
-    pub const verifyHash = verifyChecksum;
 };
 
 // =============================================================================

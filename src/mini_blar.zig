@@ -10,7 +10,7 @@ pub const dict_mod = @import("dict.zig");
 const testing = std.testing;
 
 pub const ContainerError = container.ContainerError;
-const ContainerType = ct.ContainerType;
+const ContainerTypeId = ct.ContainerTypeId;
 const XxHash64 = std.hash.XxHash64;
 
 /// A file to be included in a BLIP archive.
@@ -103,7 +103,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, file.birthtime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -115,7 +115,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, file.ctime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -127,7 +127,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, file.gid, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -149,7 +149,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &bytes, file.mode, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -161,7 +161,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, file.mtime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -183,7 +183,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         try to_free.append(allocator, key);
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, file.uid, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;
@@ -223,7 +223,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         for (file.xattrs) |xa| {
             const key = try leaf.serializeUtf8(allocator, xa.name);
             try to_free.append(allocator, key);
-            const val = try leaf.serializeRaw(allocator, xa.value);
+            const val = try leaf.serializeData(allocator, xa.value);
             try to_free.append(allocator, val);
             fork_pairs[fi] = .{ .key = key, .value = val };
             fi += 1;
@@ -231,7 +231,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         if (file.resource_fork.len > 0) {
             const key = try leaf.serializeUtf8(allocator, "rf");
             try to_free.append(allocator, key);
-            const val = try leaf.serializeRaw(allocator, file.resource_fork);
+            const val = try leaf.serializeData(allocator, file.resource_fork);
             try to_free.append(allocator, val);
             fork_pairs[fi] = .{ .key = key, .value = val };
             fi += 1;
@@ -274,7 +274,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, dir.birthtime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -286,7 +286,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, dir.ctime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -298,7 +298,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, dir.gid, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -320,7 +320,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &bytes, dir.mode, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -332,7 +332,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, dir.mtime_ns, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -354,7 +354,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         try to_free.append(allocator, key);
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, dir.uid, .little);
-        const val = try leaf.serializeRaw(allocator, &bytes);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -380,7 +380,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         for (dir.xattrs, 0..) |xa, xi| {
             const xa_key = try leaf.serializeUtf8(allocator, xa.name);
             try to_free.append(allocator, xa_key);
-            const xa_val = try leaf.serializeRaw(allocator, xa.value);
+            const xa_val = try leaf.serializeData(allocator, xa.value);
             try to_free.append(allocator, xa_val);
             xa_pairs[xi] = .{ .key = xa_key, .value = xa_val };
         }
@@ -403,7 +403,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
     {
         const key = try leaf.serializeUtf8(allocator, "xh");
         try to_free.append(allocator, key);
-        const val = try leaf.serializeRaw(allocator, &dir.xh64);
+        const val = try leaf.serializeData(allocator, &dir.xh64);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -435,7 +435,7 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
     }
 
     // Serialize magic: DATA("MBAR\x02")
-    const magic_bytes = try leaf.serializeRaw(allocator, MAGIC_MBAR);
+    const magic_bytes = try leaf.serializeData(allocator, MAGIC_MBAR);
     try to_free.append(allocator, magic_bytes);
 
     // Serialize body array (containing all FILE elements)
@@ -485,7 +485,7 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
         }
     }
     const magic = if (has_dir) MAGIC_BLAR else MAGIC_MBAR;
-    const magic_bytes = try leaf.serializeRaw(allocator, magic);
+    const magic_bytes = try leaf.serializeData(allocator, magic);
     try to_free.append(allocator, magic_bytes);
 
     // Serialize body array (containing all entries)
@@ -553,12 +553,12 @@ pub const ArchiveReader = struct {
     }
 
     /// Get the container type of an entry at the given index.
-    pub fn entryTypeAt(self: ArchiveReader, index: u64) ContainerError!ct.ContainerType {
+    pub fn entryTypeAt(self: ArchiveReader, index: u64) ContainerError!ct.ContainerTypeId {
         const body_view = try self.outer.elementAt(1);
         const body_reader = try array_mod.ArrayReader.init(body_view.buf);
 
         const entry_view = try body_reader.elementAt(index);
-        return entry_view.container_type;
+        return entry_view.type_id;
     }
 
     /// Get raw bytes of the entry at the given index.
@@ -647,12 +647,6 @@ pub const ArchiveReader = struct {
         return self.outer.verifyChecksum();
     }
 
-    /// Legacy alias: equivalent to verifyChecksum().
-    /// Deprecated: use verifyChecksum() instead.
-    pub fn verifyHash(self: ArchiveReader) ContainerError!bool {
-        return self.verifyChecksum();
-    }
-
     /// Find a file by its path.
     pub fn findFile(self: ArchiveReader, path: []const u8) ContainerError!?u64 {
         const count = try self.entryCount();
@@ -679,7 +673,7 @@ test "empty archive (0 files) creates valid archive with magic + empty body" {
     const reader = try ArchiveReader.init(archive);
     try testing.expect(try reader.verifyMagic());
     try testing.expectEqual(@as(u64, 0), try reader.fileCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 }
 
 test "single file archive round-trip with ARRAY-based FILE" {
@@ -693,10 +687,10 @@ test "single file archive round-trip with ARRAY-based FILE" {
     const reader = try ArchiveReader.init(archive);
     try testing.expect(try reader.verifyMagic());
     try testing.expectEqual(@as(u64, 1), try reader.fileCount());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 
     // Verify entry type is FILE
-    try testing.expectEqual(ContainerType.file, try reader.entryTypeAt(0));
+    try testing.expectEqual(ContainerTypeId.file, try reader.entryTypeAt(0));
 
     // Read back path
     const path = try reader.entryPathAt(0);
@@ -792,12 +786,12 @@ test "full archive with DIR + FILE entries round-trips" {
 
     const reader = try ArchiveReader.init(archive);
     try testing.expect(try reader.verifyMagic());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expectEqual(@as(u64, 2), try reader.entryCount());
 
     // Caller order preserved: dir first, then file
-    try testing.expectEqual(ContainerType.dir, try reader.entryTypeAt(0));
-    try testing.expectEqual(ContainerType.file, try reader.entryTypeAt(1));
+    try testing.expectEqual(ContainerTypeId.dir, try reader.entryTypeAt(0));
+    try testing.expectEqual(ContainerTypeId.file, try reader.entryTypeAt(1));
 
     try testing.expectEqualSlices(u8, "src", try reader.entryPathAt(0));
     try testing.expectEqualSlices(u8, "src/main.zig", try reader.entryPathAt(1));
@@ -845,7 +839,7 @@ test "archive with large file content" {
 
     const reader = try ArchiveReader.init(archive);
     try testing.expect(try reader.verifyMagic());
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expectEqual(@as(u64, 1), try reader.fileCount());
 
     const roundtrip = try reader.fileContentAt(0);
@@ -873,19 +867,19 @@ test "FILE metadata round-trip: mode, mtime, username" {
 
     // Element 0 is metadata DICT
     const meta_view = try arr.elementAt(0);
-    try testing.expectEqual(ContainerType.dict, meta_view.container_type);
+    try testing.expectEqual(ContainerTypeId.dict, meta_view.type_id);
 
     // Parse metadata dict
     const meta_reader = try dict_mod.DictReader.init(meta_view.buf);
 
     // Verify md (mode)
     const md_idx = (try meta_reader.findKey("md")).?;
-    const md_val = try leaf.readRaw(try meta_reader.valueAt(md_idx));
+    const md_val = try leaf.readData(try meta_reader.valueAt(md_idx));
     try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, md_val[0..2], .little));
 
     // Verify mt (mtime)
     const mt_idx = (try meta_reader.findKey("mt")).?;
-    const mt_val = try leaf.readRaw(try meta_reader.valueAt(mt_idx));
+    const mt_val = try leaf.readData(try meta_reader.valueAt(mt_idx));
     try testing.expectEqual(@as(i64, 1708787200_000_000_000), std.mem.readInt(i64, mt_val[0..8], .little));
 
     // Verify pa (path)
@@ -916,18 +910,18 @@ test "DIR metadata round-trip with 2-char keys" {
 
     const reader = try ArchiveReader.init(archive);
     const dict_reader = try reader.dirDictAt(0);
-    try testing.expect(try dict_reader.verifyHash());
+    try testing.expect(try dict_reader.verifyChecksum());
 
     // Verify 2-char keys
     const pa_idx = (try dict_reader.findKey("pa")).?;
     try testing.expectEqualSlices(u8, "mydir", try leaf.readUtf8(try dict_reader.valueAt(pa_idx)));
 
     const md_idx = (try dict_reader.findKey("md")).?;
-    const md_val = try leaf.readRaw(try dict_reader.valueAt(md_idx));
+    const md_val = try leaf.readData(try dict_reader.valueAt(md_idx));
     try testing.expectEqual(@as(u16, 0o755), std.mem.readInt(u16, md_val[0..2], .little));
 
     const xh_idx = (try dict_reader.findKey("xh")).?;
-    const xh_val = try leaf.readRaw(try dict_reader.valueAt(xh_idx));
+    const xh_val = try leaf.readData(try dict_reader.valueAt(xh_idx));
     try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, xh_val);
 }
 
@@ -955,7 +949,7 @@ test "FILE with xattrs creates forks DICT" {
 
     // Element 2 should be a DICT
     const forks_view = try arr.elementAt(2);
-    try testing.expectEqual(ContainerType.dict, forks_view.container_type);
+    try testing.expectEqual(ContainerTypeId.dict, forks_view.type_id);
 }
 
 test "outer array element count is 2 (magic + body)" {

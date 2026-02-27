@@ -101,35 +101,6 @@ pub fn verifyLeafChecksum(buf: []const u8) LPContainerError!bool {
 }
 
 // =============================================================================
-// Backward-compatibility shims (v1 -> v2 migration)
-//
-// These aliases allow unmigrated modules (array.zig, dict.zig, peek.zig,
-// poke.zig, mini_blar.zig, lzma2.zig, lib.zig) to continue using the old
-// names until they are individually migrated to v2 LP format.
-// =============================================================================
-
-/// Legacy alias: serializeRaw -> serializeData.
-/// Deprecated: use serializeData() instead.
-pub const serializeRaw = serializeData;
-
-/// Legacy alias: readRaw -> readData.
-/// Deprecated: use readData() instead.
-pub const readRaw = readData;
-
-/// Legacy alias: readDataContent -> readData.
-/// Deprecated: use readData() instead.
-/// Note: in v1, readDataContent stripped the 8-byte xxHash64 suffix.
-/// In v2 LP format, checksums are handled via the CSUM attribute and
-/// readData() returns only the payload (excluding checksum bytes).
-pub const readDataContent = readData;
-
-/// Legacy alias: verifyDataHash -> verifyLeafChecksum.
-/// Deprecated: use verifyLeafChecksum() instead.
-/// Note: in v1, this verified the inline xxHash64. In v2, this verifies
-/// the CSUM attribute checksum (returns true if no checksum present).
-pub const verifyDataHash = verifyLeafChecksum;
-
-// =============================================================================
 // Tests — v2 LP format
 // =============================================================================
 

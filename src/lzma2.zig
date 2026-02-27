@@ -9,19 +9,12 @@ const testing = std.testing;
 const ContainerError = container.ContainerError;
 const LPContainerError = container.LPContainerError;
 
-/// Legacy error type — kept for backward compatibility.
-/// New code should use compression.CompressionError.
-pub const Lzma2Error = error{
-    CompressionFailed,
-    DecompressionFailed,
-};
-
 /// Compress arbitrary bytes (typically a serialized archive) into a DATA
 /// container with the COMP=lzma2, DECOMP_LEN, and CSUM=blake3_128 attributes.
 ///
 /// Delegates to the unified compression module.
 /// Caller owns returned memory.
-pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || Lzma2Error || compression.CompressionError)![]u8 {
+pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || compression.CompressionError)![]u8 {
     return compression.compressContainer(allocator, .lzma2, container_bytes);
 }
 
@@ -30,7 +23,7 @@ pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (All
 ///
 /// Delegates to the unified compression module.
 /// Caller owns returned memory.
-pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Error || ContainerError || Lzma2Error || compression.CompressionError)![]u8 {
+pub fn decompressContainer(allocator: Allocator, buf: []const u8) (Allocator.Error || ContainerError || compression.CompressionError)![]u8 {
     return compression.decompressContainer(allocator, buf);
 }
 
@@ -42,7 +35,7 @@ pub const isCompressed = compression.isCompressed;
 pub const Lzma2Reader = struct {
     lp_view: container.LPContainerView,
 
-    pub fn init(buf: []const u8) (ContainerError || Lzma2Error)!Lzma2Reader {
+    pub fn init(buf: []const u8) ContainerError!Lzma2Reader {
         const view = container.parseLPHeader(buf) catch |e| switch (e) {
             // Map LP-specific errors to ContainerError variants
             inline else => |err| return err,
@@ -61,11 +54,6 @@ pub const Lzma2Reader = struct {
         return csum_mod.verify(csum_id, data_to_check, self.lp_view.checksumSlice());
     }
 
-    /// Legacy alias for verifyChecksum.
-    pub fn verifyHash(self: Lzma2Reader) bool {
-        return self.verifyChecksum();
-    }
-
     /// Returns the size of the compressed payload (bytes).
     pub fn compressedSize(self: Lzma2Reader) usize {
         return self.lp_view.payloadSlice().len;
@@ -78,10 +66,9 @@ pub const Lzma2Reader = struct {
 };
 
 /// Verify the embedded checksum of a compressed LP container.
-/// Legacy alias — delegates to Lzma2Reader.
-pub fn verifyHash(buf: []const u8) (ContainerError || Lzma2Error)!bool {
+pub fn verifyChecksum(buf: []const u8) ContainerError!bool {
     const reader = try Lzma2Reader.init(buf);
-    return reader.verifyHash();
+    return reader.verifyChecksum();
 }
 
 // =============================================================================
@@ -114,7 +101,7 @@ test "LZMA2 hash/checksum verification" {
     const compressed = try compressContainer(allocator, inner);
     defer allocator.free(compressed);
 
-    try testing.expect(try verifyHash(compressed));
+    try testing.expect(try verifyChecksum(compressed));
 }
 
 test "LZMA2 checksum detects corruption" {
@@ -130,7 +117,7 @@ test "LZMA2 checksum detects corruption" {
     // Corrupt a byte in the compressed data (not in checksum area)
     compressed[compressed.len / 2] ^= 0xFF;
 
-    try testing.expect(!(try verifyHash(compressed)));
+    try testing.expect(!(try verifyChecksum(compressed)));
 }
 
 test "LZMA2 wraps an ARRAY container" {
@@ -168,7 +155,7 @@ test "LZMA2 Reader: header inspection without decompression" {
 
     const reader = try Lzma2Reader.init(compressed);
     try testing.expectEqual(@as(u64, inner.len), reader.uncompressedSize());
-    try testing.expect(reader.verifyHash());
+    try testing.expect(reader.verifyChecksum());
     try testing.expect(reader.compressedSize() > 0);
 }
 

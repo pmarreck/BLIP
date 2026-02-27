@@ -745,7 +745,7 @@ test "full archive round-trip: create → toJson → fromJson → byte-identical
 
     // Verify the round-tripped archive is valid
     const reader = try mini_blar.ArchiveReader.init(archive2);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expectEqual(@as(u64, 2), try reader.entryCount());
 
     // Content should match
@@ -789,7 +789,7 @@ test "minimal JSON (only required fields) produces valid archive" {
     defer allocator.free(archive);
 
     const reader = try mini_blar.ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expectEqual(@as(u64, 1), try reader.entryCount());
     try testing.expectEqualSlices(u8, "hello", try reader.fileContentAt(0));
 }
@@ -842,7 +842,7 @@ test "dir entries with Merkle hash recomputation" {
     defer allocator.free(archive2);
 
     const reader = try mini_blar.ArchiveReader.init(archive2);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expectEqual(@as(u64, 2), try reader.entryCount());
 }
 
@@ -926,5 +926,5 @@ test "xattrs round-trip via JSON" {
     defer allocator.free(archive2);
 
     const reader = try mini_blar.ArchiveReader.init(archive2);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 }

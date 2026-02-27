@@ -390,9 +390,6 @@ pub const DictReader = struct {
         return csum_mod.verify(csum_id, self.lp_view.buf[0..csum_offset], self.lp_view.checksumSlice());
     }
 
-    /// Legacy alias: equivalent to verifyChecksum().
-    /// Deprecated: use verifyChecksum() instead.
-    pub const verifyHash = verifyChecksum;
 };
 
 // =============================================================================
@@ -1081,17 +1078,3 @@ test "verifyChecksum with corrupted checksum bytes in dict" {
     try testing.expect(!valid);
 }
 
-test "verifyHash legacy alias works" {
-    const allocator = testing.allocator;
-    const key = try leaf.serializeUtf8(allocator, "key");
-    defer allocator.free(key);
-    const val = try leaf.serializeData(allocator, "value");
-    defer allocator.free(val);
-
-    const pairs = [_]KeyValue{.{ .key = key, .value = val }};
-    const result = try serializeDict(allocator, &pairs);
-    defer allocator.free(result);
-
-    const reader = try DictReader.init(result);
-    try testing.expect(try reader.verifyHash());
-}

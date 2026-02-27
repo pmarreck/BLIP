@@ -295,7 +295,7 @@ export fn blip_archive_verify(
     buf_len: usize,
 ) callconv(.c) bool {
     const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return false;
-    return reader.verifyHash() catch false;
+    return reader.verifyChecksum() catch false;
 }
 
 /// Get the file path at the given index (zero-copy pointer into buf).

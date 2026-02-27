@@ -679,7 +679,7 @@ test "poke content: change DATA, verify via peek" {
     try testing.expectEqualSlices(u8, "modified", content);
 
     // Verify integrity
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expect(try reader.verifyFileAt(0));
 }
 
@@ -708,7 +708,7 @@ test "poke metadata: change path, verify" {
     try testing.expectEqualSlices(u8, "data", content);
 
     // Integrity
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 }
 
 test "poke empty value allowed" {
@@ -728,7 +728,7 @@ test "poke empty value allowed" {
     const reader = try mini_blar.ArchiveReader.init(poked);
     const content = try reader.fileContentAt(0);
     try testing.expectEqual(@as(usize, 0), content.len);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
 }
 
 test "poke error on non-leaf target" {
@@ -793,7 +793,7 @@ test "poke multi-file: only target modified" {
     try testing.expectEqualSlices(u8, "charlie", try reader.fileContentAt(2));
 
     // Verify all hashes
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     for (0..3) |i| {
         try testing.expect(try reader.verifyFileAt(i));
     }
@@ -815,7 +815,7 @@ test "poke integrity passes after every poke" {
     archive = poked1;
 
     var reader = try mini_blar.ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expect(try reader.verifyFileAt(0));
 
     // Poke path
@@ -824,7 +824,7 @@ test "poke integrity passes after every poke" {
     archive = poked2;
 
     reader = try mini_blar.ArchiveReader.init(archive);
-    try testing.expect(try reader.verifyHash());
+    try testing.expect(try reader.verifyChecksum());
     try testing.expect(try reader.verifyFileAt(0));
 
     allocator.free(archive);
