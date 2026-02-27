@@ -39,7 +39,7 @@ pub const XattrEntry = struct {
 /// A directory entry to be included in a full BLIP archive.
 pub const DirEntry = struct {
     path: []const u8, // directory path (UTF-8)
-    xh64: [8]u8, // pre-computed Merkle hash
+    xh64: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, // Merkle hash (auto-computed by createFullArchive)
     mode: u16 = 0,
     mtime_ns: i64 = 0,
     ctime_ns: i64 = 0,
@@ -77,6 +77,18 @@ pub fn computeMerkleHash(child_hashes: []const [8]u8) [8]u8 {
     var result: [8]u8 = undefined;
     std.mem.writeInt(u64, &result, hash_value, .little);
     return result;
+}
+
+/// Check if `child_path` is a direct child of `dir_path`.
+/// e.g., isDirectChild("mydir", "mydir/file.txt") = true
+///       isDirectChild("mydir", "mydir/sub/deep.txt") = false
+pub fn isDirectChild(dir_path: []const u8, child_path: []const u8) bool {
+    if (child_path.len <= dir_path.len + 1) return false;
+    if (!std.mem.startsWith(u8, child_path, dir_path)) return false;
+    if (child_path[dir_path.len] != '/') return false;
+    // Check no more slashes after the prefix
+    const rest = child_path[dir_path.len + 1 ..];
+    return std.mem.indexOfScalar(u8, rest, '/') == null;
 }
 
 /// Magic bytes for full blar archives (with DIR support): "BLAR" + version 2.
@@ -450,7 +462,8 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
 }
 
 /// Create a full BLIP archive from a list of file and/or directory entries.
-/// Entries are serialized in the order given — caller controls ordering.
+/// Merkle hashes (xh64) for DIR entries are auto-computed from child FILE checksums;
+/// callers may leave xh64 zeroed. Entries are serialized in the order given.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
 pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (Allocator.Error || ContainerError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
@@ -459,40 +472,79 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
         to_free.deinit(allocator);
     }
 
-    // Serialize each entry as FILE or DIR container
     var entry_elements: std.ArrayList([]const u8) = .{};
     defer entry_elements.deinit(allocator);
 
+    // Phase 1: Serialize FILE entries and collect their xxHash64 checksums
+    // (keyed by path for Merkle computation). Also record positions.
+    var file_hashes = std.StringHashMap([8]u8).init(allocator);
+    defer file_hashes.deinit();
+
+    var has_dir = false;
     for (entries) |entry| {
         switch (entry) {
             .file => |file| {
                 const file_bytes = try serializeFileEntry(allocator, file, &to_free);
                 try entry_elements.append(allocator, file_bytes);
+                // Extract xxHash64 from the FILE ARRAY's LP header checksum
+                const file_view = try container.parseLPHeader(file_bytes);
+                const csum = file_view.checksumSlice();
+                if (csum.len == 8) {
+                    var hash: [8]u8 = undefined;
+                    @memcpy(&hash, csum[0..8]);
+                    try file_hashes.put(file.path, hash);
+                }
             },
-            .dir => |dir| {
-                const dir_bytes = try serializeDirEntry(allocator, dir, &to_free);
-                try entry_elements.append(allocator, dir_bytes);
+            .dir => {
+                // Placeholder — will be filled after Merkle computation
+                try entry_elements.append(allocator, &.{});
+                has_dir = true;
             },
         }
     }
 
-    // Choose magic based on content: BLAR if any DIR entries, MBAR if all files
-    var has_dir = false;
-    for (entries) |entry| {
-        if (entry == .dir) {
-            has_dir = true;
-            break;
+    // Phase 2: Compute Merkle hashes for DIR entries, then serialize them
+    for (entries, 0..) |entry, i| {
+        switch (entry) {
+            .dir => |dir| {
+                // Find direct child FILEs and collect their hashes
+                var child_hashes_list: std.ArrayList([8]u8) = .{};
+                defer child_hashes_list.deinit(allocator);
+
+                for (entries) |other| {
+                    switch (other) {
+                        .file => |f| {
+                            if (isDirectChild(dir.path, f.path)) {
+                                if (file_hashes.get(f.path)) |hash| {
+                                    try child_hashes_list.append(allocator, hash);
+                                }
+                            }
+                        },
+                        .dir => {},
+                    }
+                }
+
+                // Build DirEntry with computed Merkle hash
+                var dir_with_merkle = dir;
+                if (child_hashes_list.items.len > 0) {
+                    dir_with_merkle.xh64 = computeMerkleHash(child_hashes_list.items);
+                }
+
+                const dir_bytes = try serializeDirEntry(allocator, dir_with_merkle, &to_free);
+                entry_elements.items[i] = dir_bytes;
+            },
+            .file => {},
         }
     }
+
+    // Phase 3: Assemble archive
     const magic = if (has_dir) MAGIC_BLAR else MAGIC_MBAR;
     const magic_bytes = try leaf.serializeData(allocator, magic);
     try to_free.append(allocator, magic_bytes);
 
-    // Serialize body array (containing all entries)
     const body_array = try array_mod.serializeArray(allocator, entry_elements.items);
     try to_free.append(allocator, body_array);
 
-    // Serialize outer array: [magic, body_array] with BLAKE3-128 checksum
     const outer_elements = [_][]const u8{ magic_bytes, body_array };
     const result = try array_mod.serializeArrayWithOptions(allocator, &outer_elements, .{ .csum_id = .blake3_128 });
 
@@ -645,6 +697,57 @@ pub const ArchiveReader = struct {
     /// Verify the outer array's BLAKE3-128 integrity checksum.
     pub fn verifyChecksum(self: ArchiveReader) ContainerError!bool {
         return self.outer.verifyChecksum();
+    }
+
+    /// Verify a DIR entry's Merkle hash by recomputing it from child FILE checksums.
+    /// Returns true if the stored xh64 matches the recomputed Merkle hash.
+    /// Returns error.InvalidContainerType if the entry is not a DIR.
+    pub fn verifyMerkleAt(self: ArchiveReader, index: u64, allocator: std.mem.Allocator) (ContainerError || std.mem.Allocator.Error)!bool {
+        const entry_type = try self.entryTypeAt(index);
+        if (entry_type != .dir) return ContainerError.InvalidContainerType;
+
+        // Read stored xh64 from DIR
+        const dict_reader = try self.dirDictAt(index);
+        const xh_idx = (try dict_reader.findKey("xh")) orelse return false;
+        const xh_container = try dict_reader.valueAt(xh_idx);
+        const xh_val = try leaf.readData(xh_container);
+        if (xh_val.len != 8) return false;
+        var stored_xh64: [8]u8 = undefined;
+        @memcpy(&stored_xh64, xh_val[0..8]);
+
+        // Get DIR path
+        const dir_path = try self.entryPathAt(index);
+
+        // Collect child FILE checksums
+        const count = try self.entryCount();
+        var child_hashes: std.ArrayList([8]u8) = .{};
+        defer child_hashes.deinit(allocator);
+
+        for (0..count) |i| {
+            const child_type = try self.entryTypeAt(i);
+            if (child_type != .file) continue;
+
+            const child_path = try self.entryPathAt(i);
+            if (!isDirectChild(dir_path, child_path)) continue;
+
+            // Extract FILE ARRAY's xxHash64 checksum from LP header
+            const entry_buf = try self.entryBufAt(i);
+            const file_view = try container.parseLPHeader(entry_buf);
+            const csum = file_view.checksumSlice();
+            if (csum.len == 8) {
+                var hash: [8]u8 = undefined;
+                @memcpy(&hash, csum[0..8]);
+                try child_hashes.append(allocator, hash);
+            }
+        }
+
+        if (child_hashes.items.len == 0) {
+            // No children: stored hash should be all zeros
+            return std.mem.eql(u8, &stored_xh64, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+        }
+
+        const recomputed = computeMerkleHash(child_hashes.items);
+        return std.mem.eql(u8, &stored_xh64, &recomputed);
     }
 
     /// Find a file by its path.

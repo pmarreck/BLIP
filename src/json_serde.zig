@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const blip = @import("blip.zig");
-const container_mod = @import("container.zig");
 const mini_blar = @import("mini_blar.zig");
 const poke_mod = @import("poke.zig");
 const pb = @import("printable_binary");
@@ -439,7 +438,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
             archive_entries[i] = .{
                 .dir = .{
                     .path = path,
-                    .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, // computed below
+                    // xh64 defaults to zeros, auto-computed by createFullArchive
                     .mode = mode,
                     .mtime_ns = mtime_ns,
                     .ctime_ns = ctime_ns,
@@ -456,95 +455,9 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
         }
     }
 
-    // Compute Merkle hashes for DIR entries
-    try computeDirMerkleHashes(allocator, archive_entries);
-
-    // Create the archive
+    // Create the archive (Merkle hashes auto-computed by createFullArchive)
     const result = mini_blar.createFullArchive(allocator, archive_entries) catch |e| return mapContainerError(e);
     return result;
-}
-
-// =============================================================================
-// Merkle hash computation for DIR entries
-// =============================================================================
-
-/// Compute Merkle hashes for all DIR entries based on child FILE ARRAY hashes.
-fn computeDirMerkleHashes(allocator: Allocator, entries: []mini_blar.ArchiveEntry) JsonSerdeError!void {
-    // First, serialize each FILE entry to get its ARRAY hash
-    var file_hashes = std.StringHashMap([8]u8).init(allocator);
-    defer file_hashes.deinit();
-
-    var to_free: std.ArrayList([]u8) = .{};
-    defer {
-        for (to_free.items) |item| allocator.free(item);
-        to_free.deinit(allocator);
-    }
-
-    for (entries) |entry| {
-        switch (entry) {
-            .file => |f| {
-                const file_bytes = mini_blar.serializeFileEntry(allocator, f, &to_free) catch |e| {
-                    return mapContainerError2(e);
-                };
-                // Extract xxHash64 from the FILE ARRAY's LP header checksum.
-                // With per-file checksums, the FILE ARRAY has a trailing xxHash64
-                // that we use directly for the Merkle tree.
-                if (file_bytes.len > 0) {
-                    const file_view = container_mod.parseLPHeader(file_bytes) catch
-                        return error.InvalidContainerType;
-                    const csum_slice = file_view.checksumSlice();
-                    if (csum_slice.len == 8) {
-                        var hash: [8]u8 = undefined;
-                        @memcpy(&hash, csum_slice[0..8]);
-                        file_hashes.put(f.path, hash) catch return error.OutOfMemory;
-                    }
-                }
-            },
-            .dir => {},
-        }
-    }
-
-    // For each DIR, find child FILEs by path prefix and compute Merkle hash
-    for (entries) |*entry| {
-        switch (entry.*) {
-            .dir => |*d| {
-                var child_hashes_list: std.ArrayList([8]u8) = .{};
-                defer child_hashes_list.deinit(allocator);
-
-                const dir_prefix = d.path;
-                for (entries) |other| {
-                    switch (other) {
-                        .file => |f| {
-                            // Check if this file is a direct child of the directory
-                            if (isDirectChild(dir_prefix, f.path)) {
-                                if (file_hashes.get(f.path)) |hash| {
-                                    child_hashes_list.append(allocator, hash) catch return error.OutOfMemory;
-                                }
-                            }
-                        },
-                        .dir => {},
-                    }
-                }
-
-                if (child_hashes_list.items.len > 0) {
-                    d.xh64 = mini_blar.computeMerkleHash(child_hashes_list.items);
-                }
-            },
-            .file => {},
-        }
-    }
-}
-
-/// Check if `child_path` is a direct child of `dir_path`.
-/// e.g., isDirectChild("mydir", "mydir/file.txt") = true
-///       isDirectChild("mydir", "mydir/sub/deep.txt") = false
-fn isDirectChild(dir_path: []const u8, child_path: []const u8) bool {
-    if (child_path.len <= dir_path.len + 1) return false;
-    if (!std.mem.startsWith(u8, child_path, dir_path)) return false;
-    if (child_path[dir_path.len] != '/') return false;
-    // Check no more slashes after the prefix
-    const rest = child_path[dir_path.len + 1 ..];
-    return std.mem.indexOfScalar(u8, rest, '/') == null;
 }
 
 // =============================================================================
@@ -600,27 +513,6 @@ fn parseJsonXattrs(allocator: Allocator, obj: std.json.ObjectMap, allocated_stri
 // =============================================================================
 
 fn mapContainerError(err: anytype) JsonSerdeError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidContainerType => error.InvalidContainerType,
-        error.InvalidLength => error.InvalidLength,
-        error.LengthExceedsBounds => error.LengthExceedsBounds,
-        error.MissingRequiredKey => error.MissingRequiredKey,
-        error.DuplicateKey => error.DuplicateKey,
-        error.KeysNotSorted => error.KeysNotSorted,
-        error.HashMismatch => error.HashMismatch,
-        error.IndexOutOfBounds => error.IndexOutOfBounds,
-        error.InvalidMagic => error.InvalidMagic,
-        error.BufferTooSmall => error.BufferTooSmall,
-        error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
-        error.Overflow => error.Overflow,
-        error.MissingSigil => error.MissingSigil,
-        error.InvalidSigilOrder => error.InvalidSigilOrder,
-        error.MissingDecompLen => error.MissingDecompLen,
-    };
-}
-
-fn mapContainerError2(err: anytype) JsonSerdeError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidContainerType => error.InvalidContainerType,
@@ -897,10 +789,10 @@ test "empty content round-trip" {
 }
 
 test "isDirectChild" {
-    try testing.expect(isDirectChild("mydir", "mydir/file.txt"));
-    try testing.expect(!isDirectChild("mydir", "mydir/sub/deep.txt"));
-    try testing.expect(!isDirectChild("mydir", "other/file.txt"));
-    try testing.expect(!isDirectChild("mydir", "mydir"));
+    try testing.expect(mini_blar.isDirectChild("mydir", "mydir/file.txt"));
+    try testing.expect(!mini_blar.isDirectChild("mydir", "mydir/sub/deep.txt"));
+    try testing.expect(!mini_blar.isDirectChild("mydir", "other/file.txt"));
+    try testing.expect(!mini_blar.isDirectChild("mydir", "mydir"));
 }
 
 test "xattrs round-trip via JSON" {

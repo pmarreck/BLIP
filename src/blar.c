@@ -772,8 +772,25 @@ static int cmd_verify(int argc, char **argv) {
 
         uint8_t entry_type = 0;
         blip_archive_entry_type(buf, buf_len, i, &entry_type);
-        if (entry_type == 0x07) dir_count++;
-        else file_count++;
+        if (entry_type == 0x07) {
+            dir_count++;
+            /* Also verify Merkle hash for DIR entries */
+            rc = blip_archive_verify_merkle(buf, buf_len, i);
+            if (rc != BLIP_OK) {
+                const char *path = NULL;
+                size_t path_len = 0;
+                blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+                fprintf(stderr, "blar: verify: dir %llu", (unsigned long long)i);
+                if (path) {
+                    fprintf(stderr, " ('%.*s')", (int)path_len, path);
+                }
+                fprintf(stderr, ": Merkle hash mismatch\n");
+                free(buf);
+                return EXIT_VERIFY;
+            }
+        } else {
+            file_count++;
+        }
     }
 
     printf("OK: %llu files, %llu directories verified\n",

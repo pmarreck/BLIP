@@ -101,6 +101,11 @@ int32_t blip_archive_file_content_by_path(const uint8_t *buf, size_t buf_len,
 int32_t blip_archive_file_verify(const uint8_t *buf, size_t buf_len,
                                   uint64_t index);
 
+/* Verify a DIR entry's Merkle hash by recomputing from child FILE checksums.
+ * Returns 0 if valid, BLIP_ERR_HASH_MISMATCH if stale/wrong, negative on error. */
+int32_t blip_archive_verify_merkle(const uint8_t *buf, size_t buf_len,
+                                    uint64_t index);
+
 /* --- Full archive (DIR + metadata) support --- */
 
 typedef struct {

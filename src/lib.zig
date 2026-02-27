@@ -184,7 +184,7 @@ const CArchiveEntry = extern struct {
     owner_len: usize,
     groupname: ?[*]const u8, // NULL = not set
     groupname_len: usize,
-    xh64: [8]u8, // Merkle hash for dirs (pre-computed by caller), ignored for files
+    xh64: [8]u8, // Merkle hash for dirs (auto-computed by createFullArchive, can be zeroed)
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -357,6 +357,23 @@ export fn blip_archive_file_verify(
 ) callconv(.c) i32 {
     const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const ok = reader.verifyFileAt(index) catch |e| return containerErrorCode(e);
+    if (!ok) return -7;
+    return 0;
+}
+
+/// Verify a DIR entry's Merkle hash by recomputing from child FILE checksums.
+/// Returns 0 if valid, -7 if hash mismatch, negative error code on failure.
+export fn blip_archive_verify_merkle(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
+    const ok = reader.verifyMerkleAt(index, page_allocator) catch |e| {
+        if (e == error.OutOfMemory) return -13;
+        const ce: ContainerError = @errorCast(e);
+        return containerErrorCode(ce);
+    };
     if (!ok) return -7;
     return 0;
 }
