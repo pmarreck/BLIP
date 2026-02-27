@@ -234,6 +234,12 @@ int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
 #define BLIP_ERR_INVALID_SIGIL_ORDER -26
 #define BLIP_ERR_MISSING_DECOMP_LEN -27
 
+/* Encryption errors */
+#define BLIP_ERR_AUTH_FAILED       -28
+#define BLIP_ERR_PASSWORD_REQUIRED -29
+#define BLIP_ERR_ENCRYPTION        -30
+#define BLIP_ERR_DECRYPTION        -31
+
 /* Check if a buffer is a compressed LP container (has COMP attribute). */
 bool blip_is_compressed(const uint8_t *buf, size_t buf_len);
 
@@ -251,6 +257,28 @@ int32_t blip_lzma2_compress(const uint8_t *buf, size_t buf_len,
  * Caller must free output buffer with blip_free(). */
 int32_t blip_lzma2_decompress(const uint8_t *buf, size_t buf_len,
                                uint8_t **out_buf, size_t *out_len);
+
+/* --- Encryption --- */
+
+/* Check if a buffer is an encrypted LP container (has ENC attribute). */
+bool blip_is_encrypted(const uint8_t *buf, size_t buf_len);
+
+/* Encrypt a serialized container.
+ * enc_id: 1=AES-256-GCM, 2=ChaCha20-Poly1305
+ * kdf_id: 1=Argon2id, 2=PBKDF2-SHA256
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_encrypt_container(const uint8_t *buf, size_t buf_len,
+                                const char *password, size_t password_len,
+                                uint8_t enc_id, uint8_t kdf_id,
+                                uint8_t **out_buf, size_t *out_len);
+
+/* Decrypt an encrypted LP container.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_decrypt_container(const uint8_t *buf, size_t buf_len,
+                                const char *password, size_t password_len,
+                                uint8_t **out_buf, size_t *out_len);
 
 #ifdef __cplusplus
 }

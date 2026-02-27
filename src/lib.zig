@@ -122,6 +122,10 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -25 => "missing attribute sigil",
         -26 => "invalid attribute sigil order",
         -27 => "missing decompressed length",
+        -28 => "authentication failed (wrong password or corrupted data)",
+        -29 => "password required for encrypted container",
+        -30 => "encryption failed",
+        -31 => "decryption failed",
         else => "unknown error",
     };
 }
@@ -771,6 +775,81 @@ export fn blip_lzma2_decompress(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Encryption C FFI exports
+// ---------------------------------------------------------------------------
+
+const encryption_mod = blip.encryption;
+const enc_container_mod = mini_blar.container_mod;
+
+/// Check if a buffer is an encrypted LP container (has ENC attribute).
+export fn blip_is_encrypted(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return encryption_mod.isEncrypted(buf[0..buf_len]);
+}
+
+/// Encrypt a serialized container.
+/// enc_id: 1=AES-256-GCM, 2=ChaCha20-Poly1305
+/// kdf_id: 1=Argon2id, 2=PBKDF2-SHA256
+export fn blip_encrypt_container(
+    buf: [*]const u8,
+    buf_len: usize,
+    password: [*]const u8,
+    password_len: usize,
+    enc_id_raw: u8,
+    kdf_id_raw: u8,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const enc_id = std.meta.intToEnum(enc_container_mod.EncryptionId, @as(u7, @truncate(enc_id_raw))) catch return -1;
+    const kdf_id = std.meta.intToEnum(enc_container_mod.KdfId, @as(u7, @truncate(kdf_id_raw))) catch return -1;
+    const result = encryption_mod.encryptContainer(
+        page_allocator,
+        enc_id,
+        kdf_id,
+        buf[0..buf_len],
+        password[0..password_len],
+    ) catch |e| {
+        return encryptionErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Decrypt an encrypted LP container.
+export fn blip_decrypt_container(
+    buf: [*]const u8,
+    buf_len: usize,
+    password: [*]const u8,
+    password_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = encryption_mod.decryptContainer(
+        page_allocator,
+        buf[0..buf_len],
+        password[0..password_len],
+    ) catch |e| {
+        return encryptionErrorCode(e);
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn encryptionErrorCode(err: anytype) i32 {
+    return switch (err) {
+        error.AuthenticationFailed => -28,
+        error.PasswordRequired => -29,
+        error.EncryptionFailed => -30,
+        error.DecryptionFailed => -31,
+        error.OutOfMemory => -13,
+        error.HashMismatch => -7,
+        error.UnsupportedEncryption, error.UnsupportedKdf => -1,
+        else => -99,
+    };
+}
+
 test "lib placeholder" {
     _ = blip;
 }
@@ -1324,4 +1403,82 @@ test "C FFI: blip_peek returns error for invalid path" {
     try std.testing.expectEqual(@as(i32, -15), blip_peek(out_buf, out_len, "[abc", 4, &out_type, &data_ptr, &data_len));
     // Out of bounds
     try std.testing.expectEqual(@as(i32, -8), blip_peek(out_buf, out_len, "[99]", 4, &out_type, &data_ptr, &data_len));
+}
+
+// ---------------------------------------------------------------------------
+// Encryption FFI tests
+// ---------------------------------------------------------------------------
+
+test "C FFI: blip_encrypt_container and blip_decrypt_container round-trip" {
+    const data_bytes = try leaf.serializeData(std.testing.allocator, "FFI encryption test");
+    defer std.testing.allocator.free(data_bytes);
+
+    var encrypted_buf: [*]u8 = undefined;
+    var encrypted_len: usize = 0;
+    const enc_rc = blip_encrypt_container(
+        data_bytes.ptr,
+        data_bytes.len,
+        "test-password",
+        13,
+        1, // aes_256_gcm
+        1, // argon2id
+        &encrypted_buf,
+        &encrypted_len,
+    );
+    try std.testing.expectEqual(@as(i32, 0), enc_rc);
+    defer blip_free(encrypted_buf, encrypted_len);
+
+    var decrypted_buf: [*]u8 = undefined;
+    var decrypted_len: usize = 0;
+    const dec_rc = blip_decrypt_container(
+        encrypted_buf,
+        encrypted_len,
+        "test-password",
+        13,
+        &decrypted_buf,
+        &decrypted_len,
+    );
+    try std.testing.expectEqual(@as(i32, 0), dec_rc);
+    defer blip_free(decrypted_buf, decrypted_len);
+
+    try std.testing.expectEqualSlices(u8, data_bytes, decrypted_buf[0..decrypted_len]);
+}
+
+test "C FFI: blip_is_encrypted detects encrypted containers" {
+    const data_bytes = try leaf.serializeData(std.testing.allocator, "test");
+    defer std.testing.allocator.free(data_bytes);
+
+    try std.testing.expect(!blip_is_encrypted(data_bytes.ptr, data_bytes.len));
+
+    var encrypted_buf: [*]u8 = undefined;
+    var encrypted_len: usize = 0;
+    // Use PBKDF2 (kdf_id=2) for speed in test
+    const rc = blip_encrypt_container(data_bytes.ptr, data_bytes.len, "p", 1, 1, 2, &encrypted_buf, &encrypted_len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer blip_free(encrypted_buf, encrypted_len);
+
+    try std.testing.expect(blip_is_encrypted(encrypted_buf, encrypted_len));
+}
+
+test "C FFI: blip_decrypt_container with wrong password returns auth error" {
+    const data_bytes = try leaf.serializeData(std.testing.allocator, "secret");
+    defer std.testing.allocator.free(data_bytes);
+
+    var encrypted_buf: [*]u8 = undefined;
+    var encrypted_len: usize = 0;
+    // Use PBKDF2 (kdf_id=2) for speed
+    _ = blip_encrypt_container(data_bytes.ptr, data_bytes.len, "correct", 7, 1, 2, &encrypted_buf, &encrypted_len);
+    defer blip_free(encrypted_buf, encrypted_len);
+
+    var decrypted_buf: [*]u8 = undefined;
+    var decrypted_len: usize = 0;
+    const rc = blip_decrypt_container(encrypted_buf, encrypted_len, "wrong", 5, &decrypted_buf, &decrypted_len);
+    try std.testing.expectEqual(@as(i32, -28), rc);
+}
+
+test "C FFI: blip_error_string returns encryption error strings" {
+    try std.testing.expectEqualSlices(u8, "authentication failed (wrong password or corrupted data)", std.mem.span(blip_error_string(-28)));
+    try std.testing.expectEqualSlices(u8, "password required for encrypted container", std.mem.span(blip_error_string(-29)));
+    try std.testing.expectEqualSlices(u8, "encryption failed", std.mem.span(blip_error_string(-30)));
+    try std.testing.expectEqualSlices(u8, "decryption failed", std.mem.span(blip_error_string(-31)));
 }
