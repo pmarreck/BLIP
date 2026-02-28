@@ -840,19 +840,27 @@ static int cmd_to_json_common(const char *prog, int argc, char **argv) {
 
 static void from_json_usage(FILE *out, const char *prog) {
     fprintf(out,
-        "Usage: %s from-json [-o <output>] [<json-file>]\n"
+        "Usage: %s from-json [-o <output>] [-z] [-e [cipher]] [--kdf <name>] [<json-file>]\n"
         "\n"
         "Convert JSON to a BLIP archive.\n"
         "Reads JSON from a file argument or stdin.\n"
         "\n"
         "Options:\n"
-        "  -o <output>   Write archive to specified file (required unless piping)\n"
+        "  -o <output>        Write archive to specified file (required unless piping)\n"
+        "  -z                 Compress with LZMA2\n"
+        "  -e [cipher]        Encrypt (aes = AES-256-GCM [default], chacha = ChaCha20-Poly1305)\n"
+        "  --kdf <name>       KDF for encryption (argon2 [default], pbkdf2)\n"
+        "\n"
+        "Password for encryption is read from BLIP_PASSWORD env var.\n"
+        "If -e is specified but no password is available, a warning is printed and\n"
+        "encryption is skipped.\n"
         "\n"
         "Examples:\n"
         "  %s from-json input.json -o output.blar\n"
         "  cat input.json | %s from-json -o output.blar\n"
-        "  %s to-json a.blar | jq '...' | %s from-json -o b.blar\n",
-        prog, prog, prog, prog, prog);
+        "  %s to-json a.blar | jq '...' | %s from-json -o b.blar\n"
+        "  %s to-json a.blar | %s from-json -z -e -o b.blar\n",
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int cmd_from_json_common(const char *prog, int argc, char **argv) {
@@ -865,6 +873,10 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
 
     const char *output_path = NULL;
     const char *input_file = NULL;
+    bool compress_lzma2 = false;
+    bool do_encrypt = false;
+    uint8_t enc_id = 1;   /* default: AES-256-GCM */
+    uint8_t kdf_id = 1;   /* default: Argon2id */
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -873,6 +885,37 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
                 return EXIT_USAGE;
             }
             output_path = argv[++i];
+        } else if (strcmp(argv[i], "-z") == 0) {
+            compress_lzma2 = true;
+        } else if (strcmp(argv[i], "-e") == 0) {
+            do_encrypt = true;
+            /* Check for optional cipher argument */
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                const char *cipher = argv[i+1];
+                if (strcmp(cipher, "aes") == 0 || strcmp(cipher, "aes-256-gcm") == 0) {
+                    enc_id = 1;
+                    i++; /* consume cipher arg */
+                } else if (strcmp(cipher, "chacha") == 0 || strcmp(cipher, "chacha20") == 0 ||
+                           strcmp(cipher, "chacha20-poly1305") == 0) {
+                    enc_id = 2;
+                    i++; /* consume cipher arg */
+                }
+                /* else: not a cipher name, don't consume it */
+            }
+        } else if (strcmp(argv[i], "--kdf") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: from-json: --kdf requires an argument\n", prog);
+                return EXIT_USAGE;
+            }
+            const char *kdf_name = argv[++i];
+            if (strcmp(kdf_name, "argon2") == 0 || strcmp(kdf_name, "argon2id") == 0) {
+                kdf_id = 1;
+            } else if (strcmp(kdf_name, "pbkdf2") == 0 || strcmp(kdf_name, "pbkdf2-sha256") == 0) {
+                kdf_id = 2;
+            } else {
+                fprintf(stderr, "%s: from-json: unknown KDF '%s' (use 'argon2' or 'pbkdf2')\n", prog, kdf_name);
+                return EXIT_USAGE;
+            }
         } else if (argv[i][0] != '-') {
             if (!input_file)
                 input_file = argv[i];
@@ -919,6 +962,45 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
     if (rc != BLIP_OK) {
         fprintf(stderr, "%s: from-json: %s\n", prog, blip_error_string(rc));
         return EXIT_IO;
+    }
+
+    /* Optionally compress with LZMA2 */
+    if (compress_lzma2) {
+        uint8_t *compressed_buf = NULL;
+        size_t compressed_len = 0;
+        rc = blip_lzma2_compress(archive_buf, archive_len,
+                                  &compressed_buf, &compressed_len);
+        blip_free(archive_buf, archive_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "%s: from-json: compression failed: %s\n",
+                    prog, blip_error_string(rc));
+            return EXIT_IO;
+        }
+        archive_buf = compressed_buf;
+        archive_len = compressed_len;
+    }
+
+    /* Optionally encrypt (outermost layer — after compression) */
+    if (do_encrypt) {
+        const char *password = getenv("BLIP_PASSWORD");
+        if (!password || strlen(password) == 0) {
+            fprintf(stderr, "%s: from-json: warning: -e specified but BLIP_PASSWORD not set; skipping encryption\n", prog);
+        } else {
+            uint8_t *encrypted_buf = NULL;
+            size_t encrypted_len = 0;
+            rc = blip_encrypt_container(archive_buf, archive_len,
+                                         password, strlen(password),
+                                         enc_id, kdf_id,
+                                         &encrypted_buf, &encrypted_len);
+            blip_free(archive_buf, archive_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "%s: from-json: encryption failed: %s\n",
+                        prog, blip_error_string(rc));
+                return EXIT_IO;
+            }
+            archive_buf = encrypted_buf;
+            archive_len = encrypted_len;
+        }
     }
 
     if (!write_file(output_path, archive_buf, archive_len)) {

@@ -457,6 +457,137 @@ else
 fi
 
 # =============================================================================
+# 25. from-json -z produces compressed archive
+# =============================================================================
+
+"$BLAR" to-json "$TMPDIR_TEST/multi.blar" \
+  | "$BLAR" from-json -z -o "$TMPDIR_TEST/compressed.blar"
+# Verify blar list works (read_archive decompresses transparently)
+"$BLAR" list "$TMPDIR_TEST/compressed.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "25a. from-json -z: list works" || fail "25a. from-json -z: list failed"
+
+# Content matches original
+for path in hello.txt second.txt third.txt; do
+  ORIG=$("$BLAR" cat "$TMPDIR_TEST/multi.blar" "$path" 2>/dev/null)
+  COMP=$("$BLAR" cat "$TMPDIR_TEST/compressed.blar" "$path" 2>/dev/null)
+  if [[ "$ORIG" != "$COMP" ]]; then
+    fail "25b. from-json -z: content mismatch for $path"
+  fi
+done
+pass "25b. from-json -z: content matches original"
+
+# Compressed archive should differ from uncompressed (larger header/different bytes)
+if cmp -s "$TMPDIR_TEST/multi.blar" "$TMPDIR_TEST/compressed.blar"; then
+  fail "25c. from-json -z: compressed archive identical to uncompressed (compression not applied)"
+else
+  pass "25c. from-json -z: compressed archive differs from uncompressed"
+fi
+
+# =============================================================================
+# 26. from-json -e produces encrypted archive
+# =============================================================================
+
+BLIP_PASSWORD=testpass "$BLAR" to-json "$TMPDIR_TEST/multi.blar" \
+  | BLIP_PASSWORD=testpass "$BLAR" from-json -e -o "$TMPDIR_TEST/encrypted.blar"
+
+# List without password should fail
+if "$BLAR" list "$TMPDIR_TEST/encrypted.blar" > /dev/null 2>&1; then
+  fail "26a. from-json -e: list without password should fail"
+else
+  pass "26a. from-json -e: list without password fails correctly"
+fi
+
+# List with password should succeed
+BLIP_PASSWORD=testpass "$BLAR" list "$TMPDIR_TEST/encrypted.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "26b. from-json -e: list with password works" || fail "26b. from-json -e: list with password failed"
+
+# Content matches original
+for path in hello.txt second.txt third.txt; do
+  ORIG=$("$BLAR" cat "$TMPDIR_TEST/multi.blar" "$path" 2>/dev/null)
+  ENC=$(BLIP_PASSWORD=testpass "$BLAR" cat "$TMPDIR_TEST/encrypted.blar" "$path" 2>/dev/null)
+  if [[ "$ORIG" != "$ENC" ]]; then
+    fail "26c. from-json -e: content mismatch for $path"
+  fi
+done
+pass "26c. from-json -e: content matches original"
+
+# =============================================================================
+# 27. from-json -z -e produces compressed+encrypted archive
+# =============================================================================
+
+BLIP_PASSWORD=testpass "$BLAR" to-json "$TMPDIR_TEST/multi.blar" \
+  | BLIP_PASSWORD=testpass "$BLAR" from-json -z -e -o "$TMPDIR_TEST/both.blar"
+
+# List with password should succeed
+BLIP_PASSWORD=testpass "$BLAR" list "$TMPDIR_TEST/both.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "27a. from-json -z -e: list with password works" || fail "27a. from-json -z -e: list with password failed"
+
+# Content matches original
+for path in hello.txt second.txt third.txt; do
+  ORIG=$("$BLAR" cat "$TMPDIR_TEST/multi.blar" "$path" 2>/dev/null)
+  BOTH=$(BLIP_PASSWORD=testpass "$BLAR" cat "$TMPDIR_TEST/both.blar" "$path" 2>/dev/null)
+  if [[ "$ORIG" != "$BOTH" ]]; then
+    fail "27b. from-json -z -e: content mismatch for $path"
+  fi
+done
+pass "27b. from-json -z -e: content matches original"
+
+# =============================================================================
+# 28. from-json -e chacha with --kdf pbkdf2
+# =============================================================================
+
+"$BLAR" to-json "$TMPDIR_TEST/single.blar" > "$TMPDIR_TEST/for_chacha.json"
+BLIP_PASSWORD=testpass "$BLAR" from-json -e chacha --kdf pbkdf2 -o "$TMPDIR_TEST/chacha.blar" "$TMPDIR_TEST/for_chacha.json"
+
+BLIP_PASSWORD=testpass "$BLAR" list "$TMPDIR_TEST/chacha.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "28. from-json -e chacha --kdf pbkdf2 works" || fail "28. from-json -e chacha --kdf pbkdf2 failed"
+
+# =============================================================================
+# 29. from-json -e without BLIP_PASSWORD warns and skips encryption
+# =============================================================================
+
+unset BLIP_PASSWORD
+"$BLAR" from-json -e -o "$TMPDIR_TEST/no_pw.blar" "$TMPDIR_TEST/for_chacha.json" 2>"$TMPDIR_TEST/no_pw_err.txt"
+
+# Verify stderr contains warning about BLIP_PASSWORD
+if grep -qi "warning" "$TMPDIR_TEST/no_pw_err.txt" && grep -qi "BLIP_PASSWORD" "$TMPDIR_TEST/no_pw_err.txt"; then
+  pass "29a. from-json -e no password: warning printed"
+else
+  fail "29a. from-json -e no password: expected warning about BLIP_PASSWORD, got: $(cat "$TMPDIR_TEST/no_pw_err.txt")"
+fi
+
+# Output should NOT be encrypted (list works without password)
+"$BLAR" list "$TMPDIR_TEST/no_pw.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "29b. from-json -e no password: output is not encrypted" || fail "29b. from-json -e no password: output should be readable without password"
+
+# =============================================================================
+# 30. Full round-trip: create -z -e → to-json → from-json -z -e → verify content
+# =============================================================================
+
+BLIP_PASSWORD=roundtrip "$BLAR" create -z -e -o "$TMPDIR_TEST/full_rt_orig.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/second.txt" 2>/dev/null
+
+# to-json decrypts+decompresses transparently
+BLIP_PASSWORD=roundtrip "$BLAR" to-json "$TMPDIR_TEST/full_rt_orig.blar" \
+  | BLIP_PASSWORD=roundtrip "$BLAR" from-json -z -e -o "$TMPDIR_TEST/full_rt_new.blar"
+
+# Verify the new archive with password
+BLIP_PASSWORD=roundtrip "$BLAR" list "$TMPDIR_TEST/full_rt_new.blar" > /dev/null 2>&1
+[[ $? -eq 0 ]] && pass "30a. full round-trip: list with password works" || fail "30a. full round-trip: list failed"
+
+# Content matches
+ORIG=$(BLIP_PASSWORD=roundtrip "$BLAR" cat "$TMPDIR_TEST/full_rt_orig.blar" "hello.txt" 2>/dev/null)
+NEW=$(BLIP_PASSWORD=roundtrip "$BLAR" cat "$TMPDIR_TEST/full_rt_new.blar" "hello.txt" 2>/dev/null)
+[[ "$ORIG" == "$NEW" ]] && pass "30b. full round-trip: content matches" || fail "30b. full round-trip: content mismatch: '$ORIG' vs '$NEW'"
+
+# =============================================================================
+# 31. from-json --help shows -z and -e flags
+# =============================================================================
+
+OUT=$("$BLAR" from-json --help 2>&1)
+[[ "$OUT" == *"-z"* && "$OUT" == *"-e"* && "$OUT" == *"--kdf"* ]] \
+  && pass "31. from-json --help shows -z, -e, --kdf" || fail "31. from-json --help missing flags: got '$OUT'"
+
+# =============================================================================
 # Results
 # =============================================================================
 

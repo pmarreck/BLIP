@@ -152,6 +152,10 @@ blar to-json a.blar | jq '(.entries[] | select(.path=="hello.txt")).content = "n
 # Add a file via jq
 blar to-json a.blar | jq '.entries += [{"type":"file","path":"new.txt","content":"added"}]' | blar from-json -o b.blar
 
+# Re-apply compression and/or encryption when creating archive from JSON
+blar to-json a.blar | blar from-json -z -o compressed.blar
+BLIP_PASSWORD=secret blar to-json a.blar | BLIP_PASSWORD=secret blar from-json -z -e -o b.blar
+
 # Create an encrypted archive (AES-256-GCM + Argon2id by default)
 blar create -e -o secret.blar myproject/
 
@@ -318,13 +322,17 @@ blar to-json a.blar \
 blar to-json a.blar \
   | jq '(.entries[] | select(.path=="script.sh")).mode = "0755"' \
   | blar from-json -o b.blar
+
+# Re-apply compression and/or encryption
+BLIP_PASSWORD=secret blar to-json encrypted.blar \
+  | BLIP_PASSWORD=secret blar from-json -z -e -o b.blar
 ```
 
 Binary content is encoded using printable-binary encoding in JSON strings, which preserves all 256 byte values safely within JSON. All hashes, offsets, and index tables are recomputed automatically on `from-json`.
 
 **Byte-identical round-tripping:** Because BLIP uses deterministic encoding (canonical BLIP integers, sorted keys, sorted paths), converting an archive to JSON and back produces the *exact same bytes* — not just equivalent content, but identical at the binary level. This means you can convert an archive containing executables, images, or any binary data to JSON text, transmit it through any text channel (email, chat, clipboard, LLM prompt, HTTP API, git commit), convert it back, and get a byte-for-byte identical archive. This property is tested at both the Zig unit level (`expectEqualSlices` on raw buffers) and the shell integration level (`cmp -s` on archive files) across multi-file, single-file, binary, directory, and empty-file archives.
 
-**Caveat for compressed/encrypted archives:** The JSON representation captures logical content, not LP envelope configuration. `to-json` decompresses and decrypts transparently, so `from-json` produces an uncompressed, unencrypted archive. The semantic content is losslessly preserved, but byte-identity requires the original archive to be uncompressed and unencrypted. (Encryption byte-identity is impossible by design — fresh salt and nonce are required for security.)
+**Caveat for compressed/encrypted archives:** The JSON representation captures logical content, not LP envelope configuration. `to-json` decompresses and decrypts transparently, so plain `from-json` produces an uncompressed, unencrypted archive. Use `from-json -z` to re-apply LZMA2 compression and `from-json -e` to re-apply encryption (password via `BLIP_PASSWORD` env var). The semantic content is always losslessly preserved; byte-identity holds for uncompressed/unencrypted archives. (Encryption byte-identity is impossible by design — fresh salt and nonce are required for security.)
 
 `miniblar to-json` and `miniblar from-json` work identically.
 
