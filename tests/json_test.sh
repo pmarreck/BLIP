@@ -399,6 +399,64 @@ XATTR_RT=$("$BLAR" to-json "$TMPDIR_TEST/xattr.blar" | jq -r '.entries[0].xattrs
 [[ $? -eq 0 ]] && pass "23. final verify passes" || fail "23. final verify failed"
 
 # =============================================================================
+# 24. Byte-identical round-trip: archive → to-json → from-json → cmp
+# =============================================================================
+
+# Multi-file archive: bytes must be identical after JSON round-trip
+"$BLAR" to-json "$TMPDIR_TEST/multi.blar" \
+  | "$BLAR" from-json -o "$TMPDIR_TEST/multi_cmp.blar"
+if cmp -s "$TMPDIR_TEST/multi.blar" "$TMPDIR_TEST/multi_cmp.blar"; then
+  pass "24a. byte-identical round-trip (multi-file)"
+else
+  fail "24a. multi-file archives differ after JSON round-trip"
+fi
+
+# Single-file archive
+"$BLAR" to-json "$TMPDIR_TEST/single.blar" \
+  | "$BLAR" from-json -o "$TMPDIR_TEST/single_cmp.blar"
+if cmp -s "$TMPDIR_TEST/single.blar" "$TMPDIR_TEST/single_cmp.blar"; then
+  pass "24b. byte-identical round-trip (single-file)"
+else
+  fail "24b. single-file archives differ after JSON round-trip"
+fi
+
+# Binary content archive
+"$BLAR" to-json "$TMPDIR_TEST/binary.blar" \
+  | "$BLAR" from-json -o "$TMPDIR_TEST/binary_cmp.blar"
+if cmp -s "$TMPDIR_TEST/binary.blar" "$TMPDIR_TEST/binary_cmp.blar"; then
+  pass "24c. byte-identical round-trip (binary content)"
+else
+  fail "24c. binary archives differ after JSON round-trip"
+fi
+
+# Directory archive
+"$BLAR" to-json "$TMPDIR_TEST/dirs.blar" \
+  | "$BLAR" from-json -o "$TMPDIR_TEST/dirs_cmp.blar"
+if cmp -s "$TMPDIR_TEST/dirs.blar" "$TMPDIR_TEST/dirs_cmp.blar"; then
+  pass "24d. byte-identical round-trip (directory archive)"
+else
+  fail "24d. directory archives differ after JSON round-trip"
+fi
+
+# Empty file archive
+"$BLAR" to-json "$TMPDIR_TEST/empty.blar" \
+  | "$BLAR" from-json -o "$TMPDIR_TEST/empty_cmp.blar"
+if cmp -s "$TMPDIR_TEST/empty.blar" "$TMPDIR_TEST/empty_cmp.blar"; then
+  pass "24e. byte-identical round-trip (empty file)"
+else
+  fail "24e. empty file archives differ after JSON round-trip"
+fi
+
+# Miniblar archive
+"$MINIBLAR" to-json "$TMPDIR_TEST/mini.mblar" \
+  | "$MINIBLAR" from-json -o "$TMPDIR_TEST/mini_cmp.mblar"
+if cmp -s "$TMPDIR_TEST/mini.mblar" "$TMPDIR_TEST/mini_cmp.mblar"; then
+  pass "24f. byte-identical round-trip (miniblar)"
+else
+  fail "24f. miniblar archives differ after JSON round-trip"
+fi
+
+# =============================================================================
 # Results
 # =============================================================================
 

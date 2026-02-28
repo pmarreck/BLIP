@@ -641,14 +641,8 @@ test "full archive round-trip: create → toJson → fromJson → byte-identical
     const archive2 = try jsonToArchive(allocator, json);
     defer allocator.free(archive2);
 
-    // Verify the round-tripped archive is valid
-    const reader = try mini_blar.ArchiveReader.init(archive2);
-    try testing.expect(try reader.verifyChecksum());
-    try testing.expectEqual(@as(u64, 2), try reader.entryCount());
-
-    // Content should match
-    try testing.expectEqualSlices(u8, "Hello, world!\n", try reader.fileContentAt(0));
-    try testing.expectEqualSlices(u8, "binary data", try reader.fileContentAt(1));
+    // Archives MUST be byte-identical (deterministic encoding)
+    try testing.expectEqualSlices(u8, archive1, archive2);
 }
 
 test "binary content: pb-encodes in JSON, pb-decodes back correctly" {
