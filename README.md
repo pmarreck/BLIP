@@ -401,6 +401,27 @@ The 16-byte AEAD authentication tag is appended to the ciphertext within the VAL
 
 **Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in BLAKE3-128 integrity verification catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. Built-in LZMA2 compression and AEAD encryption via the LP attribute system keep archives compact and secure without external tooling. And ~3x lower per-file overhead matters when archiving many small files.
 
+### Compression granularity
+
+Because LP attributes (including COMP) apply to any container, BLIP supports a full spectrum of compression strategies — from per-file to solid — without any special mechanism:
+
+- **Per-file:** COMP on each FILE or DATA container. Preserves O(1) random access to every file. Worst compression ratio.
+- **Solid (whole-archive):** COMP on the body ARRAY. Best ratio for similar files, but requires decompressing everything to access any single file.
+- **Grouped:** Organize files into sub-arrays by content type, compress each group independently. O(1) access to the right group via a DICT index, solid compression within each group, and different algorithms or no compression per group (e.g., skip compression for video files that are already compressed).
+
+A grouped layout might look like:
+
+```
+ARRAY (archive)
+├── DATA (magic)
+└── DICT (body, keyed by content type)
+    ├── "image/png"  → ARRAY [FILE, FILE, ...]   ← COMP=lzma2
+    ├── "text/plain"  → ARRAY [FILE, FILE, ...]   ← COMP=lzma2
+    └── "video/mp4"  → ARRAY [FILE, FILE, ...]   ← no COMP
+```
+
+This falls out naturally from recursive typed containers with per-container attributes — no special "solid block" feature is needed. The specific grouping semantics (key naming, content-type detection, etc.) are application-defined; interoperating tools would need to agree on a convention.
+
 ## miniblar: Minimal BLIP Archive Tool
 
 `miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, ownership). No directory entries — files only. The result is a compact bag of files with full metadata preservation. Entry order is caller-controlled (the CLI sorts by path; the Zig API preserves the order given).

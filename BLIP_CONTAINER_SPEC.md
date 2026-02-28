@@ -99,6 +99,14 @@ When the COMP attribute is present, the VAL payload is compressed. The DECOMP_LE
 | 3 | LZ4 |
 | 4 | zstd |
 
+**Compression granularity:** Because COMP is an LP attribute on any container, implementations can choose where to apply compression:
+
+- **Per-file** (COMP on each FILE/DATA) — preserves O(1) random access to individual files.
+- **Solid** (COMP on a parent ARRAY) — compresses all children as a single stream for better ratios, at the cost of requiring full decompression to access any child.
+- **Grouped** — organize files into sub-arrays (e.g., by content type), compress each group independently. This enables solid compression within groups while preserving O(1) access at the group level, and allows different algorithms or no compression per group.
+
+The specific grouping conventions (key naming, content-type detection, etc.) are application-defined. The BLIP format provides the mechanism; interoperating tools MUST agree on the structure.
+
 ### Checksum (CSUM Attribute)
 
 When the CSUM attribute is present, a checksum is appended to the end of the VAL payload.
