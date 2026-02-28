@@ -823,6 +823,9 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 | Ecosystem | Universal | New (requires BLIP decoder) |
 | Compression | External (tar.gz, tar.zst) | Built-in LZMA2 via COMP attribute; per-container granularity |
 | Encryption | None built-in | Built-in AEAD (AES-256-GCM / ChaCha20-Poly1305) via ENC attribute |
+| Introspection | `tar tf` lists files | `peek` navigates every container, key, and hash with path expressions |
+| JSON interchange | No equivalent | `to-json`/`from-json` round-trip; binary encoded via printable-binary |
+| Text transport | Binary-only; requires base64 | Printable-binary encoding: copy-pasteable through any text channel |
 
 ## Security Considerations
 
