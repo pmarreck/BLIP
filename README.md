@@ -324,6 +324,8 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 
 **Byte-identical round-tripping:** Because BLIP uses deterministic encoding (canonical BLIP integers, sorted keys, sorted paths), converting an archive to JSON and back produces the *exact same bytes* — not just equivalent content, but identical at the binary level. This means you can convert an archive containing executables, images, or any binary data to JSON text, transmit it through any text channel (email, chat, clipboard, LLM prompt, HTTP API, git commit), convert it back, and get a byte-for-byte identical archive. This property is tested at both the Zig unit level (`expectEqualSlices` on raw buffers) and the shell integration level (`cmp -s` on archive files) across multi-file, single-file, binary, directory, and empty-file archives.
 
+**Caveat for compressed/encrypted archives:** The JSON representation captures logical content, not LP envelope configuration. `to-json` decompresses and decrypts transparently, so `from-json` produces an uncompressed, unencrypted archive. The semantic content is losslessly preserved, but byte-identity requires the original archive to be uncompressed and unencrypted. (Encryption byte-identity is impossible by design — fresh salt and nonce are required for security.)
+
 `miniblar to-json` and `miniblar from-json` work identically.
 
 ### Encryption
