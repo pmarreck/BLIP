@@ -72,10 +72,35 @@
 - [x] All existing tests still pass (158 tests across 6 suites)
 - [x] README documentation with jq pipeline examples
 
+## v2 LP Container Format Migration (Completed 2026-02-27)
+- [x] LP (Length-Payload) envelope replaces old TLV structure
+- [x] Sorted attribute sigils: TYPE, COMP, DECOMP_LEN, CSUM, ENC, SIG, VAL
+- [x] container_types.zig — AttributeSigil, ContainerTypeId, CompressionId, ChecksumId, EncryptionId, KdfId enums
+- [x] container.zig — computeLPLength, writeLPHeader, parseLPHeader
+- [x] Per-container LZMA2 compression via COMP attribute (blar create -z)
+- [x] Per-container checksums via CSUM attribute (CRC32, xxHash64, BLAKE3-128)
+- [x] BLAKE3-128 outer archive integrity + xxHash64 inner containers
+- [x] Per-file xxHash64 checksums on FILE/DATA/DIR containers
+- [x] Merkle hash auto-computation in createFullArchive
+- [x] All existing CLI tools updated for v2 LP format
+- [x] Integration tests: 25 LZMA2 tests + 21 binary format tests (all passing)
+
+## Encryption (Completed 2026-02-28)
+- [x] EncryptionId (AES-256-GCM, ChaCha20-Poly1305) + KdfId (Argon2id, PBKDF2-SHA256) enums
+- [x] ENC attribute sigil (0x13) in LP envelope sort order
+- [x] encryption.zig — deriveKey, encrypt, decrypt, encryptContainer, decryptContainer, isEncrypted
+- [x] AES-256-GCM + ChaCha20-Poly1305 AEAD ciphers via Zig stdlib
+- [x] Argon2id (64 MiB, t=3, p=4) + PBKDF2-SHA256 (600k rounds) key derivation
+- [x] C FFI: blip_is_encrypted, blip_encrypt_container, blip_decrypt_container
+- [x] blar CLI: `blar create -e` (encrypt), `--kdf` (KDF selection), auto-decrypt on read
+- [x] Password from BLIP_PASSWORD env var or interactive prompt on stderr
+- [x] Layering: compress → encrypt → checksum (write), checksum → decrypt → decompress (read)
+- [x] Integration tests: 14 encryption tests (all passing)
+- [x] All existing tests still pass (236 shell tests + all Zig unit tests)
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
 - [ ] Cross-language implementations (C, Rust, etc.)
-- [ ] Compression wrapper container type
 - [ ] Binary data manipulation DSL — extend peek/poke into a full structural editor (insert/delete array elements, add/remove dict keys, splice content, move entries, etc.). Note: JSON interchange (`to-json | jq | from-json`) already covers most high-level manipulation use cases.
 - [ ] Segmentation container type — a new top-level container for splitting large archives into fixed-size segments (e.g. for transport over size-limited channels, span across volumes, or resumable transfers)

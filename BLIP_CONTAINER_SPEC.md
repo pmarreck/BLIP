@@ -3,7 +3,7 @@
 A recursive, typed, self-indexed binary container format built on [BLIP encoding](BLIP_SPEC.md). Designed as a compact, deterministic, integrity-verified alternative to tar and similar archive formats.
 
 **Author:** Peter Marreck
-**Version:** 1.2 (2026-02-24)
+**Version:** 2.0 (2026-02-28)
 **Depends on:** BLIP Spec v1.1
 
 ## Overview
@@ -43,7 +43,128 @@ fn compute_total(V_size: u64) -> u64:
             return total        // converged
 ```
 
-## Type Assignments
+## LP Envelope (v2)
+
+As of v2, all containers use the LP (Length-Payload) envelope format. The type sentinel is no longer inline — instead, container type and other properties are expressed as **sorted attributes** within the payload.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Length:  BLIP(total_length)                                  │
+│ Attributes (sorted by sigil value):                          │
+│   0x81 0x01 BLIP(type_id)            -- TYPE (required)     │
+│   0x81 0x10 BLIP(comp_id)            -- COMP (optional)     │
+│   0x81 0x11 BLIP(decomp_len)         -- DECOMP_LEN (opt)   │
+│   0x81 0x12 BLIP(csum_id)            -- CSUM (optional)     │
+│   0x81 0x13 ...                      -- ENC (optional)      │
+│   0x81 0x20 ...                      -- SIG (future)        │
+│   0x81 0x7F                          -- VAL (required)      │
+│ Payload:  type-specific data + [checksum]                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Each attribute is a 2-byte sentinel (`0x81` + sigil byte) followed by attribute-specific data. Attributes MUST be sorted by sigil value within a container. TYPE is always first; VAL is always last.
+
+### Attribute Sigils
+
+| Sigil | Hex | Name | Description |
+|-------|-----|------|-------------|
+| `0x01` | `0x81 0x01` | TYPE | Container type ID (required) |
+| `0x10` | `0x81 0x10` | COMP | Compression algorithm ID |
+| `0x11` | `0x81 0x11` | DECOMP_LEN | Decompressed payload length (required when COMP present) |
+| `0x12` | `0x81 0x12` | CSUM | Checksum algorithm ID |
+| `0x13` | `0x81 0x13` | ENC | Encryption algorithm, KDF, salt, nonce |
+| `0x20` | `0x81 0x20` | SIG | Digital signature (reserved, future) |
+| `0x7F` | `0x81 0x7F` | VAL | Value/payload marker (required) |
+
+### Container Type IDs
+
+| ID | Name | Description |
+|----|------|-------------|
+| 1 | ARRAY | Ordered sequence of containers |
+| 2 | DICT | Sorted key-value pairs |
+| 3 | UTF8 | UTF-8 string |
+| 4 | DATA | Checksummed binary data |
+| 5 | FILE | File container (ARRAY layout: metadata + content) |
+| 6 | MAP | Unsorted key-value pairs (insertion order) |
+| 7 | DIR | Directory container (sorted 2-char keys) |
+
+### Compression (COMP Attribute)
+
+When the COMP attribute is present, the VAL payload is compressed. The DECOMP_LEN attribute MUST also be present to specify the decompressed size.
+
+| ID | Algorithm |
+|----|-----------|
+| 1 | LZMA2 |
+| 2 | bzip2 |
+| 3 | LZ4 |
+| 4 | zstd |
+
+### Checksum (CSUM Attribute)
+
+When the CSUM attribute is present, a checksum is appended to the end of the VAL payload.
+
+| ID | Algorithm | Length |
+|----|-----------|--------|
+| 1 | CRC-32 | 4 bytes |
+| 2 | xxHash64 | 8 bytes |
+| 3 | BLAKE3-128 | 16 bytes |
+
+### Encryption (ENC Attribute)
+
+The ENC attribute provides per-container AEAD encryption with password-based key derivation.
+
+**ENC attribute layout:**
+
+```
+0x81 0x13  BLIP(enc_id)  BLIP(kdf_id)  <16-byte salt>  <12-byte nonce>
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Sentinel | 2 bytes | `0x81 0x13` |
+| enc_id | 1+ bytes | BLIP-encoded encryption algorithm ID |
+| kdf_id | 1+ bytes | BLIP-encoded key derivation function ID |
+| Salt | 16 bytes | Random salt for KDF (CSPRNG) |
+| Nonce | 12 bytes | Random nonce for AEAD cipher (CSPRNG) |
+
+**Encryption algorithm IDs:**
+
+| ID | Algorithm | Key size | Nonce | Auth tag |
+|----|-----------|----------|-------|----------|
+| 1 | AES-256-GCM | 256 bits | 12 bytes | 16 bytes |
+| 2 | ChaCha20-Poly1305 | 256 bits | 12 bytes | 16 bytes |
+
+**Key derivation function IDs:**
+
+| ID | Algorithm | Parameters |
+|----|-----------|------------|
+| 1 | Argon2id | m=65536 (64 MiB), t=3, p=4, output=32 bytes |
+| 2 | PBKDF2-SHA256 | 600,000 iterations, output=32 bytes |
+
+KDF parameters are fixed per ID. New parameter sets require new KDF IDs.
+
+**Encrypted payload layout:**
+
+The AEAD ciphertext replaces the plaintext in the VAL payload, with the 16-byte authentication tag appended:
+
+```
+0x81 0x7F  <ciphertext>  <16-byte auth tag>  [checksum]
+```
+
+**Attribute interaction order:**
+- **Serialization (write):** compress → encrypt → checksum. The plaintext is compressed first (if COMP present), then the compressed bytes are encrypted, and finally the ciphertext + auth tag are checksummed (if CSUM present).
+- **Deserialization (read):** verify checksum → decrypt → decompress. The checksum covers the ciphertext, providing tamper detection even before decryption.
+
+**Total encryption overhead:** ~32 bytes in attributes (2 sentinel + 1 enc_id + 1 kdf_id + 16 salt + 12 nonce) + 16 bytes auth tag in payload = ~48 bytes.
+
+**Error cases:**
+- Wrong password → AEAD authentication tag verification fails → `AuthenticationFailed`
+- Truncated ciphertext → length check fails → `BufferTooSmall`
+- Missing password when ENC attribute detected → `PasswordRequired`
+
+## Type Assignments (Legacy)
+
+> **Note:** The type sentinel assignments below are from the v1 TLV format. In v2 LP format, container types are expressed via the TYPE attribute (see §LP Envelope above). The container semantics (ARRAY, DICT, FILE, etc.) remain the same — only the envelope encoding changed.
 
 BLIP sentinels (0x81 0x00 through 0x81 0x7F) serve as type tags. The sentinel 0x81 0x00 is reserved at the BLIP level as PAD_END (see BLIP Spec §Sentinel Values) and is NOT available as a container type.
 
@@ -692,7 +813,8 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 | Platform encoding | ASCII (POSIX) or UTF-8 (pax) | UTF-8 only |
 | Typed values | No (everything is byte ranges) | Yes (UTF8, RAW, ARRAY, DICT, MAP, FILE, DIR, DATA) |
 | Ecosystem | Universal | New (requires BLIP decoder) |
-| Compression | External (tar.gz, tar.zst) | External (same — wrap in compression) |
+| Compression | External (tar.gz, tar.zst) | Built-in LZMA2 via COMP attribute; per-container granularity |
+| Encryption | None built-in | Built-in AEAD (AES-256-GCM / ChaCha20-Poly1305) via ENC attribute |
 
 ## Security Considerations
 
@@ -704,13 +826,17 @@ Compare to tar:       200 × 1024 = 200 KB (2%)
 
 4. **Duplicate keys:** Dictionary, Map, and Directory containers MUST NOT have duplicate keys. Parsers SHOULD reject duplicates. File containers' metadata DICT must also not have duplicate keys.
 
-5. **Hash verification:** The xxHash64 at the end of arrays and dictionaries provides integrity checking, not cryptographic authentication. It detects accidental corruption but not adversarial tampering. For cryptographic integrity, layer a signature over the archive.
+5. **Hash verification:** The xxHash64 at the end of arrays and dictionaries provides integrity checking, not cryptographic authentication. It detects accidental corruption but not adversarial tampering. For cryptographic authentication, use the ENC attribute which provides AEAD (authenticated encryption with associated data).
 
 6. **Padded BLIP overflow:** If a parser encounters a padded BLIP with I=1 (indirect), it MUST validate that the target offset falls within the container bounds before following it. Malicious inputs could set indirect offsets pointing outside the container.
 
+7. **Encryption:** The ENC attribute provides confidentiality and authenticity via AEAD ciphers. The AEAD authentication tag guarantees that ciphertext has not been tampered with. However, the LP envelope attributes (TYPE, COMP, CSUM, ENC metadata) are stored in cleartext — an observer can see that a container is encrypted and which algorithms are used, but cannot read the payload. KDF parameters (Argon2id: 64 MiB memory, 3 iterations; PBKDF2: 600k iterations) are chosen to resist offline brute-force attacks. Implementations MUST use a cryptographically secure random number generator for salt and nonce generation. Nonce reuse with the same key is catastrophic for AES-GCM security — random 96-bit nonces provide adequate collision resistance for typical usage volumes.
+
+8. **Password handling:** Passwords SHOULD be read from environment variables or interactive prompts (with echo disabled), never from command-line arguments (which may be visible in process listings). Implementations SHOULD clear password memory after key derivation.
+
 ## Open Questions
 
-1. **Compression:** Should the format define a standard compression wrapper (e.g., a COMPRESSED container type that wraps another container with zstd/deflate)? Or is external compression (like `archive.blip.zst`) sufficient?
+(None currently — compression and encryption are now addressed via LP attributes.)
 
 ## License
 

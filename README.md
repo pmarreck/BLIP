@@ -83,7 +83,7 @@ nix develop -c zig build bench -Doptimize=ReleaseFast
 
 BLIP also defines a recursive binary container format for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
 
-Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8. Each container uses the LP (Length-Payload) envelope: `[BLIP(total_length)] [sorted attributes] [VAL payload + checksum]`. Attributes include TYPE (container type ID), COMP (compression algorithm), DECOMP_LEN (decompressed length), CSUM (checksum algorithm), and SIG (digital signature). Features include end-of-container index tables for O(1) random access, BLAKE3-128 integrity at the archive level with xxHash64 for inner containers, Merkle hash trees for directories, built-in LZMA2 compression, and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming. All metadata uses compact 2-character key names.
+Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8. Each container uses the LP (Length-Payload) envelope: `[BLIP(total_length)] [sorted attributes] [VAL payload + checksum]`. Attributes include TYPE (container type ID), COMP (compression algorithm), DECOMP_LEN (decompressed length), CSUM (checksum algorithm), ENC (encryption algorithm + KDF + salt + nonce), and SIG (digital signature). Features include end-of-container index tables for O(1) random access, BLAKE3-128 integrity at the archive level with xxHash64 for inner containers, Merkle hash trees for directories, built-in LZMA2 compression, per-container AEAD encryption (AES-256-GCM or ChaCha20-Poly1305 with Argon2id or PBKDF2-SHA256 key derivation), and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming. All metadata uses compact 2-character key names.
 
 ## C FFI
 
@@ -151,6 +151,23 @@ blar to-json a.blar | jq '(.entries[] | select(.path=="hello.txt")).content = "n
 
 # Add a file via jq
 blar to-json a.blar | jq '.entries += [{"type":"file","path":"new.txt","content":"added"}]' | blar from-json -o b.blar
+
+# Create an encrypted archive (AES-256-GCM + Argon2id by default)
+blar create -e -o secret.blar myproject/
+
+# Encrypt with ChaCha20-Poly1305
+blar create -e chacha -o secret.blar myproject/
+
+# Encrypt with PBKDF2-SHA256 instead of Argon2id
+blar create -e --kdf pbkdf2 -o secret.blar myproject/
+
+# Compress + encrypt (compression applied first, then encryption)
+blar create -z -e -o secret.blar myproject/
+
+# Decrypt automatically on read (prompts for password if BLIP_PASSWORD not set)
+BLIP_PASSWORD=mysecret blar list secret.blar
+BLIP_PASSWORD=mysecret blar extract secret.blar -C output_dir/
+BLIP_PASSWORD=mysecret blar verify secret.blar
 ```
 
 ### Tar-style shortcuts (hyphen optional)
@@ -307,6 +324,60 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 
 `miniblar to-json` and `miniblar from-json` work identically.
 
+### Encryption
+
+BLIP archives support per-container AEAD encryption as an LP attribute. Encryption is applied after compression and before checksumming, so the on-disk layering is: compressed plaintext → encrypted ciphertext → checksum.
+
+**Ciphers:**
+- **AES-256-GCM** (default) — NIST standard, hardware-accelerated on most CPUs
+- **ChaCha20-Poly1305** — Software-friendly, constant-time on all platforms
+
+**Key derivation:**
+- **Argon2id** (default) — Memory-hard KDF (64 MiB, 3 iterations, parallelism 4), resistant to GPU/ASIC attacks
+- **PBKDF2-SHA256** — Portable fallback (600,000 iterations), widely supported
+
+**Usage:**
+
+```bash
+# Encrypt with defaults (AES-256-GCM + Argon2id)
+blar create -e -o secret.blar myproject/
+
+# Specify cipher
+blar create -e chacha -o secret.blar myproject/
+
+# Specify KDF
+blar create -e --kdf pbkdf2 -o secret.blar myproject/
+
+# Compress + encrypt
+blar create -z -e -o secret.blar myproject/
+
+# Decrypt on read (password from env var)
+BLIP_PASSWORD=mysecret blar list secret.blar
+
+# Decrypt on read (interactive prompt on stderr)
+blar list secret.blar
+# Enter password: ********
+```
+
+**On-disk layout (ENC attribute in LP envelope):**
+
+```
+BLIP(total_length)
+0x81 0x01 BLIP(type_id)                              -- TYPE
+0x81 0x10 BLIP(comp_id)                              -- COMP (if compressed)
+0x81 0x11 BLIP(decomp_len)                           -- DECOMP_LEN (if compressed)
+0x81 0x12 BLIP(csum_id)                              -- CSUM (if checksummed)
+0x81 0x13 BLIP(enc_id) BLIP(kdf_id) <16 salt> <12 nonce>  -- ENC
+0x81 0x7F                                            -- VAL
+<encrypted_payload> <16 auth_tag> [checksum]
+```
+
+The 16-byte AEAD authentication tag is appended to the ciphertext within the VAL payload. Total encryption overhead: ~32 bytes in attributes + 16 bytes auth tag. A wrong password produces an `AuthenticationFailed` error via the AEAD tag check — there is no ambiguity about whether decryption succeeded.
+
+**Attribute interaction order:**
+- Write: compress → encrypt → checksum
+- Read: verify checksum → decrypt → decompress
+
 ## BLIP Archive (blar) vs tar
 
 | | BLIP Archive (`blar`) | `tar` (POSIX/GNU/BSD) |
@@ -323,10 +394,12 @@ Binary content is encoded using printable-binary encoding in JSON strings, which
 | **Ecosystem** | New — requires a BLIP-aware tool | Universal — every Unix system has tar; decades of tooling, documentation, and interoperability |
 | **Specification** | Single spec, one canonical encoding | Multiple incompatible specs (v7, ustar, pax, GNU, BSD); real-world archives mix formats |
 | **Empty directories** | Explicit DIR container type with its own metadata and Merkle hash | Representable but inconsistently handled across implementations |
+| **Encryption** | Built-in AEAD encryption (AES-256-GCM / ChaCha20-Poly1305) with password-based key derivation (Argon2id / PBKDF2); ~48 bytes overhead | None built-in; users layer external encryption (`gpg`, `age`) after the fact |
+| **Compression** | Built-in LZMA2 via LP attribute; per-container granularity | External only (`tar.gz`, `tar.zst`); whole-archive granularity |
 
 **Where tar wins:** Ubiquity. tar is everywhere, understood by every tool, and has decades of battle-tested interoperability. If you need an archive that any system can unpack without installing anything, tar is the right choice.
 
-**Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in BLAKE3-128 integrity verification catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. Built-in LZMA2 compression via the LP attribute system keeps archives compact. And ~3x lower per-file overhead matters when archiving many small files.
+**Where BLIP Archive wins:** Correctness guarantees. Deterministic output means two archives of the same files are byte-identical — useful for caching, deduplication, and content-addressed storage. Built-in BLAKE3-128 integrity verification catches corruption without external tooling. O(1) random access means you can extract one file from a million-file archive without scanning the rest. Built-in LZMA2 compression and AEAD encryption via the LP attribute system keep archives compact and secure without external tooling. And ~3x lower per-file overhead matters when archiving many small files.
 
 ## miniblar: Minimal BLIP Archive Tool
 
