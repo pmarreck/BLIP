@@ -179,7 +179,7 @@ static uint8_t *read_archive(const char *path, size_t *out_len) {
     if (blip_is_compressed(buf, *out_len)) {
         uint8_t *decompressed = NULL;
         size_t decomp_len = 0;
-        int32_t rc = blip_lzma2_decompress(buf, *out_len, &decompressed, &decomp_len);
+        int32_t rc = blip_decompress_container(buf, *out_len, &decompressed, &decomp_len);
         free(buf);
         if (rc != BLIP_OK) {
             fprintf(stderr, "Failed to decompress archive: %s\n",
@@ -847,7 +847,7 @@ static void from_json_usage(FILE *out, const char *prog) {
         "\n"
         "Options:\n"
         "  -o <output>        Write archive to specified file (required unless piping)\n"
-        "  -z                 Compress with LZMA2\n"
+        "  -z [algo]          Compress (lzma2=default, bzip2, lz4, zstd)\n"
         "  -e [cipher]        Encrypt (aes = AES-256-GCM [default], chacha = ChaCha20-Poly1305)\n"
         "  --kdf <name>       KDF for encryption (argon2 [default], pbkdf2)\n"
         "\n"
@@ -873,7 +873,7 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
 
     const char *output_path = NULL;
     const char *input_file = NULL;
-    bool compress_lzma2 = false;
+    uint8_t compress_algo = 0;  /* 0 = no compression */
     bool do_encrypt = false;
     uint8_t enc_id = 1;   /* default: AES-256-GCM */
     uint8_t kdf_id = 1;   /* default: Argon2id */
@@ -886,7 +886,25 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
             }
             output_path = argv[++i];
         } else if (strcmp(argv[i], "-z") == 0) {
-            compress_lzma2 = true;
+            compress_algo = BLIP_COMP_LZMA2; /* default */
+            /* Check for optional algorithm argument */
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                const char *algo = argv[i+1];
+                if (strcmp(algo, "lzma2") == 0 || strcmp(algo, "lzma") == 0) {
+                    compress_algo = BLIP_COMP_LZMA2;
+                    i++; /* consume algo arg */
+                } else if (strcmp(algo, "bzip2") == 0 || strcmp(algo, "bz2") == 0) {
+                    compress_algo = BLIP_COMP_BZIP2;
+                    i++;
+                } else if (strcmp(algo, "lz4") == 0) {
+                    compress_algo = BLIP_COMP_LZ4;
+                    i++;
+                } else if (strcmp(algo, "zstd") == 0 || strcmp(algo, "zst") == 0) {
+                    compress_algo = BLIP_COMP_ZSTD;
+                    i++;
+                }
+                /* else: not an algo name, don't consume */
+            }
         } else if (strcmp(argv[i], "-e") == 0) {
             do_encrypt = true;
             /* Check for optional cipher argument */
@@ -964,12 +982,12 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
         return EXIT_IO;
     }
 
-    /* Optionally compress with LZMA2 */
-    if (compress_lzma2) {
+    /* Optionally compress */
+    if (compress_algo != 0) {
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
-        rc = blip_lzma2_compress(archive_buf, archive_len,
-                                  &compressed_buf, &compressed_len);
+        rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+                                      &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
             fprintf(stderr, "%s: from-json: compression failed: %s\n",

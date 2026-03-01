@@ -284,7 +284,7 @@ static void print_usage(FILE *out) {
         "For flat file-only archives, use 'miniblar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-z] [-e [cipher]] [-o <archive>] <files/dirs...>  Create archive\n"
+        "  create [-z [algo]] [-e [cipher]] [-o <archive>] <files/dirs...>  Create archive\n"
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
@@ -311,7 +311,7 @@ static void print_usage(FILE *out) {
         "  P                             Absolute names (preserve leading /)\n"
         "\n"
         "Options:\n"
-        "  -z               Compress archive with LZMA2\n"
+        "  -z [algo]        Compress (lzma2=default, bzip2, lz4, zstd)\n"
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
@@ -330,7 +330,7 @@ static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
     int input_start = 0;
     bool absolute_names = g_absolute_names;
-    bool compress_lzma2 = false;
+    uint8_t compress_algo = 0;  /* 0 = no compression */
     bool do_encrypt = false;
     uint8_t enc_id = 1;   /* default: AES-256-GCM */
     uint8_t kdf_id = 1;   /* default: Argon2id */
@@ -349,7 +349,29 @@ static int cmd_create(int argc, char **argv) {
             argc--;
             i--;
         } else if (strcmp(argv[i], "-z") == 0) {
-            compress_lzma2 = true;
+            compress_algo = BLIP_COMP_LZMA2; /* default */
+            /* Check for optional algorithm argument */
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                const char *algo = argv[i+1];
+                if (strcmp(algo, "lzma2") == 0 || strcmp(algo, "lzma") == 0) {
+                    compress_algo = BLIP_COMP_LZMA2;
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                } else if (strcmp(algo, "bzip2") == 0 || strcmp(algo, "bz2") == 0) {
+                    compress_algo = BLIP_COMP_BZIP2;
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                } else if (strcmp(algo, "lz4") == 0) {
+                    compress_algo = BLIP_COMP_LZ4;
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                } else if (strcmp(algo, "zstd") == 0 || strcmp(algo, "zst") == 0) {
+                    compress_algo = BLIP_COMP_ZSTD;
+                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
+                    argc--;
+                }
+                /* else: not an algo name, don't consume */
+            }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
@@ -496,12 +518,12 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    /* Optionally compress with LZMA2 */
-    if (compress_lzma2) {
+    /* Optionally compress */
+    if (compress_algo != 0) {
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
-        rc = blip_lzma2_compress(archive_buf, archive_len,
-                                  &compressed_buf, &compressed_len);
+        rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+                                      &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
             fprintf(stderr, "blar: create: compression failed: %s\n",

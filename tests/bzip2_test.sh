@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# tests/bzip2_test.sh — bzip2 compression container CLI tests
+#
+# Tests: -z bzip2 flag for create, transparent decompression for list/extract/verify/info/cat/peek/to-json
+# Also tests: -z alone still defaults to lzma2 (backward compatibility)
+
+set -euo pipefail
+
+PASS=0
+FAIL=0
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
+
+# ── Build ────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BLAR="$PROJECT_DIR/zig-out/bin/blar"
+MINIBLAR="$PROJECT_DIR/zig-out/bin/miniblar"
+
+echo "Building blar and miniblar..."
+(cd "$PROJECT_DIR" && zig build 2>/dev/null) || { echo "FATAL: build failed"; exit 1; }
+
+# ── Setup ────────────────────────────────────────────────────────────────
+TMPDIR_TEST="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_TEST"' EXIT
+
+echo "hello world" > "$TMPDIR_TEST/hello.txt"
+echo "goodbye world" > "$TMPDIR_TEST/goodbye.txt"
+dd if=/dev/urandom bs=1024 count=10 of="$TMPDIR_TEST/random.bin" 2>/dev/null
+
+# Normalized paths (leading / stripped) — matches how blar stores them
+NORM_HELLO="${TMPDIR_TEST#/}/hello.txt"
+NORM_GOODBYE="${TMPDIR_TEST#/}/goodbye.txt"
+NORM_RANDOM="${TMPDIR_TEST#/}/random.bin"
+
+# ── blar create -z bzip2 ─────────────────────────────────────────────────
+
+# 1. Basic compressed archive creation
+"$BLAR" create -z bzip2 -o "$TMPDIR_TEST/compressed.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+if [ -f "$TMPDIR_TEST/compressed.blar" ]; then
+  pass "blar create -z bzip2 produces output file"
+else
+  fail "blar create -z bzip2 produces output file"
+fi
+
+# 2. Compressed archive has COMP attribute (0x81 0x10) in v2 LP header
+HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/compressed.blar" | tr -d '\n')
+if echo "$HEADER_HEX" | grep -q "8110"; then
+  pass "blar create -z bzip2: COMP attribute (0x81 0x10) present in LP header"
+else
+  fail "blar create -z bzip2: COMP attribute (0x81 0x10) not found in header (got $HEADER_HEX)"
+fi
+
+# 3. COMP value is 0x02 (bzip2), not 0x01 (lzma2)
+# In the LP header, COMP sigil (0x81 0x10) is followed by the algo ID
+if echo "$HEADER_HEX" | grep -q "811002"; then
+  pass "blar create -z bzip2: COMP=bzip2 (0x02) in header"
+else
+  fail "blar create -z bzip2: COMP=bzip2 (0x02) not found (got $HEADER_HEX)"
+fi
+
+# ── Transparent decompression: blar list ─────────────────────────────────
+
+# 4. list works on bzip2 archive
+LIST_OUT=$("$BLAR" list "$TMPDIR_TEST/compressed.blar" 2>/dev/null)
+if echo "$LIST_OUT" | grep -q 'hello.txt'; then
+  pass "blar list: works on bzip2 archive"
+else
+  fail "blar list: works on bzip2 archive — output: $LIST_OUT"
+fi
+
+# 5. list shows all files
+if echo "$LIST_OUT" | grep -q 'goodbye.txt'; then
+  pass "blar list: shows all files"
+else
+  fail "blar list: shows all files — output: $LIST_OUT"
+fi
+
+# ── Transparent decompression: blar extract ──────────────────────────────
+
+# 6-7. extract works on bzip2 archive
+EXTRACT_DIR="$TMPDIR_TEST/extract_out"
+mkdir -p "$EXTRACT_DIR"
+"$BLAR" extract "$TMPDIR_TEST/compressed.blar" -C "$EXTRACT_DIR" 2>/dev/null
+
+EXTRACTED_HELLO="$EXTRACT_DIR/$NORM_HELLO"
+if [ -f "$EXTRACTED_HELLO" ] && [ "$(cat "$EXTRACTED_HELLO")" = "hello world" ]; then
+  pass "blar extract: hello.txt content correct"
+else
+  fail "blar extract: hello.txt content correct (file: $EXTRACTED_HELLO)"
+fi
+
+EXTRACTED_GOODBYE="$EXTRACT_DIR/$NORM_GOODBYE"
+if [ -f "$EXTRACTED_GOODBYE" ] && [ "$(cat "$EXTRACTED_GOODBYE")" = "goodbye world" ]; then
+  pass "blar extract: goodbye.txt content correct"
+else
+  fail "blar extract: goodbye.txt content correct (file: $EXTRACTED_GOODBYE)"
+fi
+
+# ── Transparent decompression: blar verify ───────────────────────────────
+
+# 8. verify works on bzip2 archive
+VERIFY_OUT=$("$BLAR" verify "$TMPDIR_TEST/compressed.blar" 2>&1)
+if echo "$VERIFY_OUT" | grep -q 'OK'; then
+  pass "blar verify: passes on bzip2 archive"
+else
+  fail "blar verify: passes on bzip2 archive — output: $VERIFY_OUT"
+fi
+
+# ── Transparent decompression: blar info ─────────────────────────────────
+
+# 9. info works on bzip2 archive
+INFO_OUT=$("$BLAR" info "$TMPDIR_TEST/compressed.blar" 2>/dev/null)
+if echo "$INFO_OUT" | grep -q 'hello.txt'; then
+  pass "blar info: shows files"
+else
+  fail "blar info: shows files — output: $INFO_OUT"
+fi
+
+# ── Transparent decompression: blar cat ──────────────────────────────────
+
+# 10. cat works on bzip2 archive
+CAT_OUT=$("$BLAR" cat "$TMPDIR_TEST/compressed.blar" "$NORM_HELLO" 2>/dev/null)
+if [ "$CAT_OUT" = "hello world" ]; then
+  pass "blar cat: correct content from bzip2 archive"
+else
+  fail "blar cat: correct content from bzip2 archive (got: '$CAT_OUT')"
+fi
+
+# ── Transparent decompression: blar peek ─────────────────────────────────
+
+# 11. peek works on bzip2 archive
+PEEK_OUT=$("$BLAR" peek "$TMPDIR_TEST/compressed.blar" "[1][0][0][pa]" 2>&1)
+if echo "$PEEK_OUT" | grep -q 'hello.txt'; then
+  pass "blar peek: works on bzip2 archive"
+else
+  fail "blar peek: works on bzip2 archive — output: $PEEK_OUT"
+fi
+
+# ── Transparent decompression: blar to-json ──────────────────────────────
+
+# 12-13. to-json works on bzip2 archive
+JSON_OUT=$("$BLAR" to-json "$TMPDIR_TEST/compressed.blar" 2>/dev/null)
+if echo "$JSON_OUT" | jq '.entries | length' > /dev/null 2>&1; then
+  pass "blar to-json: valid JSON from bzip2 archive"
+else
+  fail "blar to-json: valid JSON from bzip2 archive"
+fi
+
+ENTRY_COUNT=$(echo "$JSON_OUT" | jq '.entries | length')
+if [ "$ENTRY_COUNT" -ge 2 ]; then
+  pass "blar to-json: shows all entries ($ENTRY_COUNT)"
+else
+  fail "blar to-json: shows all entries (got $ENTRY_COUNT)"
+fi
+
+# ── miniblar create -z bzip2 ─────────────────────────────────────────────
+
+# 14. miniblar create -z bzip2
+"$MINIBLAR" create -z bzip2 -o "$TMPDIR_TEST/mini_compressed.mblar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+if [ -f "$TMPDIR_TEST/mini_compressed.mblar" ]; then
+  pass "miniblar create -z bzip2 produces output file"
+else
+  fail "miniblar create -z bzip2 produces output file"
+fi
+
+# 15. miniblar compressed archive has COMP=bzip2 in v2 LP header
+MINI_HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/mini_compressed.mblar" | tr -d '\n')
+if echo "$MINI_HEADER_HEX" | grep -q "811002"; then
+  pass "miniblar create -z bzip2: COMP=bzip2 (0x02) in header"
+else
+  fail "miniblar create -z bzip2: COMP=bzip2 (0x02) not found in header (got $MINI_HEADER_HEX)"
+fi
+
+# ── Transparent decompression: miniblar ──────────────────────────────────
+
+# 16. miniblar list on bzip2 compressed
+MINI_LIST=$("$MINIBLAR" list "$TMPDIR_TEST/mini_compressed.mblar" 2>/dev/null)
+if echo "$MINI_LIST" | grep -q 'hello.txt'; then
+  pass "miniblar list: works on bzip2 archive"
+else
+  fail "miniblar list: works on bzip2 archive — output: $MINI_LIST"
+fi
+
+# 17. miniblar extract on bzip2 compressed
+MINI_EXTRACT="$TMPDIR_TEST/mini_extract"
+mkdir -p "$MINI_EXTRACT"
+"$MINIBLAR" extract "$TMPDIR_TEST/mini_compressed.mblar" -C "$MINI_EXTRACT" 2>/dev/null
+MINI_EXTRACTED="$MINI_EXTRACT/$NORM_HELLO"
+if [ -f "$MINI_EXTRACTED" ] && [ "$(cat "$MINI_EXTRACTED")" = "hello world" ]; then
+  pass "miniblar extract: correct content from bzip2"
+else
+  fail "miniblar extract: correct content from bzip2 (file: $MINI_EXTRACTED)"
+fi
+
+# 18. miniblar verify on bzip2 compressed
+MINI_VERIFY=$("$MINIBLAR" verify "$TMPDIR_TEST/mini_compressed.mblar" 2>&1)
+if echo "$MINI_VERIFY" | grep -q 'OK'; then
+  pass "miniblar verify: passes on bzip2 archive"
+else
+  fail "miniblar verify: passes on bzip2 archive — output: $MINI_VERIFY"
+fi
+
+# 19. miniblar cat on bzip2 compressed
+MINI_CAT=$("$MINIBLAR" cat "$TMPDIR_TEST/mini_compressed.mblar" "$NORM_HELLO" 2>/dev/null)
+if [ "$MINI_CAT" = "hello world" ]; then
+  pass "miniblar cat: correct content from bzip2"
+else
+  fail "miniblar cat: correct content from bzip2 (got: '$MINI_CAT')"
+fi
+
+# ── Binary content round-trip ────────────────────────────────────────────
+
+# 20. Binary file round-trips through bzip2 compressed archive
+"$BLAR" create -z bzip2 -o "$TMPDIR_TEST/binary_comp.blar" "$TMPDIR_TEST/random.bin" 2>/dev/null
+BINARY_EXTRACT="$TMPDIR_TEST/binary_extract"
+mkdir -p "$BINARY_EXTRACT"
+"$BLAR" extract "$TMPDIR_TEST/binary_comp.blar" -C "$BINARY_EXTRACT" 2>/dev/null
+BINARY_EXTRACTED="$BINARY_EXTRACT/$NORM_RANDOM"
+if cmp -s "$TMPDIR_TEST/random.bin" "$BINARY_EXTRACTED"; then
+  pass "binary content round-trips through bzip2"
+else
+  fail "binary content round-trips through bzip2 (file: $BINARY_EXTRACTED)"
+fi
+
+# ── Backward compatibility: -z alone defaults to lzma2 ───────────────────
+
+# 21. -z alone still creates LZMA2 (COMP=0x01) not bzip2
+"$BLAR" create -z -o "$TMPDIR_TEST/default_z.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+DEFAULT_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/default_z.blar" | tr -d '\n')
+if echo "$DEFAULT_HEADER" | grep -q "811001"; then
+  pass "-z alone defaults to lzma2 (COMP=0x01)"
+else
+  fail "-z alone defaults to lzma2 (COMP=0x01) — got $DEFAULT_HEADER"
+fi
+
+# 22. -z lzma2 explicitly also works
+"$BLAR" create -z lzma2 -o "$TMPDIR_TEST/explicit_lzma2.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+EXPLICIT_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/explicit_lzma2.blar" | tr -d '\n')
+if echo "$EXPLICIT_HEADER" | grep -q "811001"; then
+  pass "-z lzma2 uses lzma2 (COMP=0x01)"
+else
+  fail "-z lzma2 uses lzma2 (COMP=0x01) — got $EXPLICIT_HEADER"
+fi
+
+# ── bz2 alias ────────────────────────────────────────────────────────────
+
+# 23. -z bz2 alias works
+"$BLAR" create -z bz2 -o "$TMPDIR_TEST/bz2_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+BZ2_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/bz2_alias.blar" | tr -d '\n')
+if echo "$BZ2_HEADER" | grep -q "811002"; then
+  pass "-z bz2 alias uses bzip2 (COMP=0x02)"
+else
+  fail "-z bz2 alias uses bzip2 (COMP=0x02) — got $BZ2_HEADER"
+fi
+
+# ── Help text mentions -z algo ───────────────────────────────────────────
+
+# 24. blar --help mentions bzip2
+BLAR_HELP=$("$BLAR" --help 2>&1)
+if echo "$BLAR_HELP" | grep -q 'bzip2'; then
+  pass "blar --help mentions bzip2"
+else
+  fail "blar --help mentions bzip2"
+fi
+
+# 25. miniblar --help mentions bzip2
+MINI_HELP=$("$MINIBLAR" --help 2>&1)
+if echo "$MINI_HELP" | grep -q 'bzip2'; then
+  pass "miniblar --help mentions bzip2"
+else
+  fail "miniblar --help mentions bzip2"
+fi
+
+# ── Directory archive with -z bzip2 (blar only) ──────────────────────────
+
+# 26. blar create -z bzip2 with directories
+mkdir -p "$TMPDIR_TEST/testdir/subdir"
+echo "nested" > "$TMPDIR_TEST/testdir/subdir/file.txt"
+echo "top" > "$TMPDIR_TEST/testdir/top.txt"
+"$BLAR" create -z bzip2 -o "$TMPDIR_TEST/dir_comp.blar" "$TMPDIR_TEST/testdir" 2>/dev/null
+DIR_LIST=$("$BLAR" list "$TMPDIR_TEST/dir_comp.blar" 2>/dev/null)
+if echo "$DIR_LIST" | grep -q 'file.txt'; then
+  pass "blar create -z bzip2 with dirs: list works"
+else
+  fail "blar create -z bzip2 with dirs: list works — output: $DIR_LIST"
+fi
+
+# 27. extract bzip2 compressed dir archive
+DIR_EXTRACT="$TMPDIR_TEST/dir_extract"
+mkdir -p "$DIR_EXTRACT"
+"$BLAR" extract "$TMPDIR_TEST/dir_comp.blar" -C "$DIR_EXTRACT" 2>/dev/null
+NORM_NESTED="${TMPDIR_TEST#/}/testdir/subdir/file.txt"
+DIR_EXTRACTED="$DIR_EXTRACT/$NORM_NESTED"
+if [ -f "$DIR_EXTRACTED" ] && [ "$(cat "$DIR_EXTRACTED")" = "nested" ]; then
+  pass "blar extract -z bzip2 dir: nested content correct"
+else
+  fail "blar extract -z bzip2 dir: nested content correct (file: $DIR_EXTRACTED)"
+fi
+
+# ── from-json with -z bzip2 ──────────────────────────────────────────────
+
+# 28. from-json with -z bzip2 creates a bzip2-compressed archive
+"$BLAR" to-json "$TMPDIR_TEST/compressed.blar" > "$TMPDIR_TEST/archive.json" 2>/dev/null
+"$BLAR" from-json -z bzip2 -o "$TMPDIR_TEST/from_json_bz2.blar" "$TMPDIR_TEST/archive.json" 2>/dev/null
+FJ_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/from_json_bz2.blar" | tr -d '\n')
+if echo "$FJ_HEADER" | grep -q "811002"; then
+  pass "from-json -z bzip2 creates bzip2-compressed archive"
+else
+  fail "from-json -z bzip2 creates bzip2-compressed archive — got $FJ_HEADER"
+fi
+
+# 29. from-json -z bzip2 archive round-trips
+FJ_LIST=$("$BLAR" list "$TMPDIR_TEST/from_json_bz2.blar" 2>/dev/null)
+if echo "$FJ_LIST" | grep -q 'hello.txt'; then
+  pass "from-json -z bzip2: list works after round-trip"
+else
+  fail "from-json -z bzip2: list works after round-trip — output: $FJ_LIST"
+fi
+
+# ── Results ──────────────────────────────────────────────────────────────
+
+echo ""
+echo "========================================"
+echo "Results: $PASS passed, $FAIL failed"
+echo "========================================"
+[ "$FAIL" -eq 0 ] || exit 1

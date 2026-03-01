@@ -4,6 +4,8 @@ const ct = @import("container_types.zig");
 const container = @import("container.zig");
 const csum_mod = @import("checksum.zig");
 const z7z = @import("z7z");
+const bzip2z = @import("bzip2z");
+const lz4 = @cImport(@cInclude("lz4.h"));
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
@@ -24,8 +26,35 @@ pub fn compress(allocator: Allocator, algo: ct.CompressionId, data: []const u8) 
                 else => return error.CompressionFailed,
             };
         },
-        .bzip2 => return error.UnsupportedCompression,
-        .lz4 => return error.UnsupportedCompression,
+        .bzip2 => {
+            return bzip2z.bzip2.compress(allocator, data) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CompressionFailed,
+            };
+        },
+        .lz4 => {
+            const src_size: c_int = @intCast(data.len);
+            const bound = lz4.LZ4_compressBound(src_size);
+            if (bound <= 0) return error.CompressionFailed;
+            const dest_buf = try allocator.alloc(u8, @intCast(bound));
+            errdefer allocator.free(dest_buf);
+            const compressed_size = lz4.LZ4_compress_default(
+                @ptrCast(data.ptr),
+                @ptrCast(dest_buf.ptr),
+                src_size,
+                bound,
+            );
+            if (compressed_size <= 0) {
+                allocator.free(dest_buf);
+                return error.CompressionFailed;
+            }
+            // Shrink to actual compressed size
+            const result = allocator.realloc(dest_buf, @intCast(compressed_size)) catch {
+                // realloc to shrink shouldn't fail, but if it does, keep original
+                return dest_buf[0..@intCast(compressed_size)];
+            };
+            return result;
+        },
         .zstd => return error.UnsupportedCompression,
     }
 }
@@ -50,8 +79,29 @@ pub fn decompress(allocator: Allocator, algo: ct.CompressionId, data: []const u8
             }
             return out_buf;
         },
-        .bzip2 => return error.UnsupportedCompression,
-        .lz4 => return error.UnsupportedCompression,
+        .bzip2 => {
+            // bzip2 is self-describing (stream contains its own length), decomp_len not needed
+            return bzip2z.bzip2.decompress(allocator, data) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.DecompressionFailed,
+            };
+        },
+        .lz4 => {
+            // LZ4 requires knowing the decompressed size (not self-describing)
+            const out_buf = try allocator.alloc(u8, @intCast(decomp_len));
+            errdefer allocator.free(out_buf);
+            const result = lz4.LZ4_decompress_safe(
+                @ptrCast(data.ptr),
+                @ptrCast(out_buf.ptr),
+                @intCast(data.len),
+                @intCast(decomp_len),
+            );
+            if (result < 0 or @as(u64, @intCast(result)) != decomp_len) {
+                allocator.free(out_buf);
+                return error.DecompressionFailed;
+            }
+            return out_buf;
+        },
         .zstd => return error.UnsupportedCompression,
     }
 }
@@ -130,14 +180,30 @@ test "LZMA2 compress/decompress round-trip (raw bytes)" {
     try testing.expectEqualSlices(u8, original, decompressed);
 }
 
-test "bzip2 compress returns UnsupportedCompression" {
+test "bzip2 compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, compress(allocator, .bzip2, "test"));
+    const original = "Hello, bzip2 compression! This is a test of the unified interface.";
+
+    const compressed = try compress(allocator, .bzip2, original);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompress(allocator, .bzip2, compressed, original.len);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, original, decompressed);
 }
 
-test "LZ4 compress returns UnsupportedCompression" {
+test "LZ4 compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, compress(allocator, .lz4, "test"));
+    const original = "Hello, LZ4 compression! This is a test of the unified interface.";
+
+    const compressed = try compress(allocator, .lz4, original);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompress(allocator, .lz4, compressed, original.len);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, original, decompressed);
 }
 
 test "zstd compress returns UnsupportedCompression" {
@@ -145,14 +211,36 @@ test "zstd compress returns UnsupportedCompression" {
     try testing.expectError(error.UnsupportedCompression, compress(allocator, .zstd, "test"));
 }
 
-test "bzip2 decompress returns UnsupportedCompression" {
+test "bzip2 compressContainer/decompressContainer round-trip" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, decompress(allocator, .bzip2, "test", 4));
+    const leaf = @import("leaf.zig");
+
+    const inner = try leaf.serializeData(allocator, "Hello, bzip2 container!");
+    defer allocator.free(inner);
+
+    const compressed = try compressContainer(allocator, .bzip2, inner);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompressContainer(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
-test "LZ4 decompress returns UnsupportedCompression" {
+test "LZ4 compressContainer/decompressContainer round-trip" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, decompress(allocator, .lz4, "test", 4));
+    const leaf = @import("leaf.zig");
+
+    const inner = try leaf.serializeData(allocator, "Hello, LZ4 container!");
+    defer allocator.free(inner);
+
+    const compressed = try compressContainer(allocator, .lz4, inner);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompressContainer(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
 test "zstd decompress returns UnsupportedCompression" {

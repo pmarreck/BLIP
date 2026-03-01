@@ -226,13 +226,20 @@ int32_t blip_to_json(const uint8_t *buf, size_t buf_len,
 int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
                        uint8_t **out_buf, size_t *out_len);
 
-/* --- LZMA2 compression --- */
+/* --- Compression --- */
+
+/* Compression algorithm IDs */
+#define BLIP_COMP_LZMA2  1
+#define BLIP_COMP_BZIP2  2
+#define BLIP_COMP_LZ4    3
+#define BLIP_COMP_ZSTD   4
 
 #define BLIP_ERR_DECOMPRESSION      -23
 #define BLIP_ERR_COMPRESSION        -24
 #define BLIP_ERR_MISSING_SIGIL      -25
 #define BLIP_ERR_INVALID_SIGIL_ORDER -26
 #define BLIP_ERR_MISSING_DECOMP_LEN -27
+#define BLIP_ERR_UNSUPPORTED_COMPRESSION -32
 
 /* Encryption errors */
 #define BLIP_ERR_AUTH_FAILED       -28
@@ -257,6 +264,22 @@ int32_t blip_lzma2_compress(const uint8_t *buf, size_t buf_len,
  * Caller must free output buffer with blip_free(). */
 int32_t blip_lzma2_decompress(const uint8_t *buf, size_t buf_len,
                                uint8_t **out_buf, size_t *out_len);
+
+/* Compress a BLIP container with the specified algorithm.
+ * algo_id: BLIP_COMP_LZMA2, BLIP_COMP_BZIP2, BLIP_COMP_LZ4, or BLIP_COMP_ZSTD.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_compress_container(const uint8_t *buf, size_t buf_len,
+                                 uint8_t algo_id,
+                                 uint8_t **out_buf, size_t *out_len);
+
+/* Decompress a compressed LP container (any supported algorithm).
+ * Reads the algorithm from the LP header's COMP attribute.
+ * Verifies checksum before decompressing.
+ * Returns 0 on success, negative error code on failure.
+ * Caller must free output buffer with blip_free(). */
+int32_t blip_decompress_container(const uint8_t *buf, size_t buf_len,
+                                   uint8_t **out_buf, size_t *out_len);
 
 /* --- Encryption --- */
 

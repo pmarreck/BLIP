@@ -126,6 +126,7 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -29 => "password required for encrypted container",
         -30 => "encryption failed",
         -31 => "decryption failed",
+        -32 => "unsupported compression algorithm",
         else => "unknown error",
     };
 }
@@ -767,6 +768,61 @@ export fn blip_lzma2_decompress(
     const result = lzma2_mod.decompressContainer(page_allocator, slice) catch |e| switch (e) {
         error.OutOfMemory => return -13,
         error.DecompressionFailed => return -23,
+        error.HashMismatch => return -7,
+        else => return -1,
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Generic compression C FFI exports
+// ---------------------------------------------------------------------------
+
+const compression_mod = blip.compression_mod;
+const CompressionId = mini_blar.container_mod.CompressionId;
+
+/// Compress a BLIP container with the specified algorithm.
+/// algo_id: 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_compress_container(
+    buf: [*]const u8,
+    buf_len: usize,
+    algo_id: u8,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const algo = std.meta.intToEnum(CompressionId, @as(u7, @truncate(algo_id))) catch return -32;
+    const slice = buf[0..buf_len];
+    const result = compression_mod.compressContainer(page_allocator, algo, slice) catch |e| switch (e) {
+        error.OutOfMemory => return -13,
+        error.CompressionFailed => return -24,
+        error.UnsupportedCompression => return -32,
+        else => return -1,
+    };
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Decompress a compressed LP container (any algorithm).
+/// Reads the algorithm from the LP header's COMP attribute.
+/// Verifies checksum before decompressing.
+/// Returns 0 on success, negative error code on failure.
+/// Caller must free output buffer with blip_free().
+export fn blip_decompress_container(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const result = compression_mod.decompressContainer(page_allocator, slice) catch |e| switch (e) {
+        error.OutOfMemory => return -13,
+        error.DecompressionFailed => return -23,
+        error.UnsupportedCompression => return -32,
         error.HashMismatch => return -7,
         else => return -1,
     };

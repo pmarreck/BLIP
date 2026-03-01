@@ -23,6 +23,20 @@ pub fn build(b: *std.Build) void {
     });
     const z7z_module = z7z_dep.module("z7z");
 
+    // bzip2z dependency — provides bzip2 compression engine
+    const bzip2z_dep = b.dependency("bzip2z", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const bzip2z_module = bzip2z_dep.module("bzip2z");
+
+    // lz4 dependency — provides LZ4 compression (C library)
+    const lz4_dep = b.dependency("lz4", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lz4_lib = lz4_dep.artifact("lz4");
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -31,31 +45,37 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
             .{ .name = "z7z", .module = z7z_module },
+            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
+    blip_module.linkLibrary(lz4_lib);
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
     //   dep.module("mini_blar") — archive creation/reading (mini_blar.zig)
-    _ = b.addModule("blip", .{
+    const exposed_blip = b.addModule("blip", .{
         .root_source_file = b.path("src/blip.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
             .{ .name = "z7z", .module = z7z_module },
+            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
+    exposed_blip.linkLibrary(lz4_lib);
 
-    _ = b.addModule("mini_blar", .{
+    const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
             .{ .name = "z7z", .module = z7z_module },
+            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
+    exposed_mini_blar.linkLibrary(lz4_lib);
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -161,31 +181,37 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(pb_exe);
 
     // Unit tests (exercises blip.zig directly)
+    const unit_test_module = b.createModule(.{
+        .root_source_file = b.path("src/blip.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "printable_binary", .module = pb_module },
+            .{ .name = "z7z", .module = z7z_module },
+            .{ .name = "bzip2z", .module = bzip2z_module },
+        },
+    });
+    unit_test_module.linkLibrary(lz4_lib);
     const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/blip.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "printable_binary", .module = pb_module },
-                .{ .name = "z7z", .module = z7z_module },
-            },
-        }),
+        .root_module = unit_test_module,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // FFI tests (exercises lib.zig C FFI surface)
+    const ffi_test_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "blip", .module = blip_module },
+            .{ .name = "printable_binary", .module = pb_module },
+            .{ .name = "z7z", .module = z7z_module },
+            .{ .name = "bzip2z", .module = bzip2z_module },
+        },
+    });
+    ffi_test_module.linkLibrary(lz4_lib);
     const ffi_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "blip", .module = blip_module },
-                .{ .name = "printable_binary", .module = pb_module },
-                .{ .name = "z7z", .module = z7z_module },
-            },
-        }),
+        .root_module = ffi_test_module,
     });
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
 
