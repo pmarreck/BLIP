@@ -37,6 +37,13 @@ pub fn build(b: *std.Build) void {
     });
     const lz4_lib = lz4_dep.artifact("lz4");
 
+    // progrez dependency — provides progress bar (C library)
+    const progrez_dep = b.dependency("progrez", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const progrez_lib = progrez_dep.artifact("progrez");
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -129,7 +136,9 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic" },
     });
     blar.linkLibrary(static_lib);
+    blar.linkLibrary(progrez_lib);
     blar.root_module.addIncludePath(b.path("src"));
+    blar.root_module.addIncludePath(progrez_dep.path("include"));
     b.installArtifact(blar);
 
     const blar_run_cmd = b.addRunArtifact(blar);
@@ -155,7 +164,9 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic" },
     });
     miniblar.linkLibrary(static_lib);
+    miniblar.linkLibrary(progrez_lib);
     miniblar.root_module.addIncludePath(b.path("src"));
+    miniblar.root_module.addIncludePath(progrez_dep.path("include"));
     b.installArtifact(miniblar);
 
     const miniblar_run_cmd = b.addRunArtifact(miniblar);

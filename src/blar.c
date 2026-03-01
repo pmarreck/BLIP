@@ -55,6 +55,8 @@ typedef struct {
     uint8_t **content_bufs; /* owned content buffers to free */
     size_t content_count;
     size_t content_capacity;
+    progrez_ctx *progress;  /* optional progress context (updated during collection) */
+    uint64_t bytes_seen;    /* running total for progress updates */
 } entry_list_t;
 
 static void entry_list_init(entry_list_t *el) {
@@ -64,6 +66,8 @@ static void entry_list_init(entry_list_t *el) {
     el->content_bufs = NULL;
     el->content_count = 0;
     el->content_capacity = 0;
+    el->progress = NULL;
+    el->bytes_seen = 0;
 }
 
 static bool entry_list_add(entry_list_t *el, blip_archive_entry entry) {
@@ -190,6 +194,7 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         fill_entry_metadata(&entry, &st);
         memset(entry.xh64, 0, 8);
         if (!entry_list_add(el, entry)) return false;
+        if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
 
         return collect_dir_children(path, el);
     } else if (S_ISREG(st.st_mode)) {
@@ -214,6 +219,8 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.is_dir = 0;
         fill_entry_metadata(&entry, &st);
         if (!entry_list_add(el, entry)) return false;
+        el->bytes_seen += content_len;
+        if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
     }
 
     return true;
@@ -481,28 +488,33 @@ static int cmd_create(int argc, char **argv) {
     entry_list_t el;
     entry_list_init(&el);
 
-    bool show_progress = isatty(STDERR_FILENO);
+    /* Progress: indeterminate scanning phase */
+    progrez_ctx *progress = progrez_create("Scanning");
+    if (progress) {
+        progrez_set_identity(progress, "blar", "archive creation");
+        progrez_set_indeterminate(progress);
+        el.progress = progress;
+    }
 
     for (int i = 0; i < input_count; i++) {
         if (!collect_entries_recurse(argv[input_start + i], &el)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             entry_list_free(&el);
             return EXIT_IO;
         }
     }
 
     if (el.count == 0) {
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "blar: create: no entries to archive\n");
         entry_list_free(&el);
         return EXIT_USAGE;
     }
 
-    if (show_progress) {
-        uint64_t total_bytes = 0;
-        for (size_t i = 0; i < el.count; i++) {
-            total_bytes += el.entries[i].content_len;
-        }
-        progress_bar(stderr, (uint64_t)el.count, (uint64_t)el.count,
-                     total_bytes, total_bytes);
+    /* Progress: switch to determinate for archive creation */
+    if (progress) {
+        progrez_set_label(progress, "Creating");
+        progrez_set_determinate(progress, el.count, el.bytes_seen);
     }
 
     /* Create the archive via FFI */
@@ -511,9 +523,17 @@ static int cmd_create(int argc, char **argv) {
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(el.entries, el.count, create_flags,
                                            &archive_buf, &archive_len);
+    uint64_t final_count = el.count;
+    uint64_t final_bytes = el.bytes_seen;
     entry_list_free(&el);
 
+    /* Signal completion of archive creation phase */
+    if (progress) {
+        progrez_update(progress, final_count, final_bytes);
+    }
+
     if (rc != BLIP_OK) {
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "blar: create: %s\n", blip_error_string(rc));
         return EXIT_IO;
     }
@@ -526,6 +546,7 @@ static int cmd_create(int argc, char **argv) {
                                       &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: create: compression failed: %s\n",
                     blip_error_string(rc));
             return EXIT_IO;
@@ -538,6 +559,7 @@ static int cmd_create(int argc, char **argv) {
     if (do_encrypt) {
         const char *password = get_password();
         if (!password) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: create: password required for encryption\n");
             blip_free(archive_buf, archive_len);
             return EXIT_IO;
@@ -550,6 +572,7 @@ static int cmd_create(int argc, char **argv) {
                                      &encrypted_buf, &encrypted_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: create: encryption failed: %s\n",
                     blip_error_string(rc));
             return EXIT_IO;
@@ -559,12 +582,14 @@ static int cmd_create(int argc, char **argv) {
     }
 
     if (!write_file(out_path, archive_buf, archive_len)) {
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "blar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
         blip_free(archive_buf, archive_len);
         return EXIT_IO;
     }
 
+    if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
@@ -654,9 +679,9 @@ static int cmd_extract(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    bool show_progress = isatty(STDERR_FILENO);
     uint64_t total_bytes = 0;
     uint64_t bytes_done = 0;
+    uint64_t file_entries = 0; /* count of non-dir entries for progress */
 
     /* First pass: create directories, count bytes for progress */
     for (uint64_t i = 0; i < count; i++) {
@@ -717,8 +742,18 @@ static int cmd_extract(int argc, char **argv) {
             if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
                 total_bytes += data_len;
             }
+            file_entries++;
         }
     }
+
+    /* Progress: determinate extraction phase */
+    progrez_ctx *progress = progrez_create("Extracting");
+    if (progress) {
+        progrez_set_identity(progress, "blar", "archive extraction");
+        progrez_set_determinate(progress, file_entries, total_bytes);
+    }
+
+    uint64_t files_done = 0;
 
     /* Second pass: extract files */
     for (uint64_t i = 0; i < count; i++) {
@@ -730,6 +765,7 @@ static int cmd_extract(int argc, char **argv) {
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: extract: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
@@ -740,6 +776,7 @@ static int cmd_extract(int argc, char **argv) {
         size_t data_len = 0;
         rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: extract: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
@@ -751,12 +788,14 @@ static int cmd_extract(int argc, char **argv) {
             int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
                              output_dir, (int)path_len, path);
             if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
                 fprintf(stderr, "blar: extract: path too long\n");
                 free(buf);
                 return EXIT_IO;
             }
         } else {
             if (path_len >= sizeof(out_path)) {
+                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
                 fprintf(stderr, "blar: extract: path too long\n");
                 free(buf);
                 return EXIT_IO;
@@ -767,6 +806,7 @@ static int cmd_extract(int argc, char **argv) {
 
         /* Ensure parent dirs exist (for implicit directories) */
         if (!ensure_parent_dir(out_path)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: extract: cannot create directory for '%s': %s\n",
                     out_path, strerror(errno));
             free(buf);
@@ -774,6 +814,7 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         if (!write_file(out_path, data, data_len)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "blar: extract: cannot write '%s': %s\n",
                     out_path, strerror(errno));
             free(buf);
@@ -800,12 +841,12 @@ static int cmd_extract(int argc, char **argv) {
             utimensat(AT_FDCWD, out_path, times, 0);
         }
 
-        if (show_progress) {
-            bytes_done += data_len;
-            progress_bar(stderr, i + 1, count, bytes_done, total_bytes);
-        }
+        bytes_done += data_len;
+        files_done++;
+        if (progress) progrez_update(progress, files_done, bytes_done);
     }
 
+    if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     free(buf);
     return EXIT_OK;
 }

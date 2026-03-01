@@ -314,35 +314,9 @@ static void fill_entry_metadata(blip_archive_entry *entry, const struct stat *st
     }
 }
 
-/* ── Progress bar ─────────────────────────────────────────────────────── */
+/* ── Progress (via progrez library) ───────────────────────────────────── */
 
-static void progress_bar(FILE *out, uint64_t current, uint64_t total,
-                         uint64_t bytes_done, uint64_t bytes_total) {
-    const int bar_width = 16;
-    int filled = (total > 0) ? (int)((current * (uint64_t)bar_width) / total) : 0;
-    if (filled > bar_width) filled = bar_width;
-    int empty = bar_width - filled;
-
-    fprintf(out, "\r[");
-    for (int i = 0; i < filled; i++) fprintf(out, "\xe2\x96\x88");
-    for (int i = 0; i < empty; i++) fprintf(out, "\xe2\x96\x91");
-    fprintf(out, "]  %llu/%llu files", (unsigned long long)current,
-            (unsigned long long)total);
-
-    double done_mb = (double)bytes_done / (1024.0 * 1024.0);
-    double total_mb = (double)bytes_total / (1024.0 * 1024.0);
-    if (bytes_total >= 1024 * 1024) {
-        fprintf(out, "   %.1f MB / %.1f MB", done_mb, total_mb);
-    } else {
-        fprintf(out, "   %llu B / %llu B", (unsigned long long)bytes_done,
-                (unsigned long long)bytes_total);
-    }
-
-    if (current == total) {
-        fprintf(out, "\n");
-    }
-    fflush(out);
-}
+#include "progrez.h"
 
 /* ── Tar-style flag parsing ───────────────────────────────────────────── */
 

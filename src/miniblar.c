@@ -278,17 +278,13 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    bool show_progress = isatty(STDERR_FILENO);
-    uint64_t total_bytes = 0;
     uint64_t bytes_done = 0;
 
-    if (show_progress) {
-        for (int i = 0; i < file_count; i++) {
-            struct stat st;
-            if (stat(argv[file_start + i], &st) == 0) {
-                total_bytes += (uint64_t)st.st_size;
-            }
-        }
+    /* Progress: indeterminate scanning phase */
+    progrez_ctx *progress = progrez_create("Scanning");
+    if (progress) {
+        progrez_set_identity(progress, "miniblar", "archive creation");
+        progrez_set_indeterminate(progress);
     }
 
     for (int i = 0; i < file_count; i++) {
@@ -296,6 +292,7 @@ static int cmd_create(int argc, char **argv) {
         size_t content_len = 0;
         uint8_t *content = read_file(path, &content_len);
         if (!content) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: create: cannot open '%s': %s\n",
                     path, strerror(errno));
             for (int j = 0; j < i; j++) {
@@ -318,11 +315,15 @@ static int cmd_create(int argc, char **argv) {
             fill_entry_metadata(&entries[i], &st);
         }
 
-        if (show_progress) {
-            bytes_done += content_len;
-            progress_bar(stderr, (uint64_t)(i + 1), (uint64_t)file_count,
-                         bytes_done, total_bytes);
-        }
+        bytes_done += content_len;
+        if (progress) progrez_update(progress, (uint64_t)(i + 1), bytes_done);
+    }
+
+    /* Progress: switch to determinate for archive creation */
+    if (progress) {
+        progrez_set_label(progress, "Creating");
+        progrez_set_determinate(progress, (uint64_t)file_count, bytes_done);
+        progrez_update(progress, (uint64_t)file_count, bytes_done);
     }
 
     uint8_t *archive_buf = NULL;
@@ -337,6 +338,7 @@ static int cmd_create(int argc, char **argv) {
     free(entries);
 
     if (rc != BLIP_OK) {
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "miniblar: create: %s\n", blip_error_string(rc));
         return EXIT_IO;
     }
@@ -349,6 +351,7 @@ static int cmd_create(int argc, char **argv) {
                                       &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: create: compression failed: %s\n",
                     blip_error_string(rc));
             return EXIT_IO;
@@ -358,12 +361,14 @@ static int cmd_create(int argc, char **argv) {
     }
 
     if (!write_file(out_path, archive_buf, archive_len)) {
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "miniblar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
         blip_free(archive_buf, archive_len);
         return EXIT_IO;
     }
 
+    if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
@@ -449,18 +454,23 @@ static int cmd_extract(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    bool show_progress = isatty(STDERR_FILENO);
     uint64_t total_bytes = 0;
     uint64_t bytes_done = 0;
 
-    if (show_progress) {
-        for (uint64_t i = 0; i < count; i++) {
-            const uint8_t *data = NULL;
-            size_t data_len = 0;
-            if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
-                total_bytes += data_len;
-            }
+    /* Count total bytes for progress */
+    for (uint64_t i = 0; i < count; i++) {
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
+            total_bytes += data_len;
         }
+    }
+
+    /* Progress: determinate extraction phase */
+    progrez_ctx *progress = progrez_create("Extracting");
+    if (progress) {
+        progrez_set_identity(progress, "miniblar", "archive extraction");
+        progrez_set_determinate(progress, count, total_bytes);
     }
 
     for (uint64_t i = 0; i < count; i++) {
@@ -468,6 +478,7 @@ static int cmd_extract(int argc, char **argv) {
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: extract: file %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
@@ -478,6 +489,7 @@ static int cmd_extract(int argc, char **argv) {
         size_t data_len = 0;
         rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
         if (rc != BLIP_OK) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: extract: file %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
             free(buf);
@@ -489,12 +501,14 @@ static int cmd_extract(int argc, char **argv) {
             int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
                              output_dir, (int)path_len, path);
             if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
                 fprintf(stderr, "miniblar: extract: path too long\n");
                 free(buf);
                 return EXIT_IO;
             }
         } else {
             if (path_len >= sizeof(out_path)) {
+                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
                 fprintf(stderr, "miniblar: extract: path too long\n");
                 free(buf);
                 return EXIT_IO;
@@ -504,6 +518,7 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         if (!ensure_parent_dir(out_path)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: extract: cannot create directory for '%s': %s\n",
                     out_path, strerror(errno));
             free(buf);
@@ -511,6 +526,7 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         if (!write_file(out_path, data, data_len)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
             fprintf(stderr, "miniblar: extract: cannot write '%s': %s\n",
                     out_path, strerror(errno));
             free(buf);
@@ -537,12 +553,11 @@ static int cmd_extract(int argc, char **argv) {
             utimensat(AT_FDCWD, out_path, times, 0);
         }
 
-        if (show_progress) {
-            bytes_done += data_len;
-            progress_bar(stderr, i + 1, count, bytes_done, total_bytes);
-        }
+        bytes_done += data_len;
+        if (progress) progrez_update(progress, i + 1, bytes_done);
     }
 
+    if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     free(buf);
     return EXIT_OK;
 }

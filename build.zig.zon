@@ -16,6 +16,10 @@
             .url = "https://github.com/pmarreck/lz4/archive/b198f4acaf3dcd55733e1aa278ae29cbde758fe6.tar.gz",
             .hash = "lz4-1.10.0-TtaqjRjWBwBSIn4YhACNrVRAR-O2_zGOpB_eM15uflzS",
         },
+        .progrez = .{
+            .url = "https://github.com/pmarreck/progrez/archive/331455d.tar.gz",
+            .hash = "progrez-0.1.0-0YJXrmrBAQCatqwMnYaaPA13IM-90s2PnLoflNf8eoeS",
+        },
     },
     .paths = .{
         "build.zig",
