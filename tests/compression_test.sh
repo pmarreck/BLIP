@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# tests/compression_test.sh — Unified compression CLI tests for all algorithms
+#
+# Tests -z flag for create with lzma2/bzip2/lz4, transparent decompression
+# for list/extract/verify/info/cat/peek/to-json/from-json, plus backward
+# compatibility (default algo, aliases).
+
+set -euo pipefail
+
+PASS=0
+FAIL=0
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
+
+# ── Build ────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BLAR="$PROJECT_DIR/zig-out/bin/blar"
+MINIBLAR="$PROJECT_DIR/zig-out/bin/miniblar"
+
+echo "Building blar and miniblar..."
+(cd "$PROJECT_DIR" && zig build 2>/dev/null) || { echo "FATAL: build failed"; exit 1; }
+
+# ── Setup ────────────────────────────────────────────────────────────────
+TMPDIR_TEST="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_TEST"' EXIT
+
+echo "hello world" > "$TMPDIR_TEST/hello.txt"
+echo "goodbye world" > "$TMPDIR_TEST/goodbye.txt"
+dd if=/dev/urandom bs=1024 count=10 of="$TMPDIR_TEST/random.bin" 2>/dev/null
+
+# Normalized paths (leading / stripped)
+NORM_HELLO="${TMPDIR_TEST#/}/hello.txt"
+NORM_GOODBYE="${TMPDIR_TEST#/}/goodbye.txt"
+NORM_RANDOM="${TMPDIR_TEST#/}/random.bin"
+
+# Algo → COMP byte mapping
+declare -A COMP_BYTE=( [lzma2]="01" [bzip2]="02" [lz4]="03" )
+
+# ══════════════════════════════════════════════════════════════════════════
+# Per-algorithm tests (parameterized)
+# ══════════════════════════════════════════════════════════════════════════
+
+for ALGO in lzma2 bzip2 lz4; do
+  COMP=${COMP_BYTE[$ALGO]}
+  Z_FLAG="-z $ALGO"
+  # lzma2 is the default for bare -z, but we test explicitly here
+  PREFIX="[$ALGO]"
+
+  echo ""
+  echo "── Testing $ALGO ──"
+
+  # --- blar create -z $ALGO ---
+
+  "$BLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_comp.blar" \
+    "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+  [ -f "$TMPDIR_TEST/${ALGO}_comp.blar" ] \
+    && pass "$PREFIX blar create produces output" \
+    || fail "$PREFIX blar create produces output"
+
+  # COMP attribute present
+  HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/${ALGO}_comp.blar" | tr -d '\n')
+  echo "$HEADER_HEX" | grep -q "8110${COMP}" \
+    && pass "$PREFIX COMP=0x${COMP} in LP header" \
+    || fail "$PREFIX COMP=0x${COMP} not found (got $HEADER_HEX)"
+
+  # --- Transparent decompression: list, extract, verify, info, cat, peek, to-json ---
+
+  LIST_OUT=$("$BLAR" list "$TMPDIR_TEST/${ALGO}_comp.blar" 2>/dev/null)
+  echo "$LIST_OUT" | grep -q 'hello.txt' \
+    && pass "$PREFIX blar list works" \
+    || fail "$PREFIX blar list — output: $LIST_OUT"
+
+  echo "$LIST_OUT" | grep -q 'goodbye.txt' \
+    && pass "$PREFIX list shows all files" \
+    || fail "$PREFIX list shows all files — output: $LIST_OUT"
+
+  EXTRACT_DIR="$TMPDIR_TEST/${ALGO}_extract"
+  mkdir -p "$EXTRACT_DIR"
+  "$BLAR" extract "$TMPDIR_TEST/${ALGO}_comp.blar" -C "$EXTRACT_DIR" 2>/dev/null
+
+  [ -f "$EXTRACT_DIR/$NORM_HELLO" ] && [ "$(cat "$EXTRACT_DIR/$NORM_HELLO")" = "hello world" ] \
+    && pass "$PREFIX extract hello.txt correct" \
+    || fail "$PREFIX extract hello.txt correct"
+
+  [ -f "$EXTRACT_DIR/$NORM_GOODBYE" ] && [ "$(cat "$EXTRACT_DIR/$NORM_GOODBYE")" = "goodbye world" ] \
+    && pass "$PREFIX extract goodbye.txt correct" \
+    || fail "$PREFIX extract goodbye.txt correct"
+
+  VERIFY_OUT=$("$BLAR" verify "$TMPDIR_TEST/${ALGO}_comp.blar" 2>&1)
+  echo "$VERIFY_OUT" | grep -q 'OK' \
+    && pass "$PREFIX verify passes" \
+    || fail "$PREFIX verify — output: $VERIFY_OUT"
+
+  INFO_OUT=$("$BLAR" info "$TMPDIR_TEST/${ALGO}_comp.blar" 2>/dev/null)
+  echo "$INFO_OUT" | grep -q 'hello.txt' \
+    && pass "$PREFIX info shows files" \
+    || fail "$PREFIX info — output: $INFO_OUT"
+
+  CAT_OUT=$("$BLAR" cat "$TMPDIR_TEST/${ALGO}_comp.blar" "$NORM_HELLO" 2>/dev/null)
+  [ "$CAT_OUT" = "hello world" ] \
+    && pass "$PREFIX cat correct content" \
+    || fail "$PREFIX cat (got: '$CAT_OUT')"
+
+  PEEK_OUT=$("$BLAR" peek "$TMPDIR_TEST/${ALGO}_comp.blar" "[1][0][0][pa]" 2>&1)
+  echo "$PEEK_OUT" | grep -q 'hello.txt' \
+    && pass "$PREFIX peek works" \
+    || fail "$PREFIX peek — output: $PEEK_OUT"
+
+  JSON_OUT=$("$BLAR" to-json "$TMPDIR_TEST/${ALGO}_comp.blar" 2>/dev/null)
+  ENTRY_COUNT=$(echo "$JSON_OUT" | jq '.entries | length')
+  [ "$ENTRY_COUNT" -ge 2 ] \
+    && pass "$PREFIX to-json valid ($ENTRY_COUNT entries)" \
+    || fail "$PREFIX to-json entry count: $ENTRY_COUNT"
+
+  # --- miniblar ---
+
+  "$MINIBLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_mini.mblar" \
+    "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+  [ -f "$TMPDIR_TEST/${ALGO}_mini.mblar" ] \
+    && pass "$PREFIX miniblar create produces output" \
+    || fail "$PREFIX miniblar create produces output"
+
+  MINI_LIST=$("$MINIBLAR" list "$TMPDIR_TEST/${ALGO}_mini.mblar" 2>/dev/null)
+  echo "$MINI_LIST" | grep -q 'hello.txt' \
+    && pass "$PREFIX miniblar list works" \
+    || fail "$PREFIX miniblar list — output: $MINI_LIST"
+
+  MINI_EXTRACT="$TMPDIR_TEST/${ALGO}_mini_ext"
+  mkdir -p "$MINI_EXTRACT"
+  "$MINIBLAR" extract "$TMPDIR_TEST/${ALGO}_mini.mblar" -C "$MINI_EXTRACT" 2>/dev/null
+  [ -f "$MINI_EXTRACT/$NORM_HELLO" ] && [ "$(cat "$MINI_EXTRACT/$NORM_HELLO")" = "hello world" ] \
+    && pass "$PREFIX miniblar extract correct" \
+    || fail "$PREFIX miniblar extract correct"
+
+  MINI_VERIFY=$("$MINIBLAR" verify "$TMPDIR_TEST/${ALGO}_mini.mblar" 2>&1)
+  echo "$MINI_VERIFY" | grep -q 'OK' \
+    && pass "$PREFIX miniblar verify passes" \
+    || fail "$PREFIX miniblar verify — output: $MINI_VERIFY"
+
+  MINI_CAT=$("$MINIBLAR" cat "$TMPDIR_TEST/${ALGO}_mini.mblar" "$NORM_HELLO" 2>/dev/null)
+  [ "$MINI_CAT" = "hello world" ] \
+    && pass "$PREFIX miniblar cat correct" \
+    || fail "$PREFIX miniblar cat (got: '$MINI_CAT')"
+
+  # --- Binary round-trip ---
+
+  "$BLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_binary.blar" "$TMPDIR_TEST/random.bin" 2>/dev/null
+  BIN_EXT="$TMPDIR_TEST/${ALGO}_bin_ext"
+  mkdir -p "$BIN_EXT"
+  "$BLAR" extract "$TMPDIR_TEST/${ALGO}_binary.blar" -C "$BIN_EXT" 2>/dev/null
+  cmp -s "$TMPDIR_TEST/random.bin" "$BIN_EXT/$NORM_RANDOM" \
+    && pass "$PREFIX binary round-trip" \
+    || fail "$PREFIX binary round-trip"
+
+  # --- Directory archive ---
+
+  mkdir -p "$TMPDIR_TEST/${ALGO}_dir/subdir"
+  echo "nested" > "$TMPDIR_TEST/${ALGO}_dir/subdir/file.txt"
+  echo "top" > "$TMPDIR_TEST/${ALGO}_dir/top.txt"
+  "$BLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_dircomp.blar" "$TMPDIR_TEST/${ALGO}_dir" 2>/dev/null
+
+  DIR_LIST=$("$BLAR" list "$TMPDIR_TEST/${ALGO}_dircomp.blar" 2>/dev/null)
+  echo "$DIR_LIST" | grep -q 'file.txt' \
+    && pass "$PREFIX dir archive list works" \
+    || fail "$PREFIX dir archive list — output: $DIR_LIST"
+
+  DIR_EXT="$TMPDIR_TEST/${ALGO}_dir_ext"
+  mkdir -p "$DIR_EXT"
+  "$BLAR" extract "$TMPDIR_TEST/${ALGO}_dircomp.blar" -C "$DIR_EXT" 2>/dev/null
+  NORM_NESTED="${TMPDIR_TEST#/}/${ALGO}_dir/subdir/file.txt"
+  [ -f "$DIR_EXT/$NORM_NESTED" ] && [ "$(cat "$DIR_EXT/$NORM_NESTED")" = "nested" ] \
+    && pass "$PREFIX dir extract nested content correct" \
+    || fail "$PREFIX dir extract nested content"
+
+  # --- from-json -z $ALGO ---
+
+  "$BLAR" to-json "$TMPDIR_TEST/${ALGO}_comp.blar" > "$TMPDIR_TEST/${ALGO}.json" 2>/dev/null
+  "$BLAR" from-json $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_fj.blar" "$TMPDIR_TEST/${ALGO}.json" 2>/dev/null
+  FJ_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/${ALGO}_fj.blar" | tr -d '\n')
+  echo "$FJ_HEADER" | grep -q "8110${COMP}" \
+    && pass "$PREFIX from-json creates $ALGO archive" \
+    || fail "$PREFIX from-json COMP — got $FJ_HEADER"
+
+  FJ_LIST=$("$BLAR" list "$TMPDIR_TEST/${ALGO}_fj.blar" 2>/dev/null)
+  echo "$FJ_LIST" | grep -q 'hello.txt' \
+    && pass "$PREFIX from-json round-trip list works" \
+    || fail "$PREFIX from-json round-trip — output: $FJ_LIST"
+
+done
+
+# ══════════════════════════════════════════════════════════════════════════
+# Non-parameterized tests (backward compat, aliases, help, uncompressed)
+# ══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "── Non-parameterized tests ──"
+
+# -z alone defaults to lzma2
+"$BLAR" create -z -o "$TMPDIR_TEST/default_z.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+DEFAULT_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/default_z.blar" | tr -d '\n')
+echo "$DEFAULT_HEADER" | grep -q "811001" \
+  && pass "-z alone defaults to lzma2 (COMP=0x01)" \
+  || fail "-z alone defaults to lzma2 — got $DEFAULT_HEADER"
+
+# -z lzma explicitly works
+"$BLAR" create -z lzma -o "$TMPDIR_TEST/lzma_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+LZMA_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/lzma_alias.blar" | tr -d '\n')
+echo "$LZMA_HEADER" | grep -q "811001" \
+  && pass "-z lzma alias works (COMP=0x01)" \
+  || fail "-z lzma alias — got $LZMA_HEADER"
+
+# -z bz2 alias works
+"$BLAR" create -z bz2 -o "$TMPDIR_TEST/bz2_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+BZ2_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/bz2_alias.blar" | tr -d '\n')
+echo "$BZ2_HEADER" | grep -q "811002" \
+  && pass "-z bz2 alias works (COMP=0x02)" \
+  || fail "-z bz2 alias — got $BZ2_HEADER"
+
+# Compressed is smaller than uncompressed (text files with lzma2)
+"$BLAR" create -o "$TMPDIR_TEST/uncompressed.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+COMP_SIZE=$(wc -c < "$TMPDIR_TEST/default_z.blar" | tr -d ' ')
+# Use a fresh lzma2 archive with same files for fair comparison
+"$BLAR" create -z -o "$TMPDIR_TEST/comp_both.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+COMP_BOTH=$(wc -c < "$TMPDIR_TEST/comp_both.blar" | tr -d ' ')
+UNCOMP_SIZE=$(wc -c < "$TMPDIR_TEST/uncompressed.blar" | tr -d ' ')
+[ "$COMP_BOTH" -lt "$UNCOMP_SIZE" ] \
+  && pass "lzma2 compressed smaller than uncompressed ($COMP_BOTH < $UNCOMP_SIZE)" \
+  || fail "lzma2 compressed not smaller ($COMP_BOTH >= $UNCOMP_SIZE)"
+
+# Uncompressed archives still work
+UNCOMP_LIST=$("$BLAR" list "$TMPDIR_TEST/uncompressed.blar" 2>/dev/null)
+echo "$UNCOMP_LIST" | grep -q 'hello.txt' \
+  && pass "uncompressed archive still works" \
+  || fail "uncompressed archive still works"
+
+# Help text
+BLAR_HELP=$("$BLAR" --help 2>&1)
+echo "$BLAR_HELP" | grep -q '\-z' \
+  && pass "blar --help mentions -z" \
+  || fail "blar --help mentions -z"
+for ALGO in bzip2 lz4; do
+  echo "$BLAR_HELP" | grep -q "$ALGO" \
+    && pass "blar --help mentions $ALGO" \
+    || fail "blar --help mentions $ALGO"
+done
+
+MINI_HELP=$("$MINIBLAR" --help 2>&1)
+echo "$MINI_HELP" | grep -q '\-z' \
+  && pass "miniblar --help mentions -z" \
+  || fail "miniblar --help mentions -z"
+
+# ── Results ──────────────────────────────────────────────────────────────
+
+echo ""
+echo "========================================"
+echo "Results: $PASS passed, $FAIL failed"
+echo "========================================"
+[ "$FAIL" -eq 0 ] || exit 1
