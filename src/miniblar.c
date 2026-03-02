@@ -148,6 +148,14 @@ static void print_version(void) {
     printf("miniblar %s\n", BLAR_VERSION);
 }
 
+/* ── Progress callback for archive creation FFI ──────────────────────── */
+
+static void create_progress_cb(uint64_t entries_done, uint64_t bytes_done,
+                                void *user_ctx) {
+    progrez_ctx *progress = (progrez_ctx *)user_ctx;
+    if (progress) progrez_update(progress, entries_done, bytes_done);
+}
+
 /* ── cmd_create ───────────────────────────────────────────────────────── */
 
 static int cmd_create(int argc, char **argv) {
@@ -319,17 +327,19 @@ static int cmd_create(int argc, char **argv) {
         if (progress) progrez_update(progress, (uint64_t)(i + 1), bytes_done);
     }
 
-    /* Progress: switch to determinate for archive creation */
+    /* Progress: switch to determinate "Creating" phase.
+     * The FFI now calls back per-entry so we get real progress. */
     if (progress) {
         progrez_set_label(progress, "Creating");
         progrez_set_determinate(progress, (uint64_t)file_count, bytes_done);
-        progrez_update(progress, (uint64_t)file_count, bytes_done);
     }
 
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(entries, (size_t)file_count, create_flags,
+                                           progress ? create_progress_cb : NULL,
+                                           progress,
                                            &archive_buf, &archive_len);
 
     for (int i = 0; i < file_count; i++) {
@@ -369,6 +379,8 @@ static int cmd_create(int argc, char **argv) {
     }
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
+    fprintf(stderr, "Created %s (%llu bytes)\n", out_path,
+            (unsigned long long)archive_len);
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }

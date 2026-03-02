@@ -352,7 +352,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
     if (json_entries.len == 0) {
         // Empty archive
         const empty_entries = &[_]mini_blar.ArchiveEntry{};
-        const result = mini_blar.createFullArchive(allocator, empty_entries) catch |e| return mapContainerError(e);
+        const result = mini_blar.createFullArchive(allocator, empty_entries, null, null) catch |e| return mapContainerError(e);
         return result;
     }
 
@@ -456,7 +456,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
     }
 
     // Create the archive (Merkle hashes auto-computed by createFullArchive)
-    const result = mini_blar.createFullArchive(allocator, archive_entries) catch |e| return mapContainerError(e);
+    const result = mini_blar.createFullArchive(allocator, archive_entries, null, null) catch |e| return mapContainerError(e);
     return result;
 }
 
@@ -632,7 +632,7 @@ test "full archive round-trip: create → toJson → fromJson → byte-identical
         .{ .file = files[1] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -658,7 +658,7 @@ test "binary content: pb-encodes in JSON, pb-decodes back correctly" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -695,7 +695,7 @@ test "zero-value field omission in output" {
         .{ .file = files[0] },
     };
 
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     const json = try archiveToJson(allocator, archive);
@@ -724,7 +724,7 @@ test "dir entries with Merkle hash recomputation" {
         } },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -768,7 +768,7 @@ test "empty content round-trip" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -805,7 +805,7 @@ test "xattrs round-trip via JSON" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);

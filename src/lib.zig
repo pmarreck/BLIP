@@ -225,6 +225,8 @@ export fn blip_archive_create_full(
     entries: [*]const CArchiveEntry,
     entry_count: usize,
     flags: u32,
+    progress_fn: mini_blar.ProgressFn,
+    progress_ctx: ?*anyopaque,
     out_buf: *[*]u8,
     out_len: *usize,
 ) callconv(.c) i32 {
@@ -275,7 +277,7 @@ export fn blip_archive_create_full(
         }
     }
 
-    const result = mini_blar.createFullArchive(page_allocator, archive_entries) catch |e| {
+    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, progress_ctx) catch |e| {
         return fullArchiveErrorCode(e);
     };
     out_buf.* = result.ptr;
@@ -1149,7 +1151,7 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var count: u64 = undefined;
@@ -1184,7 +1186,7 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_type: u8 = undefined;
@@ -1209,7 +1211,7 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_mode: u16 = undefined;

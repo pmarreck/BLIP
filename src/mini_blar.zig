@@ -465,7 +465,15 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
 /// Merkle hashes (xh64) for DIR entries are auto-computed from child FILE checksums;
 /// callers may leave xh64 zeroed. Entries are serialized in the order given.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
-pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (Allocator.Error || ContainerError)![]u8 {
+/// C-callable progress callback: (entries_done, bytes_done, user_ctx).
+pub const ProgressFn = ?*const fn (u64, u64, ?*anyopaque) callconv(.c) void;
+
+pub fn createFullArchive(
+    allocator: Allocator,
+    entries: []const ArchiveEntry,
+    progress_fn: ProgressFn,
+    progress_ctx: ?*anyopaque,
+) (Allocator.Error || ContainerError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
@@ -481,6 +489,9 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
     defer file_hashes.deinit();
 
     var has_dir = false;
+    var entries_done: u64 = 0;
+    var bytes_done: u64 = 0;
+
     for (entries) |entry| {
         switch (entry) {
             .file => |file| {
@@ -494,6 +505,9 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
                     @memcpy(&hash, csum[0..8]);
                     try file_hashes.put(file.path, hash);
                 }
+                entries_done += 1;
+                bytes_done += file.content.len;
+                if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
             },
             .dir => {
                 // Placeholder — will be filled after Merkle computation
@@ -532,6 +546,8 @@ pub fn createFullArchive(allocator: Allocator, entries: []const ArchiveEntry) (A
 
                 const dir_bytes = try serializeDirEntry(allocator, dir_with_merkle, &to_free);
                 entry_elements.items[i] = dir_bytes;
+                entries_done += 1;
+                if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
             },
             .file => {},
         }
@@ -884,7 +900,7 @@ test "full archive with DIR + FILE entries round-trips" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries);
+    const archive = try createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1008,7 +1024,7 @@ test "DIR metadata round-trip with 2-char keys" {
             .username = "peter",
         } },
     };
-    const archive = try createFullArchive(allocator, &entries);
+    const archive = try createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1119,7 +1135,7 @@ test "DIR container has xxHash64 checksum" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries);
+    const archive = try createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);

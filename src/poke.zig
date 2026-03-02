@@ -575,7 +575,7 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
     }
 
     // Re-serialize the archive
-    const result = mini_blar.createFullArchive(allocator, entries) catch |e| {
+    const result = mini_blar.createFullArchive(allocator, entries, null, null) catch |e| {
         return switch (e) {
             error.OutOfMemory => PokeError.OutOfMemory,
             error.InvalidContainerType => PokeError.InvalidContainerType,
@@ -615,7 +615,7 @@ test "round-trip: create -> reconstruct -> re-create produces identical archive"
         .{ .file = files[1] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     // Reconstruct
@@ -651,7 +651,7 @@ test "round-trip: create -> reconstruct -> re-create produces identical archive"
     }
 
     // Re-create
-    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed, null, null);
     defer allocator.free(archive2);
 
     // Should be byte-identical
@@ -666,7 +666,7 @@ test "poke content: change DATA, verify via peek" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     // Poke new content
@@ -691,7 +691,7 @@ test "poke metadata: change path, verify" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     // Poke new path
@@ -719,7 +719,7 @@ test "poke empty value allowed" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     const poked = try pokeArchive(allocator, archive, "[1][0][1]", "");
@@ -739,7 +739,7 @@ test "poke error on non-leaf target" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     // [1][0] is a FILE container, not a leaf
@@ -758,7 +758,7 @@ test "poke error on magic bytes" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     try testing.expectError(PokeError.ImmutableTarget, pokeArchive(allocator, archive, "[0]", "x"));
@@ -776,7 +776,7 @@ test "poke multi-file: only target modified" {
         .{ .file = files[1] },
         .{ .file = files[2] },
     };
-    const archive = try mini_blar.createFullArchive(allocator, &entries);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive);
 
     // Poke file 1 (b.txt)
@@ -807,7 +807,7 @@ test "poke integrity passes after every poke" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    var archive = try mini_blar.createFullArchive(allocator, &entries);
+    var archive = try mini_blar.createFullArchive(allocator, &entries, null, null);
 
     // Poke content
     const poked1 = try pokeArchive(allocator, archive, "[1][0][1]", "new content");
@@ -845,7 +845,7 @@ test "reconstruct preserves FILE with xattrs" {
     const entries = [_]mini_blar.ArchiveEntry{
         .{ .file = files[0] },
     };
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const reconstructed = try reconstructEntries(allocator, archive1);
@@ -879,7 +879,7 @@ test "reconstruct preserves FILE with xattrs" {
         allocator.free(reconstructed);
     }
 
-    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed, null, null);
     defer allocator.free(archive2);
 
     try testing.expectEqualSlices(u8, archive1, archive2);
@@ -901,7 +901,7 @@ test "reconstruct preserves DIR entries" {
             .mode = 0o644,
         } },
     };
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null);
     defer allocator.free(archive1);
 
     const reconstructed = try reconstructEntries(allocator, archive1);
@@ -935,7 +935,7 @@ test "reconstruct preserves DIR entries" {
         allocator.free(reconstructed);
     }
 
-    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed);
+    const archive2 = try mini_blar.createFullArchive(allocator, reconstructed, null, null);
     defer allocator.free(archive2);
 
     try testing.expectEqualSlices(u8, archive1, archive2);

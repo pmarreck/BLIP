@@ -5,7 +5,10 @@ const container = @import("container.zig");
 const csum_mod = @import("checksum.zig");
 const z7z = @import("z7z");
 const bzip2z = @import("bzip2z");
-const lz4 = @cImport(@cInclude("lz4.h"));
+const lz4 = @cImport({
+    @cInclude("lz4.h");
+    @cInclude("lz4frame.h");
+});
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
@@ -33,25 +36,27 @@ pub fn compress(allocator: Allocator, algo: ct.CompressionId, data: []const u8) 
             };
         },
         .lz4 => {
-            const src_size: c_int = @intCast(data.len);
-            const bound = lz4.LZ4_compressBound(src_size);
-            if (bound <= 0) return error.CompressionFailed;
-            const dest_buf = try allocator.alloc(u8, @intCast(bound));
+            // Use LZ4 frame API — handles arbitrary sizes (no 2 GB block limit)
+            // and is self-describing (frame header stores content size).
+            var prefs: lz4.LZ4F_preferences_t = std.mem.zeroes(lz4.LZ4F_preferences_t);
+            prefs.frameInfo.contentSize = data.len;
+            const bound = lz4.LZ4F_compressFrameBound(data.len, &prefs);
+            if (lz4.LZ4F_isError(bound) != 0) return error.CompressionFailed;
+            const dest_buf = try allocator.alloc(u8, bound);
             errdefer allocator.free(dest_buf);
-            const compressed_size = lz4.LZ4_compress_default(
-                @ptrCast(data.ptr),
-                @ptrCast(dest_buf.ptr),
-                src_size,
-                bound,
+            const compressed_size = lz4.LZ4F_compressFrame(
+                dest_buf.ptr,
+                dest_buf.len,
+                data.ptr,
+                data.len,
+                &prefs,
             );
-            if (compressed_size <= 0) {
+            if (lz4.LZ4F_isError(compressed_size) != 0) {
                 allocator.free(dest_buf);
                 return error.CompressionFailed;
             }
-            // Shrink to actual compressed size
-            const result = allocator.realloc(dest_buf, @intCast(compressed_size)) catch {
-                // realloc to shrink shouldn't fail, but if it does, keep original
-                return dest_buf[0..@intCast(compressed_size)];
+            const result = allocator.realloc(dest_buf, compressed_size) catch {
+                return dest_buf[0..compressed_size];
             };
             return result;
         },
@@ -87,16 +92,20 @@ pub fn decompress(allocator: Allocator, algo: ct.CompressionId, data: []const u8
             };
         },
         .lz4 => {
-            // LZ4 requires knowing the decompressed size (not self-describing)
+            // Use LZ4 frame API for decompression — self-describing, no size limit.
+            // decomp_len from LP header is used as allocation hint.
+            var dctx: ?*lz4.LZ4F_dctx = null;
+            const create_err = lz4.LZ4F_createDecompressionContext(&dctx, lz4.LZ4F_VERSION);
+            if (lz4.LZ4F_isError(create_err) != 0 or dctx == null) return error.DecompressionFailed;
+            defer _ = lz4.LZ4F_freeDecompressionContext(dctx);
+
             const out_buf = try allocator.alloc(u8, @intCast(decomp_len));
             errdefer allocator.free(out_buf);
-            const result = lz4.LZ4_decompress_safe(
-                @ptrCast(data.ptr),
-                @ptrCast(out_buf.ptr),
-                @intCast(data.len),
-                @intCast(decomp_len),
-            );
-            if (result < 0 or @as(u64, @intCast(result)) != decomp_len) {
+
+            var src_size = data.len;
+            var dst_size = out_buf.len;
+            const ret = lz4.LZ4F_decompress(dctx, out_buf.ptr, &dst_size, data.ptr, &src_size, null);
+            if (lz4.LZ4F_isError(ret) != 0 or dst_size != @as(usize, @intCast(decomp_len))) {
                 allocator.free(out_buf);
                 return error.DecompressionFailed;
             }

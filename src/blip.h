@@ -127,11 +127,20 @@ typedef struct {
     uint8_t xh64[8];         /* Merkle hash for dirs (pre-computed), ignored for files */
 } blip_archive_entry;
 
+/* Progress callback for archive creation.
+ * Called after each entry is serialized with cumulative counts.
+ * entries_done: entries serialized so far
+ * bytes_done: cumulative content bytes serialized so far */
+typedef void (*blip_progress_fn)(uint64_t entries_done, uint64_t bytes_done,
+                                  void *user_ctx);
+
 /* Create a full BLIP archive with FILE + DIR entries and metadata.
+ * progress_fn/progress_ctx: optional callback for per-entry progress (NULL to skip).
  * Returns 0 on success, negative error code on failure.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
                                   uint32_t flags,
+                                  blip_progress_fn progress_fn, void *progress_ctx,
                                   uint8_t **out_buf, size_t *out_len);
 
 /* Get the container type of an entry (5 = FILE, 7 = DIR — v2 ContainerTypeId). */
