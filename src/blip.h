@@ -134,13 +134,23 @@ typedef struct {
 typedef void (*blip_progress_fn)(uint64_t entries_done, uint64_t bytes_done,
                                   void *user_ctx);
 
+/* Phase callback for archive creation.
+ * Called when the operation transitions to a new phase (e.g., "Assembling").
+ * label/label_len: UTF-8 phase name (not null-terminated). */
+typedef void (*blip_phase_fn)(const uint8_t *label, size_t label_len,
+                               void *user_ctx);
+
 /* Create a full BLIP archive with FILE + DIR entries and metadata.
- * progress_fn/progress_ctx: optional callback for per-entry progress (NULL to skip).
+ * progress_fn: optional callback for per-entry progress (NULL to skip).
+ * phase_fn: optional callback for phase transitions (NULL to skip).
+ * progress_ctx: shared user context for both callbacks.
  * Returns 0 on success, negative error code on failure.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
                                   uint32_t flags,
-                                  blip_progress_fn progress_fn, void *progress_ctx,
+                                  blip_progress_fn progress_fn,
+                                  blip_phase_fn phase_fn,
+                                  void *progress_ctx,
                                   uint8_t **out_buf, size_t *out_len);
 
 /* Get the container type of an entry (5 = FILE, 7 = DIR — v2 ContainerTypeId). */
@@ -274,12 +284,22 @@ int32_t blip_lzma2_compress(const uint8_t *buf, size_t buf_len,
 int32_t blip_lzma2_decompress(const uint8_t *buf, size_t buf_len,
                                uint8_t **out_buf, size_t *out_len);
 
+/* Progress callback for compression: (bytes_done, bytes_total, user_ctx). */
+typedef void (*blip_compress_progress_fn)(uint64_t bytes_done, uint64_t bytes_total,
+                                           void *user_ctx);
+
 /* Compress a BLIP container with the specified algorithm.
  * algo_id: BLIP_COMP_LZMA2, BLIP_COMP_BZIP2, BLIP_COMP_LZ4, or BLIP_COMP_ZSTD.
+ * progress_fn: optional callback for compression byte progress (NULL to skip).
+ * phase_fn: optional callback for phase transitions (NULL to skip).
+ * progress_ctx: shared user context for both callbacks.
  * Returns 0 on success, negative error code on failure.
  * Caller must free output buffer with blip_free(). */
 int32_t blip_compress_container(const uint8_t *buf, size_t buf_len,
                                  uint8_t algo_id,
+                                 blip_compress_progress_fn progress_fn,
+                                 blip_phase_fn phase_fn,
+                                 void *progress_ctx,
                                  uint8_t **out_buf, size_t *out_len);
 
 /* Decompress a compressed LP container (any supported algorithm).

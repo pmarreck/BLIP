@@ -5,3 +5,4 @@ zig-out/
 result
 *.blar
 *.mblar
+.DS_Store

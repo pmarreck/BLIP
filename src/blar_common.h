@@ -85,6 +85,20 @@ static uint8_t *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
+/* ── Utility: human-readable file size ────────────────────────────────── */
+
+static const char *format_size(uint64_t bytes, char *buf, size_t buf_size) {
+    const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+    double size = (double)bytes;
+    int unit = 0;
+    while (size >= 1024.0 && unit < 4) { size /= 1024.0; unit++; }
+    if (unit == 0)
+        snprintf(buf, buf_size, "%llu B", (unsigned long long)bytes);
+    else
+        snprintf(buf, buf_size, "%.1f %s", size, units[unit]);
+    return buf;
+}
+
 /* ── Utility: write buffer to file ───────────────────────────────────── */
 
 static bool write_file(const char *path, const uint8_t *data, size_t len) {
@@ -93,6 +107,29 @@ static bool write_file(const char *path, const uint8_t *data, size_t len) {
     if (len > 0 && fwrite(data, 1, len, f) != len) {
         fclose(f);
         return false;
+    }
+    fclose(f);
+    return true;
+}
+
+/* Write with progress: writes in 4 MB chunks, calling back after each.
+ * progress_cb(bytes_written, user_ctx) is called after every chunk. */
+typedef void (*write_progress_fn)(uint64_t bytes_written, void *user_ctx);
+
+static bool write_file_progress(const char *path, const uint8_t *data, size_t len,
+                                 write_progress_fn progress_cb, void *user_ctx) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    const size_t chunk = 64 * 1024 * 1024;
+    size_t written = 0;
+    while (written < len) {
+        size_t n = len - written < chunk ? len - written : chunk;
+        if (fwrite(data + written, 1, n, f) != n) {
+            fclose(f);
+            return false;
+        }
+        written += n;
+        if (progress_cb) progress_cb((uint64_t)written, user_ctx);
     }
     fclose(f);
     return true;
@@ -961,6 +998,7 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
         rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+                                      NULL, NULL, NULL,
                                       &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {

@@ -468,10 +468,15 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
 /// C-callable progress callback: (entries_done, bytes_done, user_ctx).
 pub const ProgressFn = ?*const fn (u64, u64, ?*anyopaque) callconv(.c) void;
 
+/// C-callable phase callback: (label_ptr, label_len, user_ctx).
+/// Fires when the operation transitions to a new phase (e.g., "Assembling").
+pub const PhaseFn = ?*const fn ([*]const u8, usize, ?*anyopaque) callconv(.c) void;
+
 pub fn createFullArchive(
     allocator: Allocator,
     entries: []const ArchiveEntry,
     progress_fn: ProgressFn,
+    phase_fn: PhaseFn,
     progress_ctx: ?*anyopaque,
 ) (Allocator.Error || ContainerError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
@@ -553,7 +558,11 @@ pub fn createFullArchive(
         }
     }
 
-    // Phase 3: Assemble archive
+    // Phase 3: Assemble archive — signal phase change so callers can update UI
+    if (phase_fn) |cb| {
+        const label = "Assembling";
+        cb(label.ptr, label.len, progress_ctx);
+    }
     const magic = if (has_dir) MAGIC_BLAR else MAGIC_MBAR;
     const magic_bytes = try leaf.serializeData(allocator, magic);
     try to_free.append(allocator, magic_bytes);
@@ -900,7 +909,7 @@ test "full archive with DIR + FILE entries round-trips" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1024,7 +1033,7 @@ test "DIR metadata round-trip with 2-char keys" {
             .username = "peter",
         } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1135,7 +1144,7 @@ test "DIR container has xxHash64 checksum" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);

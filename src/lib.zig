@@ -226,6 +226,7 @@ export fn blip_archive_create_full(
     entry_count: usize,
     flags: u32,
     progress_fn: mini_blar.ProgressFn,
+    phase_fn: mini_blar.PhaseFn,
     progress_ctx: ?*anyopaque,
     out_buf: *[*]u8,
     out_len: *usize,
@@ -277,7 +278,7 @@ export fn blip_archive_create_full(
         }
     }
 
-    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, progress_ctx) catch |e| {
+    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, phase_fn, progress_ctx) catch |e| {
         return fullArchiveErrorCode(e);
     };
     out_buf.* = result.ptr;
@@ -787,18 +788,22 @@ const CompressionId = mini_blar.container_mod.CompressionId;
 
 /// Compress a BLIP container with the specified algorithm.
 /// algo_id: 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
+/// progress_fn/progress_ctx: optional callback reporting (bytes_done, bytes_total).
 /// Returns 0 on success, negative error code on failure.
 /// Caller must free output buffer with blip_free().
 export fn blip_compress_container(
     buf: [*]const u8,
     buf_len: usize,
     algo_id: u8,
+    progress_fn: compression_mod.CompressProgressFn,
+    phase_fn: compression_mod.PhaseFn,
+    progress_ctx: ?*anyopaque,
     out_buf: *[*]u8,
     out_len: *usize,
 ) callconv(.c) i32 {
     const algo = std.meta.intToEnum(CompressionId, @as(u7, @truncate(algo_id))) catch return -32;
     const slice = buf[0..buf_len];
-    const result = compression_mod.compressContainer(page_allocator, algo, slice) catch |e| switch (e) {
+    const result = compression_mod.compressContainer(page_allocator, algo, slice, progress_fn, phase_fn, progress_ctx) catch |e| switch (e) {
         error.OutOfMemory => return -13,
         error.CompressionFailed => return -24,
         error.UnsupportedCompression => return -32,
@@ -1151,7 +1156,7 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var count: u64 = undefined;
@@ -1186,7 +1191,7 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_type: u8 = undefined;
@@ -1211,7 +1216,7 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_mode: u16 = undefined;

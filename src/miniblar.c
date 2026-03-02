@@ -148,12 +148,35 @@ static void print_version(void) {
     printf("miniblar %s\n", BLAR_VERSION);
 }
 
-/* ── Progress callback for archive creation FFI ──────────────────────── */
+/* ── Progress callbacks for FFI operations ────────────────────────────── */
 
 static void create_progress_cb(uint64_t entries_done, uint64_t bytes_done,
                                 void *user_ctx) {
     progrez_ctx *progress = (progrez_ctx *)user_ctx;
     if (progress) progrez_update(progress, entries_done, bytes_done);
+}
+
+static void compress_progress_cb(uint64_t bytes_done, uint64_t bytes_total,
+                                  void *user_ctx) {
+    (void)bytes_total;
+    progrez_ctx *progress = (progrez_ctx *)user_ctx;
+    if (progress) progrez_update(progress, 0, bytes_done);
+}
+
+static void write_progress_cb(uint64_t bytes_written, void *user_ctx) {
+    progrez_ctx *progress = (progrez_ctx *)user_ctx;
+    if (progress) progrez_update(progress, 0, bytes_written);
+}
+
+static void phase_cb(const uint8_t *label, size_t label_len, void *user_ctx) {
+    progrez_ctx *progress = (progrez_ctx *)user_ctx;
+    if (!progress) return;
+    char buf[64];
+    size_t n = label_len < sizeof(buf) - 1 ? label_len : sizeof(buf) - 1;
+    memcpy(buf, label, n);
+    buf[n] = '\0';
+    progrez_set_label(progress, buf);
+    progrez_set_indeterminate(progress);
 }
 
 /* ── cmd_create ───────────────────────────────────────────────────────── */
@@ -339,6 +362,7 @@ static int cmd_create(int argc, char **argv) {
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(entries, (size_t)file_count, create_flags,
                                            progress ? create_progress_cb : NULL,
+                                           progress ? phase_cb : NULL,
                                            progress,
                                            &archive_buf, &archive_len);
 
@@ -355,9 +379,16 @@ static int cmd_create(int argc, char **argv) {
 
     /* Optionally compress */
     if (compress_algo != 0) {
+        if (progress) {
+            progrez_set_label(progress, "Compressing");
+            progrez_set_determinate(progress, 0, archive_len);
+        }
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
         rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+                                      progress ? compress_progress_cb : NULL,
+                                      progress ? phase_cb : NULL,
+                                      progress,
                                       &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);
         if (rc != BLIP_OK) {
@@ -370,7 +401,13 @@ static int cmd_create(int argc, char **argv) {
         archive_len = compressed_len;
     }
 
-    if (!write_file(out_path, archive_buf, archive_len)) {
+    if (progress) {
+        progrez_set_label(progress, "Writing");
+        progrez_set_determinate(progress, 0, archive_len);
+    }
+
+    if (!(progress ? write_file_progress(out_path, archive_buf, archive_len, write_progress_cb, progress)
+                   : write_file(out_path, archive_buf, archive_len))) {
         if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "miniblar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
@@ -379,8 +416,9 @@ static int cmd_create(int argc, char **argv) {
     }
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-    fprintf(stderr, "Created %s (%llu bytes)\n", out_path,
-            (unsigned long long)archive_len);
+    char size_buf[32];
+    fprintf(stderr, "Created %s (%s)\n", out_path,
+            format_size(archive_len, size_buf, sizeof(size_buf)));
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
