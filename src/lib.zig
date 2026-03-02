@@ -1131,10 +1131,17 @@ test "C FFI: blip_archive_file_verify checks per-file hash" {
     try std.testing.expectEqual(@as(i32, -8), blip_archive_file_verify(out_buf, out_len, 1));
 }
 
-// bzip2z has a decompression bug (OutputOverflow) when data exceeds one bzip2
-// block (~900,000 bytes at level 9). Skipped until upstream fix lands.
-// See bzip2z/inbox/ for the bug report with reproduction steps.
-test "C FFI: blip_compress_container bzip2 round-trip >900KB (blocked on bzip2z bug)" {
+// bzip2z has two known bugs:
+// 1. Compression crash (Bus error / SIGBUS) on large data (~232MB real-world content)
+// 2. Decompression OutputOverflow on multi-block streams (data > ~900KB at level 9)
+// See bzip2z/inbox/ for bug reports.
+// bzip2z bugs (being fixed upstream):
+// 1. CLI SIGBUS during bzip2 compress on ~232MB real-world data (page_allocator)
+//    - In test runner (testing.allocator): compress succeeds but decompress fails
+//    - In CLI (page_allocator): crashes with Bus error during compress
+// 2. Decompression OutputOverflow on multi-block streams (data > ~900KB)
+// Both are upstream bzip2z issues. Skipped until fix lands.
+test "C FFI: bzip2 compress+decompress large archive (blocked on bzip2z bugs)" {
     return error.SkipZigTest;
 }
 
