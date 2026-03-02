@@ -365,10 +365,6 @@ test "isCompressed returns true for compressed container" {
     try testing.expect(isCompressed(compressed));
 }
 
-// NOTE: bzip2z has bugs on multi-block streams (data > ~900KB at level 9):
-// compression SIGBUS on large data with page_allocator, and decompression
-// OutputOverflow. See bzip2z/inbox/ and lib.zig for skipped regression tests.
-
 test "isCompressed returns false for plain container" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");

@@ -1131,18 +1131,30 @@ test "C FFI: blip_archive_file_verify checks per-file hash" {
     try std.testing.expectEqual(@as(i32, -8), blip_archive_file_verify(out_buf, out_len, 1));
 }
 
-// bzip2z has two known bugs:
-// 1. Compression crash (Bus error / SIGBUS) on large data (~232MB real-world content)
-// 2. Decompression OutputOverflow on multi-block streams (data > ~900KB at level 9)
-// See bzip2z/inbox/ for bug reports.
-// bzip2z bugs (being fixed upstream):
-// 1. CLI SIGBUS during bzip2 compress on ~232MB real-world data (page_allocator)
-//    - In test runner (testing.allocator): compress succeeds but decompress fails
-//    - In CLI (page_allocator): crashes with Bus error during compress
-// 2. Decompression OutputOverflow on multi-block streams (data > ~900KB)
-// Both are upstream bzip2z issues. Skipped until fix lands.
-test "C FFI: bzip2 compress+decompress large archive (blocked on bzip2z bugs)" {
-    return error.SkipZigTest;
+test "C FFI: bzip2 compress+decompress multi-block archive" {
+    // Regression test: bzip2 multi-block streams (data > ~900KB at level 9)
+    // previously caused OutputOverflow on decompression. Fixed in bzip2z f9187bf.
+    const size = 950_000; // >900KB to ensure multi-block
+    var data: [size]u8 = undefined;
+    // Use a pattern that exercises the RLE-heavy path
+    for (&data, 0..) |*byte, i| {
+        byte.* = @truncate(i *% 7 +% (i >> 16));
+    }
+
+    var out_buf: [*]u8 = undefined;
+    var out_len: usize = undefined;
+    const rc = blip_compress_container(&data, data.len, 2, null, null, null, &out_buf, &out_len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer blip_free(out_buf, out_len);
+
+    var dec_buf: [*]u8 = undefined;
+    var dec_len: usize = undefined;
+    const rc2 = blip_decompress_container(out_buf, out_len, &dec_buf, &dec_len);
+    try std.testing.expectEqual(@as(i32, 0), rc2);
+    defer blip_free(dec_buf, dec_len);
+
+    try std.testing.expectEqual(data.len, dec_len);
+    try std.testing.expectEqualSlices(u8, &data, dec_buf[0..dec_len]);
 }
 
 test "C FFI: blip_archive_create_full with FILE + DIR entries" {

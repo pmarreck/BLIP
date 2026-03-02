@@ -9,8 +9,8 @@
             .hash = "z7z-0.1.0-rkKuF0UdBQDsZxiiNFWuuoHVeGLFO078oGD6yQQiSXoA",
         },
         .bzip2z = .{
-            .url = "https://github.com/pmarreck/bzip2z/archive/cc8e68a3463ea1557e663d47dfbdc4c480ec7082.tar.gz",
-            .hash = "bzip2z-0.1.0-m5Ndlp4rAwC04sOUUs-UpwOM65-O6XmhUiH0ANOjvD04",
+            .url = "https://github.com/pmarreck/bzip2z/archive/f9187bf2410f511f1a3c10c8e2c0c0815a4d36eb.tar.gz",
+            .hash = "bzip2z-0.1.0-m5Ndll0qAwAOnbG9tepFwl-yOW7Oj2EltKKDqx6Azstu",
         },
         .lz4 = .{
             .url = "https://github.com/pmarreck/lz4/archive/675532cbcc0609ddfc44a6e13240902574579a25.tar.gz",

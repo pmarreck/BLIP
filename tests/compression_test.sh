@@ -252,9 +252,6 @@ echo "$MINI_HELP" | grep -q '\-z' \
   || fail "miniblar --help mentions -z"
 
 # ── Large payload compression ────────────────────────────────────────────
-# NOTE: bzip2 is excluded from large-payload tests due to a known bzip2z bug
-# (OutputOverflow on multi-block decompression, i.e. data > ~900KB).
-# See bzip2z/inbox/ for the bug report.
 
 echo ""
 echo "=== Large payload compression ==="
@@ -262,7 +259,7 @@ echo "=== Large payload compression ==="
 LARGE_FILE="$TMPDIR_TEST/large.bin"
 dd if=/dev/urandom bs=1048576 count=50 of="$LARGE_FILE" 2>/dev/null
 
-for ALGO in lz4 lzma2; do
+for ALGO in lz4 lzma2 bzip2; do
   LARGE_ARCHIVE="$TMPDIR_TEST/large_${ALGO}.blar"
   if "$BLAR" create -z "$ALGO" -o "$LARGE_ARCHIVE" "$LARGE_FILE" 2>/dev/null; then
     pass "large payload ($ALGO): create succeeds"
