@@ -365,6 +365,13 @@ test "isCompressed returns true for compressed container" {
     try testing.expect(isCompressed(compressed));
 }
 
+// NOTE: bzip2z has a decompression bug (OutputOverflow) on multi-block streams
+// with certain data patterns (e.g. BLIP archive structure > 900KB).
+// See bzip2z inbox for details. The test below is disabled until fixed upstream.
+// test "bzip2 compressContainer round-trip >900KB (blocked on bzip2z OutputOverflow bug)" {
+//     ... see lib.zig FFI test for reproduction ...
+// }
+
 test "isCompressed returns false for plain container" {
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");

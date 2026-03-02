@@ -251,6 +251,47 @@ echo "$MINI_HELP" | grep -q '\-z' \
   && pass "miniblar --help mentions -z" \
   || fail "miniblar --help mentions -z"
 
+# ── Large payload compression ────────────────────────────────────────────
+# NOTE: bzip2 is excluded from large-payload tests due to a known bzip2z bug
+# (OutputOverflow on multi-block decompression, i.e. data > ~900KB).
+# See bzip2z/inbox/ for the bug report.
+
+echo ""
+echo "=== Large payload compression ==="
+
+LARGE_FILE="$TMPDIR_TEST/large.bin"
+dd if=/dev/urandom bs=1048576 count=50 of="$LARGE_FILE" 2>/dev/null
+
+for ALGO in lz4 lzma2; do
+  LARGE_ARCHIVE="$TMPDIR_TEST/large_${ALGO}.blar"
+  if "$BLAR" create -z "$ALGO" -o "$LARGE_ARCHIVE" "$LARGE_FILE" 2>/dev/null; then
+    pass "large payload ($ALGO): create succeeds"
+    if "$BLAR" list "$LARGE_ARCHIVE" 2>/dev/null | grep -q "large.bin"; then
+      pass "large payload ($ALGO): list shows file"
+    else
+      fail "large payload ($ALGO): list shows file"
+    fi
+    LARGE_EXTRACT="$TMPDIR_TEST/large_extract_${ALGO}"
+    mkdir -p "$LARGE_EXTRACT"
+    if "$BLAR" extract "$LARGE_ARCHIVE" -C "$LARGE_EXTRACT" 2>/dev/null; then
+      EXTRACTED_FILE=$(find "$LARGE_EXTRACT" -name "large.bin" -type f)
+      if [ -n "$EXTRACTED_FILE" ] && cmp -s "$LARGE_FILE" "$EXTRACTED_FILE"; then
+        pass "large payload ($ALGO): round-trip matches"
+      else
+        fail "large payload ($ALGO): round-trip matches"
+      fi
+    else
+      fail "large payload ($ALGO): extract succeeds"
+    fi
+    rm -f "$LARGE_ARCHIVE"
+    rm -rf "$LARGE_EXTRACT"
+  else
+    fail "large payload ($ALGO): create succeeds (exit code $?)"
+  fi
+done
+
+rm -f "$LARGE_FILE"
+
 # ── Results ──────────────────────────────────────────────────────────────
 
 echo ""

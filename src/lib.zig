@@ -1131,6 +1131,13 @@ test "C FFI: blip_archive_file_verify checks per-file hash" {
     try std.testing.expectEqual(@as(i32, -8), blip_archive_file_verify(out_buf, out_len, 1));
 }
 
+// bzip2z has a decompression bug (OutputOverflow) when data exceeds one bzip2
+// block (~900,000 bytes at level 9). Skipped until upstream fix lands.
+// See bzip2z/inbox/ for the bug report with reproduction steps.
+test "C FFI: blip_compress_container bzip2 round-trip >900KB (blocked on bzip2z bug)" {
+    return error.SkipZigTest;
+}
+
 test "C FFI: blip_archive_create_full with FILE + DIR entries" {
     const entries = [_]CArchiveEntry{
         .{
