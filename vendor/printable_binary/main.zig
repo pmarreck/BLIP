@@ -28,6 +28,7 @@ const Options = struct {
     range_start: ?i64 = null,
     range_end: ?i64 = null,
     no_double_encode_check: bool = false,
+    hexlike: bool = false,
 };
 
 const MappingsMode = enum { none, table, json, csv };
@@ -259,6 +260,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
                 opts.mappings_mode = .csv;
             } else if (std.mem.eql(u8, name, "no-double-encode-check")) {
                 opts.no_double_encode_check = true;
+            } else if (std.mem.eql(u8, name, "hexlike")) {
+                opts.hexlike = true;
             } else if (std.mem.eql(u8, name, "help")) {
                 opts.help_mode = true;
             } else {
@@ -280,6 +283,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
                         opts.crlf_mode = true;
                     },
                     'S' => opts.strip_whitespace = true,
+                    'X' => opts.hexlike = true,
                     'h' => opts.help_mode = true,
                     'f' => {
                         if (j + 1 < arg.len) {
@@ -324,6 +328,12 @@ fn printUsage() void {
         \\Options:
         \\  -d, --decode       Decode mode (default is encode mode)
         \\  -p, --passthrough  Pass input to stdout unchanged, send encoded data to stderr
+        \\
+        \\Encoding modes:
+        \\  -X, --hexlike      Hexlike mode: passthrough ASCII stays as-is, all other bytes
+        \\                     shown as uppercase hex runs prefixed by Οχ (Greek Omicron+Chi,
+        \\                     NOT ASCII 0x — beware when copying hex for other purposes).
+        \\                     Use with -d to decode hexlike-encoded data back to binary.
         \\
         \\Encode options (preserve literal characters instead of encoding):
         \\  -s, --spaces       Preserve literal spaces (don't encode to visible glyph)
@@ -495,33 +505,66 @@ pub fn main() !void {
             writeStats("Warning: --passthrough ignored in decode mode\n", .{});
         }
 
-        // Warn about spaces after newlines in spaces + strip-whitespace mode
-        // (two consecutive spaces after newline suggests indentation being treated as data)
-        if (opts.spaces_mode and opts.strip_whitespace) {
-            var prev1: u8 = 0;
-            var prev2: u8 = 0;
-            for (input) |c| {
-                if (c == ' ' and prev1 == ' ' and (prev2 == '\n' or prev2 == '\r')) {
-                    writeStats("Warning: spaces after newline are treated as data in --spaces mode\n", .{});
-                    break;
-                }
-                prev2 = prev1;
-                prev1 = c;
+        if (opts.hexlike) {
+            // Hexlike decode
+            const dr = pb.hexlikeDecode(allocator, input, .{
+                .spaces = opts.spaces_mode,
+            }) catch |err| {
+                writeStats("Decode error: {}\n", .{err});
+                std.process.exit(1);
+            };
+            defer allocator.free(dr.data);
+
+            // Warn if no Οχ sequences found
+            if (!dr.found_hex) {
+                _ = std.posix.write(std.posix.STDERR_FILENO, "Warning: no hexlike (\xCE\x9F\xCF\x87) sequences found in input\n") catch {};
             }
+
+            // Warn if PB-style encoding detected
+            const de_info = pb.detectDoubleEncode(input, 0.05);
+            if (de_info.detected != 0) {
+                _ = std.posix.write(std.posix.STDERR_FILENO, "Warning: input appears to contain standard printable-binary encoding\n") catch {};
+            }
+
+            writeStats("Decoding mode: Input size is {d} bytes\n", .{input.len});
+            writeStats("Decoded result size: {d} bytes\n", .{dr.data.len});
+            try writeOutput(dr.data, false);
+        } else {
+            // Regular PB decode
+
+            // Warn about spaces after newlines in spaces + strip-whitespace mode
+            // (two consecutive spaces after newline suggests indentation being treated as data)
+            if (opts.spaces_mode and opts.strip_whitespace) {
+                var prev1: u8 = 0;
+                var prev2: u8 = 0;
+                for (input) |c| {
+                    if (c == ' ' and prev1 == ' ' and (prev2 == '\n' or prev2 == '\r')) {
+                        writeStats("Warning: spaces after newline are treated as data in --spaces mode\n", .{});
+                        break;
+                    }
+                    prev2 = prev1;
+                    prev1 = c;
+                }
+            }
+
+            // Warn if hexlike encoding detected in regular PB decode
+            if (pb.detectHexlike(input)) {
+                _ = std.posix.write(std.posix.STDERR_FILENO, "Warning: input appears to contain hexlike (\xCE\x9F\xCF\x87) encoding; use --hexlike -d to decode\n") catch {};
+            }
+
+            const decoded = pb.decode(allocator, input, .{
+                .spaces = opts.spaces_mode,
+                .strip_whitespace = opts.strip_whitespace,
+            }) catch |err| {
+                writeStats("Decode error: {}\n", .{err});
+                std.process.exit(1);
+            };
+            defer allocator.free(decoded);
+
+            writeStats("Decoding mode: Input size is {d} bytes\n", .{input.len});
+            writeStats("Decoded result size: {d} bytes\n", .{decoded.len});
+            try writeOutput(decoded, false);
         }
-
-        const decoded = pb.decode(allocator, input, .{
-            .spaces = opts.spaces_mode,
-            .strip_whitespace = opts.strip_whitespace,
-        }) catch |err| {
-            writeStats("Decode error: {}\n", .{err});
-            std.process.exit(1);
-        };
-        defer allocator.free(decoded);
-
-        writeStats("Decoding mode: Input size is {d} bytes\n", .{input.len});
-        writeStats("Decoded result size: {d} bytes\n", .{decoded.len});
-        try writeOutput(decoded, false);
     } else {
         // Encode mode - check for double-encoding first
         if (!opts.no_double_encode_check) {
@@ -537,34 +580,49 @@ pub fn main() !void {
             try writeOutput(input, false);
         }
 
-        const encoded = pb.encode(allocator, input, .{
-            .spaces = opts.spaces_mode,
-            .tabs = opts.tabs_mode,
-            .crlf = opts.crlf_mode,
-            .preserve_chars = opts.preserve_chars orelse &.{},
-        }) catch |err| {
-            writeStats("Encode error: {}\n", .{err});
-            std.process.exit(1);
-        };
-        defer allocator.free(encoded);
-
-        var output = encoded;
-        var formatted: ?[]u8 = null;
-        defer if (formatted) |f| allocator.free(f);
-
-        if (opts.format_mode) {
-            formatted = pb.format(allocator, encoded, .{
-                .group_size = opts.format_group,
-                .groups_per_line = opts.format_groups_per_line,
-                .use_tabs = opts.spaces_mode,
+        if (opts.hexlike) {
+            // Hexlike encode
+            const encoded = pb.hexlikeEncode(allocator, input, .{
+                .spaces = opts.spaces_mode,
             }) catch |err| {
-                writeStats("Format error: {}\n", .{err});
+                writeStats("Encode error: {}\n", .{err});
                 std.process.exit(1);
             };
-            output = formatted.?;
-        }
+            defer allocator.free(encoded);
 
-        writeStats("Encoded {d} bytes of input to {d} bytes\n", .{ input.len, output.len });
-        try writeOutput(output, opts.passthrough_mode);
+            writeStats("Encoded {d} bytes of input to {d} bytes\n", .{ input.len, encoded.len });
+            try writeOutput(encoded, opts.passthrough_mode);
+        } else {
+            // Regular PB encode
+            const encoded = pb.encode(allocator, input, .{
+                .spaces = opts.spaces_mode,
+                .tabs = opts.tabs_mode,
+                .crlf = opts.crlf_mode,
+                .preserve_chars = opts.preserve_chars orelse &.{},
+            }) catch |err| {
+                writeStats("Encode error: {}\n", .{err});
+                std.process.exit(1);
+            };
+            defer allocator.free(encoded);
+
+            var output = encoded;
+            var formatted: ?[]u8 = null;
+            defer if (formatted) |f| allocator.free(f);
+
+            if (opts.format_mode) {
+                formatted = pb.format(allocator, encoded, .{
+                    .group_size = opts.format_group,
+                    .groups_per_line = opts.format_groups_per_line,
+                    .use_tabs = opts.spaces_mode,
+                }) catch |err| {
+                    writeStats("Format error: {}\n", .{err});
+                    std.process.exit(1);
+                };
+                output = formatted.?;
+            }
+
+            writeStats("Encoded {d} bytes of input to {d} bytes\n", .{ input.len, output.len });
+            try writeOutput(output, opts.passthrough_mode);
+        }
     }
 }

@@ -55,7 +55,7 @@ pub const character_map = [256][]const u8{
     "¬",
     "␣",
     "ǃ",
-    "˵",
+    "ˮ",
     "♯",
     "Ꞩ",
     "‰",
@@ -747,6 +747,226 @@ pub fn format(allocator: std.mem.Allocator, input: []const u8, options: FormatOp
     return result.toOwnedSlice(allocator);
 }
 
+// =============================================================================
+// Hexlike Encoding/Decoding
+// =============================================================================
+
+/// Οχ prefix: Greek Omicron (U+039F) + Greek Chi (U+03C7) — NOT ASCII "0x"
+const OX_PREFIX = "\xCE\x9F\xCF\x87";
+
+/// Hexlike passthrough set: bytes that pass through unchanged in hexlike mode.
+/// These are the bytes whose character_map entry equals the byte itself:
+/// . (46), 0-9 (48-57), @ (64), A-Z (65-90), ^ (94), _ (95), a-z (97-122)
+const hexlike_passthrough: [256]bool = blk: {
+    var set = [_]bool{false} ** 256;
+    set[46] = true; // .
+    for (48..58) |i| set[i] = true; // 0-9
+    set[64] = true; // @
+    for (65..91) |i| set[i] = true; // A-Z
+    set[94] = true; // ^
+    set[95] = true; // _
+    for (97..123) |i| set[i] = true; // a-z
+    break :blk set;
+};
+
+/// Upper-case hex digit lookup
+const hex_upper = "0123456789ABCDEF";
+
+/// Hexlike encode options
+pub const HexlikeEncodeOptions = struct {
+    /// Preserve literal spaces (add to passthrough set)
+    spaces: bool = false,
+};
+
+/// Hexlike decode options
+pub const HexlikeDecodeOptions = struct {
+    /// Treat literal spaces as data
+    spaces: bool = false,
+};
+
+/// Result of hexlike decoding
+pub const HexlikeDecodeResult = struct {
+    data: []u8,
+    found_hex: bool,
+};
+
+/// Encode binary data to hexlike format.
+/// Passthrough bytes stay as-is; all others become uppercase hex runs prefixed by Οχ.
+/// Delimiter spaces separate hex runs from adjacent passthrough text.
+/// Caller owns the returned slice and must free it with the same allocator.
+pub fn hexlikeEncode(allocator: std.mem.Allocator, input: []const u8, options: HexlikeEncodeOptions) ![]u8 {
+    if (input.len == 0) {
+        return try allocator.alloc(u8, 0);
+    }
+
+    // Worst case: each byte becomes 2 hex chars, plus OX_PREFIX (4 bytes) per run,
+    // plus delimiter spaces. Conservative: input.len * 3 + some overhead.
+    const max_size = input.len * 3 + (input.len / 2 + 1) * (OX_PREFIX.len + 2);
+    var result = try allocator.alloc(u8, max_size);
+    errdefer allocator.free(result);
+
+    var pos: usize = 0;
+    var i: usize = 0;
+    var output_has_content = false;
+
+    while (i < input.len) {
+        const byte = input[i];
+        const is_passthrough = hexlike_passthrough[byte] or (options.spaces and byte == ' ');
+
+        if (is_passthrough) {
+            // Passthrough run: copy bytes as-is
+            while (i < input.len) {
+                const b = input[i];
+                if (!(hexlike_passthrough[b] or (options.spaces and b == ' '))) break;
+                result[pos] = b;
+                pos += 1;
+                i += 1;
+            }
+            output_has_content = true;
+        } else {
+            // Non-passthrough run: collect bytes as hex
+            // Add delimiter space before Οχ (unless at start of output)
+            if (output_has_content) {
+                result[pos] = ' ';
+                pos += 1;
+            }
+            // Write Οχ prefix
+            @memcpy(result[pos..][0..OX_PREFIX.len], OX_PREFIX);
+            pos += OX_PREFIX.len;
+
+            // Write hex pairs for consecutive non-passthrough bytes
+            while (i < input.len) {
+                const b = input[i];
+                if (hexlike_passthrough[b] or (options.spaces and b == ' ')) break;
+                result[pos] = hex_upper[b >> 4];
+                result[pos + 1] = hex_upper[b & 0x0F];
+                pos += 2;
+                i += 1;
+            }
+
+            // Add delimiter space after hex run (unless at end of output)
+            if (i < input.len) {
+                result[pos] = ' ';
+                pos += 1;
+            }
+            output_has_content = true;
+        }
+    }
+
+    // Shrink to actual size
+    const final = try allocator.alloc(u8, pos);
+    @memcpy(final, result[0..pos]);
+    allocator.free(result);
+    return final;
+}
+
+/// Decode hexlike format back to binary.
+/// Scans for Οχ sequences, parses hex pairs, passes everything else through.
+/// Caller owns result.data and must free it with the same allocator.
+pub fn hexlikeDecode(allocator: std.mem.Allocator, input: []const u8, options: HexlikeDecodeOptions) !HexlikeDecodeResult {
+    _ = options;
+    if (input.len == 0) {
+        return HexlikeDecodeResult{
+            .data = try allocator.alloc(u8, 0),
+            .found_hex = false,
+        };
+    }
+
+    // Output is always <= input size
+    var result = try allocator.alloc(u8, input.len);
+    errdefer allocator.free(result);
+
+    var pos: usize = 0;
+    var i: usize = 0;
+    var found_hex = false;
+
+    while (i < input.len) {
+        // Check for Οχ prefix (4 bytes: CE 9F CF 87)
+        if (i + OX_PREFIX.len <= input.len and
+            std.mem.eql(u8, input[i .. i + OX_PREFIX.len], OX_PREFIX))
+        {
+            found_hex = true;
+            i += OX_PREFIX.len;
+            // Parse hex pairs
+            while (i + 1 < input.len) {
+                const h1 = hexDigitValue(input[i]) orelse break;
+                const h2 = hexDigitValue(input[i + 1]) orelse break;
+                result[pos] = (@as(u8, h1) << 4) | h2;
+                pos += 1;
+                i += 2;
+            }
+            // Consume trailing delimiter space (exactly one)
+            if (i < input.len and input[i] == ' ') {
+                i += 1;
+            }
+        } else if (input[i] == ' ' and
+            i + 1 + OX_PREFIX.len <= input.len and
+            std.mem.eql(u8, input[i + 1 .. i + 1 + OX_PREFIX.len], OX_PREFIX))
+        {
+            // Delimiter space before Οχ — consume it and handle the Οχ
+            i += 1; // consume delimiter space
+            found_hex = true;
+            i += OX_PREFIX.len;
+            // Parse hex pairs
+            while (i + 1 < input.len) {
+                const h1 = hexDigitValue(input[i]) orelse break;
+                const h2 = hexDigitValue(input[i + 1]) orelse break;
+                result[pos] = (@as(u8, h1) << 4) | h2;
+                pos += 1;
+                i += 2;
+            }
+            // Consume trailing delimiter space (exactly one)
+            if (i < input.len and input[i] == ' ') {
+                i += 1;
+            }
+        } else {
+            // Passthrough byte
+            result[pos] = input[i];
+            pos += 1;
+            i += 1;
+        }
+    }
+
+    // Shrink to actual size
+    const final = try allocator.alloc(u8, pos);
+    @memcpy(final, result[0..pos]);
+    allocator.free(result);
+    return HexlikeDecodeResult{
+        .data = final,
+        .found_hex = found_hex,
+    };
+}
+
+/// Parse a hex digit (uppercase or lowercase) to its value, or null if not a hex digit.
+fn hexDigitValue(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @intCast(c - '0');
+    if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
+    if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
+    return null;
+}
+
+/// Detect whether input contains hexlike (Οχ) sequences followed by hex pairs.
+/// Used for cross-format warnings.
+pub fn detectHexlike(input: []const u8) bool {
+    if (input.len < OX_PREFIX.len + 2) return false;
+
+    var i: usize = 0;
+    while (i + OX_PREFIX.len + 1 < input.len) {
+        if (std.mem.eql(u8, input[i .. i + OX_PREFIX.len], OX_PREFIX)) {
+            // Check if followed by at least one hex pair
+            const after = i + OX_PREFIX.len;
+            if (after + 1 < input.len and
+                hexDigitValue(input[after]) != null and
+                hexDigitValue(input[after + 1]) != null)
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
 /// Get the mapping for a specific byte value
 pub fn getMapping(byte: u8) []const u8 {
     return character_map[byte];
@@ -1315,4 +1535,124 @@ test "decodeLookup: every character_map entry has a valid reverse lookup" {
         try std.testing.expect(result != null);
         try std.testing.expectEqual(@as(u8, @intCast(i)), result.?);
     }
+}
+
+// =============================================================================
+// Hexlike Encoding/Decoding Tests
+// =============================================================================
+
+test "hexlikeEncode: pure passthrough ASCII" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "Hello", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello", result);
+}
+
+test "hexlikeEncode: non-passthrough byte (space without --spaces)" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "A B", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("A " ++ OX_PREFIX ++ "20 B", result);
+}
+
+test "hexlikeEncode: consecutive non-passthrough grouped" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "\x00\x01\x02", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(OX_PREFIX ++ "000102", result);
+}
+
+test "hexlikeEncode: mixed comma+space grouped" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "Hello, World!", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello " ++ OX_PREFIX ++ "2C20 World " ++ OX_PREFIX ++ "21", result);
+}
+
+test "hexlikeEncode: with spaces option" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "Hello, World!", .{ .spaces = true });
+    defer allocator.free(result);
+    // With --spaces, space passes through. Comma alone is non-passthrough.
+    // "Hello" (passthrough) + delimiter + Οχ2C + delimiter + " World" (passthrough with space) + delimiter + Οχ21
+    try std.testing.expectEqualStrings("Hello " ++ OX_PREFIX ++ "2C  World " ++ OX_PREFIX ++ "21", result);
+}
+
+test "hexlikeEncode: no trailing space at end" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "Hello!", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello " ++ OX_PREFIX ++ "21", result);
+}
+
+test "hexlikeEncode: no leading space at start" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "\x00Hello", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(OX_PREFIX ++ "00 Hello", result);
+}
+
+test "hexlikeEncode: all non-passthrough" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "\x00\x01", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(OX_PREFIX ++ "0001", result);
+}
+
+test "hexlikeEncode: uppercase hex" {
+    const allocator = std.testing.allocator;
+    const result = try hexlikeEncode(allocator, "\xAB\xCD\xEF", .{});
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(OX_PREFIX ++ "ABCDEF", result);
+}
+
+test "hexlikeDecode: pure hex" {
+    const allocator = std.testing.allocator;
+    const dr = try hexlikeDecode(allocator, OX_PREFIX ++ "48656C6C6F", .{});
+    defer allocator.free(dr.data);
+    try std.testing.expect(dr.found_hex);
+    try std.testing.expectEqualStrings("Hello", dr.data);
+}
+
+test "hexlikeDecode: mixed passthrough and hex" {
+    const allocator = std.testing.allocator;
+    const dr = try hexlikeDecode(allocator, "Hello " ++ OX_PREFIX ++ "2C20 World " ++ OX_PREFIX ++ "21", .{});
+    defer allocator.free(dr.data);
+    try std.testing.expect(dr.found_hex);
+    try std.testing.expectEqualStrings("Hello, World!", dr.data);
+}
+
+test "hexlike: 256-byte roundtrip" {
+    const allocator = std.testing.allocator;
+    var input: [256]u8 = undefined;
+    for (0..256) |i| {
+        input[i] = @intCast(i);
+    }
+    const encoded = try hexlikeEncode(allocator, &input, .{});
+    defer allocator.free(encoded);
+
+    const dr = try hexlikeDecode(allocator, encoded, .{});
+    defer allocator.free(dr.data);
+    try std.testing.expect(dr.found_hex);
+    try std.testing.expectEqualSlices(u8, &input, dr.data);
+}
+
+test "hexlikeDecode: no hex found" {
+    const allocator = std.testing.allocator;
+    const dr = try hexlikeDecode(allocator, "Hello World", .{});
+    defer allocator.free(dr.data);
+    try std.testing.expect(!dr.found_hex);
+    try std.testing.expectEqualStrings("Hello World", dr.data);
+}
+
+test "detectHexlike: detects Οχ hex sequences" {
+    try std.testing.expect(detectHexlike("Hello " ++ OX_PREFIX ++ "2C20 World"));
+}
+
+test "detectHexlike: false for plain text" {
+    try std.testing.expect(!detectHexlike("Hello World"));
+}
+
+test "detectHexlike: false for empty" {
+    try std.testing.expect(!detectHexlike(""));
 }
