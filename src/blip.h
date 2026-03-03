@@ -108,6 +108,14 @@ int32_t blip_archive_verify_merkle(const uint8_t *buf, size_t buf_len,
 
 /* --- Full archive (DIR + metadata) support --- */
 
+/* An extended attribute name-value pair. */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    const uint8_t *value;
+    size_t value_len;
+} blip_xattr_entry;
+
 typedef struct {
     const char *path;
     size_t path_len;
@@ -125,6 +133,10 @@ typedef struct {
     const char *groupname;   /* group name, NULL = not set */
     size_t groupname_len;    /* 0 = not set */
     uint8_t xh64[8];         /* Merkle hash for dirs (pre-computed), ignored for files */
+    const blip_xattr_entry *xattrs;   /* extended attributes, NULL = none */
+    size_t xattr_count;               /* 0 = none */
+    const uint8_t *resource_fork;     /* resource fork data (macOS), NULL = none */
+    size_t resource_fork_len;         /* 0 = none */
 } blip_archive_entry;
 
 /* Progress callback for archive creation.
@@ -164,6 +176,20 @@ int32_t blip_archive_entry_metadata(const uint8_t *buf, size_t buf_len,
                                      int64_t *out_mtime_ns,
                                      const char **out_owner,
                                      size_t *out_owner_len);
+
+/* Extract xattrs and resource fork from an archive entry.
+ * Returns heap-allocated arrays; caller must free with blip_free_xattrs().
+ * For FILE entries: reads forks DICT (element 2), "rf" key → resource_fork, rest → xattrs.
+ * For DIR entries: reads "xa" key from the DIR dict.
+ * Returns 0 on success, negative error code on failure. */
+int32_t blip_archive_entry_xattrs(const uint8_t *buf, size_t buf_len, uint64_t index,
+                                   blip_xattr_entry **out_xattrs, size_t *out_count,
+                                   uint8_t **out_resource_fork, size_t *out_resource_fork_len);
+
+/* Free xattr data returned by blip_archive_entry_xattrs.
+ * Frees the xattr array and resource fork buffer. */
+void blip_free_xattrs(blip_xattr_entry *xattrs, size_t count,
+                       uint8_t *resource_fork, size_t resource_fork_len);
 
 /* Normalize a path by stripping leading "./" and "/" sequences (tar-style).
  * Returns a pointer into the original path buffer (zero-copy).

@@ -172,6 +172,14 @@ const CFileEntry = extern struct {
     content_len: usize,
 };
 
+/// An xattr name-value pair passed from C.
+const CXattrEntry = extern struct {
+    name: [*]const u8,
+    name_len: usize,
+    value: [*]const u8,
+    value_len: usize,
+};
+
 /// A full archive entry passed from C (supports both files and directories with metadata).
 const CArchiveEntry = extern struct {
     path: [*]const u8,
@@ -190,6 +198,10 @@ const CArchiveEntry = extern struct {
     groupname: ?[*]const u8, // NULL = not set
     groupname_len: usize,
     xh64: [8]u8, // Merkle hash for dirs (auto-computed by createFullArchive, can be zeroed)
+    xattrs: ?[*]const CXattrEntry, // extended attributes, NULL = none
+    xattr_count: usize, // 0 = none
+    resource_fork: ?[*]const u8, // resource fork data, NULL = none
+    resource_fork_len: usize, // 0 = none
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -236,6 +248,19 @@ export fn blip_archive_create_full(
     var archive_entries = page_allocator.alloc(mini_blar.ArchiveEntry, entry_count) catch return -13;
     defer page_allocator.free(archive_entries);
 
+    // Pre-allocate a flat buffer for all xattr slices across all entries
+    var total_xattrs: usize = 0;
+    for (0..entry_count) |i| {
+        total_xattrs += entries[i].xattr_count;
+    }
+    var xattr_buf: []mini_blar.XattrEntry = if (total_xattrs > 0)
+        page_allocator.alloc(mini_blar.XattrEntry, total_xattrs) catch return -13
+    else
+        &[_]mini_blar.XattrEntry{};
+    defer if (total_xattrs > 0) page_allocator.free(xattr_buf);
+
+    var xattr_offset: usize = 0;
+
     for (0..entry_count) |i| {
         const e = entries[i];
         const raw_path = e.path[0..e.path_len];
@@ -243,6 +268,26 @@ export fn blip_archive_create_full(
 
         const username: []const u8 = if (e.owner) |o| o[0..e.owner_len] else &.{};
         const gname: []const u8 = if (e.groupname) |g| g[0..e.groupname_len] else &.{};
+
+        // Convert C xattr array to Zig slice
+        const xattr_slice: []const mini_blar.XattrEntry = if (e.xattrs) |xa_ptr| blk: {
+            const count = e.xattr_count;
+            if (count == 0) break :blk &[_]mini_blar.XattrEntry{};
+            for (0..count) |j| {
+                const cxa = xa_ptr[j];
+                const name_ptr = cxa.name;
+                const val_ptr = cxa.value;
+                xattr_buf[xattr_offset + j] = .{
+                    .name = name_ptr[0..cxa.name_len],
+                    .value = val_ptr[0..cxa.value_len],
+                };
+            }
+            const slice = xattr_buf[xattr_offset .. xattr_offset + count];
+            xattr_offset += count;
+            break :blk slice;
+        } else &[_]mini_blar.XattrEntry{};
+
+        const rfork: []const u8 = if (e.resource_fork) |rf| rf[0..e.resource_fork_len] else &.{};
 
         if (e.is_dir != 0) {
             archive_entries[i] = .{
@@ -257,6 +302,7 @@ export fn blip_archive_create_full(
                     .gid = e.gid,
                     .username = username,
                     .groupname = gname,
+                    .xattrs = xattr_slice,
                 },
             };
         } else {
@@ -273,6 +319,8 @@ export fn blip_archive_create_full(
                     .gid = e.gid,
                     .username = username,
                     .groupname = gname,
+                    .xattrs = xattr_slice,
+                    .resource_fork = rfork,
                 },
             };
         }
@@ -472,6 +520,183 @@ fn readMetadataFromDict(
         const un_val = try leaf.readUtf8(un_container);
         out_owner.* = un_val.ptr;
         out_owner_len.* = un_val.len;
+    }
+}
+
+/// Extract xattrs and resource fork from an archive entry.
+/// For FILE entries: reads forks DICT (element 2), "rf" key → resource_fork, rest → xattrs.
+/// For DIR entries: reads "xa" key from the DIR dict.
+/// Returns 0 on success, negative error code on failure.
+export fn blip_archive_entry_xattrs(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_xattrs: *?[*]CXattrEntry,
+    out_count: *usize,
+    out_resource_fork: *?[*]u8,
+    out_resource_fork_len: *usize,
+) callconv(.c) i32 {
+    // Defaults
+    out_xattrs.* = null;
+    out_count.* = 0;
+    out_resource_fork.* = null;
+    out_resource_fork_len.* = 0;
+
+    const slice = buf[0..buf_len];
+    const reader = mini_blar.ArchiveReader.init(slice) catch |e| return containerErrorCode(e);
+    const entry_type = reader.entryTypeAt(index) catch |e| return containerErrorCode(e);
+
+    if (entry_type == .file) {
+        return extractFileXattrs(slice, reader, index, out_xattrs, out_count, out_resource_fork, out_resource_fork_len);
+    } else {
+        return extractDirXattrs(slice, reader, index, out_xattrs, out_count);
+    }
+}
+
+fn extractFileXattrs(
+    slice: []const u8,
+    reader: mini_blar.ArchiveReader,
+    index: u64,
+    out_xattrs: *?[*]CXattrEntry,
+    out_count: *usize,
+    out_resource_fork: *?[*]u8,
+    out_resource_fork_len: *usize,
+) i32 {
+    const arr = reader.fileArrayAt(index) catch |e| return containerErrorCode(e);
+
+    // Check if forks DICT exists (element 2)
+    if (arr.elementCount() < 3) return 0; // no forks
+
+    const fv = arr.elementAt(2) catch |e| return containerErrorCode(e);
+    const forks_start = @intFromPtr(fv.buf.ptr) - @intFromPtr(slice.ptr);
+    const forks_end = forks_start + @as(usize, @intCast(fv.total_length));
+    const forks_buf = slice[forks_start..forks_end];
+    const forks_reader = dict_mod.DictReader.init(forks_buf) catch |e| return containerErrorCode(e);
+    const fork_count = forks_reader.pairCount();
+
+    // Extract resource fork first
+    if (forks_reader.findKey("rf") catch |e| return containerErrorCode(e)) |rf_idx| {
+        const rf_container = forks_reader.valueAt(rf_idx) catch |e| return containerErrorCode(e);
+        const rf_val = leaf.readData(rf_container) catch |e| return containerErrorCode(e);
+        if (rf_val.len > 0) {
+            const rf_copy = page_allocator.alloc(u8, rf_val.len) catch return -13;
+            @memcpy(rf_copy, rf_val);
+            out_resource_fork.* = rf_copy.ptr;
+            out_resource_fork_len.* = rf_copy.len;
+        }
+    }
+
+    // Count xattrs (everything except "rf")
+    var xattr_count: usize = 0;
+    for (0..fork_count) |fi| {
+        const key_container = forks_reader.keyAt(fi) catch |e| return containerErrorCode(e);
+        const key_bytes = dict_mod.extractKeyBytes(key_container) catch |e| return containerErrorCode(e);
+        if (!std.mem.eql(u8, key_bytes, "rf")) {
+            xattr_count += 1;
+        }
+    }
+
+    if (xattr_count == 0) return 0;
+
+    const xattrs = page_allocator.alloc(CXattrEntry, xattr_count) catch return -13;
+    var xi: usize = 0;
+    for (0..fork_count) |fi| {
+        const key_container = forks_reader.keyAt(fi) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        const key_bytes = dict_mod.extractKeyBytes(key_container) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        if (!std.mem.eql(u8, key_bytes, "rf")) {
+            const val_container = forks_reader.valueAt(fi) catch |e| {
+                page_allocator.free(xattrs);
+                return containerErrorCode(e);
+            };
+            const val_bytes = leaf.readData(val_container) catch |e| {
+                page_allocator.free(xattrs);
+                return containerErrorCode(e);
+            };
+            // Zero-copy: pointers into the archive buffer
+            xattrs[xi] = .{
+                .name = key_bytes.ptr,
+                .name_len = key_bytes.len,
+                .value = val_bytes.ptr,
+                .value_len = val_bytes.len,
+            };
+            xi += 1;
+        }
+    }
+
+    out_xattrs.* = xattrs.ptr;
+    out_count.* = xattr_count;
+    return 0;
+}
+
+fn extractDirXattrs(
+    slice: []const u8,
+    reader: mini_blar.ArchiveReader,
+    index: u64,
+    out_xattrs: *?[*]CXattrEntry,
+    out_count: *usize,
+) i32 {
+    _ = slice;
+    const dict_reader = reader.dirDictAt(index) catch |e| return containerErrorCode(e);
+
+    // Look for "xa" key
+    const xa_idx = (dict_reader.findKey("xa") catch |e| return containerErrorCode(e)) orelse return 0;
+    const xa_container = dict_reader.valueAt(xa_idx) catch |e| return containerErrorCode(e);
+    const xa_reader = dict_mod.DictReader.init(xa_container) catch |e| return containerErrorCode(e);
+    const xa_count = xa_reader.pairCount();
+
+    if (xa_count == 0) return 0;
+
+    const xattrs = page_allocator.alloc(CXattrEntry, xa_count) catch return -13;
+    for (0..xa_count) |xi| {
+        const key_container = xa_reader.keyAt(xi) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        const key_bytes = dict_mod.extractKeyBytes(key_container) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        const val_container = xa_reader.valueAt(xi) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        const val_bytes = leaf.readData(val_container) catch |e| {
+            page_allocator.free(xattrs);
+            return containerErrorCode(e);
+        };
+        // Zero-copy: pointers into the archive buffer
+        xattrs[xi] = .{
+            .name = key_bytes.ptr,
+            .name_len = key_bytes.len,
+            .value = val_bytes.ptr,
+            .value_len = val_bytes.len,
+        };
+    }
+
+    out_xattrs.* = xattrs.ptr;
+    out_count.* = xa_count;
+    return 0;
+}
+
+/// Free xattr data returned by blip_archive_entry_xattrs.
+/// Only the CXattrEntry array is heap-allocated; name/value pointers are zero-copy into archive buf.
+export fn blip_free_xattrs(
+    xattrs: ?[*]CXattrEntry,
+    count: usize,
+    resource_fork: ?[*]u8,
+    resource_fork_len: usize,
+) callconv(.c) void {
+    if (xattrs) |xa| {
+        if (count > 0) page_allocator.free(xa[0..count]);
+    }
+    if (resource_fork) |rf| {
+        if (resource_fork_len > 0) page_allocator.free(rf[0..resource_fork_len]);
     }
 }
 
@@ -1168,6 +1393,8 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .owner = null, .owner_len = 0,
             .groupname = null, .groupname_len = 0,
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xattrs = null, .xattr_count = 0,
+            .resource_fork = null, .resource_fork_len = 0,
         },
         .{
             .path = "mydir/file.txt", .path_len = 14,
@@ -1178,6 +1405,8 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .owner = null, .owner_len = 0,
             .groupname = null, .groupname_len = 0,
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xattrs = null, .xattr_count = 0,
+            .resource_fork = null, .resource_fork_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -1203,6 +1432,8 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .owner = null, .owner_len = 0,
             .groupname = null, .groupname_len = 0,
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xattrs = null, .xattr_count = 0,
+            .resource_fork = null, .resource_fork_len = 0,
         },
         .{
             .path = "bfile.txt", .path_len = 9,
@@ -1213,6 +1444,8 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .owner = null, .owner_len = 0,
             .groupname = null, .groupname_len = 0,
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xattrs = null, .xattr_count = 0,
+            .resource_fork = null, .resource_fork_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -1238,6 +1471,8 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
             .owner = "peter", .owner_len = 5,
             .groupname = null, .groupname_len = 0,
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xattrs = null, .xattr_count = 0,
+            .resource_fork = null, .resource_fork_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;

@@ -328,6 +328,8 @@ static int cmd_create(int argc, char **argv) {
                     path, strerror(errno));
             for (int j = 0; j < i; j++) {
                 free((void *)entries[j].content);
+                free_file_xattrs((blip_xattr_entry *)entries[j].xattrs, entries[j].xattr_count,
+                                  (uint8_t *)entries[j].resource_fork);
             }
             free(entries);
             return EXIT_IO;
@@ -345,6 +347,17 @@ static int cmd_create(int argc, char **argv) {
         if (stat(path, &st) == 0) {
             fill_entry_metadata(&entries[i], &st);
         }
+
+        /* Read xattrs and resource fork */
+        blip_xattr_entry *xa = NULL;
+        size_t xa_count = 0;
+        uint8_t *rfork = NULL;
+        size_t rfork_len = 0;
+        read_file_xattrs(path, &xa, &xa_count, &rfork, &rfork_len);
+        entries[i].xattrs = xa;
+        entries[i].xattr_count = xa_count;
+        entries[i].resource_fork = rfork;
+        entries[i].resource_fork_len = rfork_len;
 
         bytes_done += content_len;
         if (progress) progrez_update(progress, (uint64_t)(i + 1), bytes_done);
@@ -368,6 +381,8 @@ static int cmd_create(int argc, char **argv) {
 
     for (int i = 0; i < file_count; i++) {
         free((void *)entries[i].content);
+        free_file_xattrs((blip_xattr_entry *)entries[i].xattrs, entries[i].xattr_count,
+                          (uint8_t *)entries[i].resource_fork);
     }
     free(entries);
 
@@ -601,6 +616,22 @@ static int cmd_extract(int argc, char **argv) {
             times[1].tv_sec = (time_t)(mtime_ns / 1000000000LL);
             times[1].tv_nsec = (long)(mtime_ns % 1000000000LL);
             utimensat(AT_FDCWD, out_path, times, 0);
+        }
+
+        /* Restore xattrs and resource fork */
+        blip_xattr_entry *file_xattrs = NULL;
+        size_t file_xattr_count = 0;
+        uint8_t *file_rfork = NULL;
+        size_t file_rfork_len = 0;
+        if (blip_archive_entry_xattrs(buf, buf_len, i,
+                &file_xattrs, &file_xattr_count,
+                &file_rfork, &file_rfork_len) == BLIP_OK) {
+            if (file_xattr_count > 0 || file_rfork_len > 0) {
+                write_file_xattrs(out_path, file_xattrs, file_xattr_count,
+                                   file_rfork, file_rfork_len);
+            }
+            blip_free_xattrs(file_xattrs, file_xattr_count,
+                              file_rfork, file_rfork_len);
         }
 
         bytes_done += data_len;

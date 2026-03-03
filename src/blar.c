@@ -193,7 +193,29 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.is_dir = 1;
         fill_entry_metadata(&entry, &st);
         memset(entry.xh64, 0, 8);
-        if (!entry_list_add(el, entry)) return false;
+
+        /* Read xattrs (dirs don't have resource forks) */
+        blip_xattr_entry *xa = NULL;
+        size_t xa_count = 0;
+        uint8_t *rfork = NULL;
+        size_t rfork_len = 0;
+        read_file_xattrs(path, &xa, &xa_count, &rfork, &rfork_len);
+        entry.xattrs = xa;
+        entry.xattr_count = xa_count;
+        /* resource_fork stays NULL/0 for dirs (rfork freed below if any) */
+
+        if (!entry_list_add(el, entry)) {
+            free_file_xattrs(xa, xa_count, rfork);
+            return false;
+        }
+        /* Register xattr buffers for cleanup */
+        if (xa) entry_list_add_content(el, (uint8_t *)xa);
+        for (size_t xi = 0; xi < xa_count; xi++) {
+            if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+            if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+        }
+        if (rfork) entry_list_add_content(el, rfork);
+
         if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
 
         return collect_dir_children(path, el);
@@ -218,7 +240,30 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.content_len = content_len;
         entry.is_dir = 0;
         fill_entry_metadata(&entry, &st);
-        if (!entry_list_add(el, entry)) return false;
+
+        /* Read xattrs and resource fork */
+        blip_xattr_entry *xa = NULL;
+        size_t xa_count = 0;
+        uint8_t *rfork = NULL;
+        size_t rfork_len = 0;
+        read_file_xattrs(path, &xa, &xa_count, &rfork, &rfork_len);
+        entry.xattrs = xa;
+        entry.xattr_count = xa_count;
+        entry.resource_fork = rfork;
+        entry.resource_fork_len = rfork_len;
+
+        if (!entry_list_add(el, entry)) {
+            free_file_xattrs(xa, xa_count, rfork);
+            return false;
+        }
+        /* Register xattr buffers for cleanup */
+        if (xa) entry_list_add_content(el, (uint8_t *)xa);
+        for (size_t xi = 0; xi < xa_count; xi++) {
+            if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+            if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+        }
+        if (rfork) entry_list_add_content(el, rfork);
+
         el->bytes_seen += content_len;
         if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
     }
@@ -783,6 +828,23 @@ static int cmd_extract(int argc, char **argv) {
             if (mode != 0) {
                 chmod(out_path, mode);
             }
+
+            /* Restore xattrs on directory */
+            blip_xattr_entry *dir_xattrs = NULL;
+            size_t dir_xattr_count = 0;
+            uint8_t *dir_rfork = NULL;
+            size_t dir_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, i,
+                    &dir_xattrs, &dir_xattr_count,
+                    &dir_rfork, &dir_rfork_len) == BLIP_OK) {
+                if (dir_xattr_count > 0 || dir_rfork_len > 0) {
+                    write_file_xattrs(out_path, dir_xattrs, dir_xattr_count,
+                                       dir_rfork, dir_rfork_len);
+                }
+                blip_free_xattrs(dir_xattrs, dir_xattr_count,
+                                  dir_rfork, dir_rfork_len);
+            }
+
             /* mtime for directories is set after all files are extracted */
         } else {
             /* FILE entry: count bytes for progress */
@@ -888,6 +950,22 @@ static int cmd_extract(int argc, char **argv) {
             times[1].tv_sec = (time_t)(mtime_ns / 1000000000LL);
             times[1].tv_nsec = (long)(mtime_ns % 1000000000LL);
             utimensat(AT_FDCWD, out_path, times, 0);
+        }
+
+        /* Restore xattrs and resource fork */
+        blip_xattr_entry *file_xattrs = NULL;
+        size_t file_xattr_count = 0;
+        uint8_t *file_rfork = NULL;
+        size_t file_rfork_len = 0;
+        if (blip_archive_entry_xattrs(buf, buf_len, i,
+                &file_xattrs, &file_xattr_count,
+                &file_rfork, &file_rfork_len) == BLIP_OK) {
+            if (file_xattr_count > 0 || file_rfork_len > 0) {
+                write_file_xattrs(out_path, file_xattrs, file_xattr_count,
+                                   file_rfork, file_rfork_len);
+            }
+            blip_free_xattrs(file_xattrs, file_xattr_count,
+                              file_rfork, file_rfork_len);
         }
 
         bytes_done += data_len;

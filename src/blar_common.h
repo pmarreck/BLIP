@@ -351,6 +351,180 @@ static void fill_entry_metadata(blip_archive_entry *entry, const struct stat *st
     }
 }
 
+/* ── Extended attribute helpers ────────────────────────────────────────── */
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/xattr.h>
+#endif
+
+/* Read extended attributes from a filesystem path.
+ * Separates com.apple.ResourceFork into dedicated output on macOS.
+ * Returns 0 on success, -1 on error (errno set).
+ * Caller must free returned buffers with free_file_xattrs(). */
+static int read_file_xattrs(const char *path,
+                             blip_xattr_entry **out_xattrs, size_t *out_count,
+                             uint8_t **out_resource_fork, size_t *out_resource_fork_len) {
+    *out_xattrs = NULL;
+    *out_count = 0;
+    *out_resource_fork = NULL;
+    *out_resource_fork_len = 0;
+
+#if defined(__APPLE__) || defined(__linux__)
+    /* List xattr names */
+#if defined(__APPLE__)
+    ssize_t list_len = listxattr(path, NULL, 0, XATTR_NOFOLLOW);
+#else
+    ssize_t list_len = llistxattr(path, NULL, 0);
+#endif
+    if (list_len <= 0) return 0; /* no xattrs or error */
+
+    char *name_buf = (char *)malloc((size_t)list_len);
+    if (!name_buf) return -1;
+
+#if defined(__APPLE__)
+    list_len = listxattr(path, name_buf, (size_t)list_len, XATTR_NOFOLLOW);
+#else
+    list_len = llistxattr(path, name_buf, (size_t)list_len);
+#endif
+    if (list_len <= 0) {
+        free(name_buf);
+        return 0;
+    }
+
+    /* Count xattr names */
+    size_t total = 0;
+    for (ssize_t i = 0; i < list_len; ) {
+        total++;
+        i += (ssize_t)strlen(name_buf + i) + 1;
+    }
+
+    /* Allocate max possible (some may become resource_fork) */
+    blip_xattr_entry *xattrs = (blip_xattr_entry *)calloc(total, sizeof(blip_xattr_entry));
+    if (!xattrs) { free(name_buf); return -1; }
+
+    size_t count = 0;
+    for (ssize_t i = 0; i < list_len; ) {
+        const char *name = name_buf + i;
+        size_t name_len = strlen(name);
+        i += (ssize_t)name_len + 1;
+
+        /* Get value size */
+#if defined(__APPLE__)
+        ssize_t val_len = getxattr(path, name, NULL, 0, 0, XATTR_NOFOLLOW);
+#else
+        ssize_t val_len = lgetxattr(path, name, NULL, 0);
+#endif
+        if (val_len < 0) continue; /* skip unreadable */
+
+        uint8_t *val_buf = NULL;
+        if (val_len > 0) {
+            val_buf = (uint8_t *)malloc((size_t)val_len);
+            if (!val_buf) continue;
+#if defined(__APPLE__)
+            ssize_t got = getxattr(path, name, val_buf, (size_t)val_len, 0, XATTR_NOFOLLOW);
+#else
+            ssize_t got = lgetxattr(path, name, val_buf, (size_t)val_len);
+#endif
+            if (got < 0) { free(val_buf); continue; }
+            val_len = got;
+        }
+
+#if defined(__APPLE__)
+        /* Separate resource fork */
+        if (strcmp(name, "com.apple.ResourceFork") == 0) {
+            *out_resource_fork = val_buf;
+            *out_resource_fork_len = (size_t)val_len;
+            continue;
+        }
+#endif
+
+        /* Duplicate name (name_buf will be freed) */
+        char *name_dup = strdup(name);
+        if (!name_dup) { free(val_buf); continue; }
+
+        xattrs[count].name = name_dup;
+        xattrs[count].name_len = name_len;
+        xattrs[count].value = val_buf;
+        xattrs[count].value_len = (size_t)val_len;
+        count++;
+    }
+
+    free(name_buf);
+
+    if (count == 0) {
+        free(xattrs);
+        return 0;
+    }
+
+    *out_xattrs = xattrs;
+    *out_count = count;
+#else
+    (void)path;
+#endif /* __APPLE__ || __linux__ */
+
+    return 0;
+}
+
+/* Free xattr data returned by read_file_xattrs(). */
+static void free_file_xattrs(blip_xattr_entry *xattrs, size_t count,
+                               uint8_t *resource_fork) {
+    if (xattrs) {
+        for (size_t i = 0; i < count; i++) {
+            free((void *)xattrs[i].name);
+            free((void *)xattrs[i].value);
+        }
+        free(xattrs);
+    }
+    if (resource_fork) free(resource_fork);
+}
+
+/* Write extended attributes to a filesystem path.
+ * Writes resource fork as com.apple.ResourceFork on macOS.
+ * Non-fatal: warns on stderr for individual failures. */
+static void write_file_xattrs(const char *path,
+                                const blip_xattr_entry *xattrs, size_t count,
+                                const uint8_t *resource_fork, size_t resource_fork_len) {
+#if defined(__APPLE__) || defined(__linux__)
+    for (size_t i = 0; i < count; i++) {
+        /* Build null-terminated name */
+        char name_buf[256];
+        if (xattrs[i].name_len >= sizeof(name_buf)) {
+            fprintf(stderr, "warning: xattr name too long, skipping\n");
+            continue;
+        }
+        memcpy(name_buf, xattrs[i].name, xattrs[i].name_len);
+        name_buf[xattrs[i].name_len] = '\0';
+
+#if defined(__APPLE__)
+        int rc = setxattr(path, name_buf, xattrs[i].value, xattrs[i].value_len, 0, XATTR_NOFOLLOW);
+#else
+        int rc = lsetxattr(path, name_buf, xattrs[i].value, xattrs[i].value_len, 0);
+#endif
+        if (rc != 0) {
+            fprintf(stderr, "warning: cannot set xattr '%s' on '%s': %s\n",
+                    name_buf, path, strerror(errno));
+        }
+    }
+
+#if defined(__APPLE__)
+    if (resource_fork && resource_fork_len > 0) {
+        int rc = setxattr(path, "com.apple.ResourceFork", resource_fork, resource_fork_len, 0, XATTR_NOFOLLOW);
+        if (rc != 0) {
+            fprintf(stderr, "warning: cannot set resource fork on '%s': %s\n",
+                    path, strerror(errno));
+        }
+    }
+#else
+    (void)resource_fork;
+    (void)resource_fork_len;
+#endif
+
+#else
+    (void)path; (void)xattrs; (void)count;
+    (void)resource_fork; (void)resource_fork_len;
+#endif /* __APPLE__ || __linux__ */
+}
+
 /* ── Progress (via progrez library) ───────────────────────────────────── */
 
 #include "progrez.h"

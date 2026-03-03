@@ -232,6 +232,38 @@ else
 fi
 cd "$PROJECT_DIR"
 
+# --------------- 19. Xattr round-trip (macOS only) ---------------
+if [[ "$(uname)" == "Darwin" ]]; then
+  XATTR_DIR="$TMPDIR_TEST/xattr_test"
+  mkdir -p "$XATTR_DIR"
+  echo "xattr test content" > "$XATTR_DIR/xfile.txt"
+  xattr -w user.test_blip "hello_xattr" "$XATTR_DIR/xfile.txt"
+
+  XATTR_ARCHIVE="$TMPDIR_TEST/xattr_test.blar"
+  "$BLAR" create -o "$XATTR_ARCHIVE" "$XATTR_DIR" 2>/dev/null
+
+  XATTR_EXTRACT="$TMPDIR_TEST/xattr_extracted"
+  mkdir -p "$XATTR_EXTRACT"
+  "$BLAR" extract "$XATTR_ARCHIVE" -C "$XATTR_EXTRACT" 2>/dev/null
+
+  # Find the extracted file (path is normalized, leading / stripped)
+  NORM_XATTR_PATH="$(echo "$XATTR_DIR/xfile.txt" | sed 's|^/||')"
+  XATTR_OUT="$XATTR_EXTRACT/$NORM_XATTR_PATH"
+
+  if [[ -f "$XATTR_OUT" ]]; then
+    XATTR_VAL="$(xattr -p user.test_blip "$XATTR_OUT" 2>/dev/null)"
+    if [[ "$XATTR_VAL" == "hello_xattr" ]]; then
+      pass "xattr round-trip preserves user.test_blip"
+    else
+      fail "xattr round-trip: expected 'hello_xattr', got '$XATTR_VAL'"
+    fi
+  else
+    fail "xattr round-trip: extracted file not found at $XATTR_OUT"
+  fi
+else
+  echo "SKIP: xattr round-trip (macOS only)"
+fi
+
 # =============================================================================
 # Summary
 # =============================================================================
