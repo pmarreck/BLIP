@@ -37,7 +37,8 @@ pub fn compress(
 ) (Allocator.Error || CompressionError)![]u8 {
     switch (algo) {
         .lzma2 => {
-            return z7z.lzma2_encoder.compress(data, .{
+            const params = z7z.lzma2_encoder.LevelParams.fromLevel(z7z.lzma2_encoder.LevelParams.DEFAULT_LEVEL);
+            return z7z.lzma2_encoder.compress(data, params.dict_size, params.nice_len, .{
                 .callback = progress_fn,
                 .user_data = progress_ctx,
             }, allocator) catch |e| switch (e) {

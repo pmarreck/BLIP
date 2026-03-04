@@ -354,7 +354,12 @@ static void fill_entry_metadata(blip_archive_entry *entry, const struct stat *st
 /* ── Extended attribute helpers ────────────────────────────────────────── */
 
 #if defined(__APPLE__) || defined(__linux__)
-#include <sys/xattr.h>
+  #if defined(__has_include)
+    #if __has_include(<sys/xattr.h>)
+      #include <sys/xattr.h>
+      #define HAVE_XATTR 1
+    #endif
+  #endif
 #endif
 
 /* Read extended attributes from a filesystem path.
@@ -369,7 +374,7 @@ static int read_file_xattrs(const char *path,
     *out_resource_fork = NULL;
     *out_resource_fork_len = 0;
 
-#if defined(__APPLE__) || defined(__linux__)
+#ifdef HAVE_XATTR
     /* List xattr names */
 #if defined(__APPLE__)
     ssize_t list_len = listxattr(path, NULL, 0, XATTR_NOFOLLOW);
@@ -460,7 +465,7 @@ static int read_file_xattrs(const char *path,
     *out_count = count;
 #else
     (void)path;
-#endif /* __APPLE__ || __linux__ */
+#endif /* HAVE_XATTR */
 
     return 0;
 }
@@ -484,7 +489,7 @@ static void free_file_xattrs(blip_xattr_entry *xattrs, size_t count,
 static void write_file_xattrs(const char *path,
                                 const blip_xattr_entry *xattrs, size_t count,
                                 const uint8_t *resource_fork, size_t resource_fork_len) {
-#if defined(__APPLE__) || defined(__linux__)
+#ifdef HAVE_XATTR
     for (size_t i = 0; i < count; i++) {
         /* Build null-terminated name */
         char name_buf[256];
@@ -522,7 +527,7 @@ static void write_file_xattrs(const char *path,
 #else
     (void)path; (void)xattrs; (void)count;
     (void)resource_fork; (void)resource_fork_len;
-#endif /* __APPLE__ || __linux__ */
+#endif /* HAVE_XATTR */
 }
 
 /* ── Progress (via progrez library) ───────────────────────────────────── */

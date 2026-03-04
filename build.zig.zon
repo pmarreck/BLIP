@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .z7z = .{
-            .url = "https://github.com/pmarreck/z7z/archive/18e094eab1cb545c86a6b6e72cc9c48db3539ddd.tar.gz",
-            .hash = "z7z-0.1.0-rkKuF0UdBQDsZxiiNFWuuoHVeGLFO078oGD6yQQiSXoA",
+            .url = "https://github.com/pmarreck/z7z/archive/93112f05573ba294b18f98ec5473251b7fedd240.tar.gz",
+            .hash = "z7z-0.1.0-rkKuF1v8BQAz2YEHTrHZ3KrgSvHwfPfiwiX3HOAPmF4Y",
         },
         .bzip2z = .{
             .url = "https://github.com/pmarreck/bzip2z/archive/76d3ca8f35dad2c1393eb35d97332d5a8e9da2bb.tar.gz",
@@ -17,8 +17,8 @@
             .hash = "lz4-1.10.0-TtaqjVLWBwDiQxASdpBmT-44zoqcVnVkA9kQGAonGWDf",
         },
         .progrez = .{
-            .url = "https://github.com/pmarreck/progrez/archive/f338840d063e05cb6f886e365a8ddb1ade4a2bcd.tar.gz",
-            .hash = "progrez-0.1.0-0YJXrt4AAgAa3oScbj1pXFwos1rhFzR50M6sQSJBmZHg",
+            .url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz",
+            .hash = "progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp",
         },
     },
     .paths = .{
