@@ -16,6 +16,10 @@
             .url = "https://github.com/pmarreck/lz4/archive/675532cbcc0609ddfc44a6e13240902574579a25.tar.gz",
             .hash = "lz4-1.10.0-TtaqjVLWBwDiQxASdpBmT-44zoqcVnVkA9kQGAonGWDf",
         },
+        .zstdz = .{
+            .url = "https://github.com/pmarreck/zstdz/archive/c79c202b8d6512a72a5b0b65ad771adfda66d301.tar.gz",
+            .hash = "zstdz-1.6.0-yDWjzshaNABOkMCYfrjAhKjPt46sKjdR9cLB-XgzeTt4",
+        },
         .progrez = .{
             .url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz",
             .hash = "progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp",

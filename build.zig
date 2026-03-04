@@ -37,6 +37,13 @@ pub fn build(b: *std.Build) void {
     });
     const lz4_lib = lz4_dep.artifact("lz4");
 
+    // zstdz dependency — provides Zstandard compression (C library)
+    const zstdz_dep = b.dependency("zstdz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zstdz_lib = zstdz_dep.artifact("zstd");
+
     // progrez dependency — provides progress bar (C library)
     const progrez_dep = b.dependency("progrez", .{
         .target = target,
@@ -56,6 +63,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     blip_module.linkLibrary(lz4_lib);
+    blip_module.linkLibrary(zstdz_lib);
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
@@ -71,6 +79,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     exposed_blip.linkLibrary(lz4_lib);
+    exposed_blip.linkLibrary(zstdz_lib);
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
@@ -83,6 +92,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     exposed_mini_blar.linkLibrary(lz4_lib);
+    exposed_mini_blar.linkLibrary(zstdz_lib);
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -203,6 +213,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     unit_test_module.linkLibrary(lz4_lib);
+    unit_test_module.linkLibrary(zstdz_lib);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -221,6 +232,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     ffi_test_module.linkLibrary(lz4_lib);
+    ffi_test_module.linkLibrary(zstdz_lib);
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,
     });

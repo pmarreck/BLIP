@@ -36,13 +36,13 @@ NORM_GOODBYE="${TMPDIR_TEST#/}/goodbye.txt"
 NORM_RANDOM="${TMPDIR_TEST#/}/random.bin"
 
 # Algo → COMP byte mapping
-declare -A COMP_BYTE=( [lzma2]="01" [bzip2]="02" [lz4]="03" )
+declare -A COMP_BYTE=( [lzma2]="01" [bzip2]="02" [lz4]="03" [zstd]="04" )
 
 # ══════════════════════════════════════════════════════════════════════════
 # Per-algorithm tests (parameterized)
 # ══════════════════════════════════════════════════════════════════════════
 
-for ALGO in lzma2 bzip2 lz4; do
+for ALGO in lzma2 bzip2 lz4 zstd; do
   COMP=${COMP_BYTE[$ALGO]}
   Z_FLAG="-z $ALGO"
   # lzma2 is the default for bare -z, but we test explicitly here

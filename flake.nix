@@ -28,6 +28,10 @@
           url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz";
           hash = "sha256-q7omg5xppVn5iIgl9VVYKqOMDiea5tm6KbBd0GUiy4E=";
         };
+        zstdz-src = pkgs.fetchurl {
+          url = "https://github.com/pmarreck/zstdz/archive/c79c202b8d6512a72a5b0b65ad771adfda66d301.tar.gz";
+          hash = "sha256-Uq/M87sBrp1VB/Ahr8Pu4vE3AMgR/2nHjJQT18XfH8o=";
+        };
         # Transitive dependency of z7z
         libmagic-src = pkgs.fetchurl {
           url = "https://github.com/pmarreck/libmagic/archive/refs/tags/zig-0.15.0.tar.gz";
@@ -48,6 +52,8 @@
             tar xzf ${lz4-src} --strip-components=1 -C $out/lz4-1.10.0-TtaqjVLWBwDiQxASdpBmT-44zoqcVnVkA9kQGAonGWDf
             mkdir -p $out/progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp
             tar xzf ${progrez-src} --strip-components=1 -C $out/progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp
+            mkdir -p $out/zstdz-1.6.0-yDWjzshaNABOkMCYfrjAhKjPt46sKjdR9cLB-XgzeTt4
+            tar xzf ${zstdz-src} --strip-components=1 -C $out/zstdz-1.6.0-yDWjzshaNABOkMCYfrjAhKjPt46sKjdR9cLB-XgzeTt4
             mkdir -p $out/libmagic-5.46.0-RysxHD9fCACu5caBjXS-x3qQnQM3nRfosCyktdVRzv-R
             tar xzf ${libmagic-src} --strip-components=1 -C $out/libmagic-5.46.0-RysxHD9fCACu5caBjXS-x3qQnQM3nRfosCyktdVRzv-R
           '';

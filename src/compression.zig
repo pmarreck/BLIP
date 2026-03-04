@@ -9,6 +9,9 @@ const lz4 = @cImport({
     @cInclude("lz4.h");
     @cInclude("lz4frame.h");
 });
+const zstd = @cImport({
+    @cInclude("zstd.h");
+});
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
@@ -125,7 +128,71 @@ pub fn compress(
             };
             return result;
         },
-        .zstd => return error.UnsupportedCompression,
+        .zstd => {
+            // Use zstd simple API with chunked progress reporting.
+            const chunk_size: usize = 4 * 1024 * 1024; // 4 MB chunks
+            const bound = zstd.ZSTD_compressBound(data.len);
+            if (zstd.ZSTD_isError(bound) != 0) return error.CompressionFailed;
+
+            const dest_buf = try allocator.alloc(u8, bound);
+            errdefer allocator.free(dest_buf);
+
+            if (data.len <= chunk_size) {
+                // Small data: single-shot compress (level 3 = default)
+                const csize = zstd.ZSTD_compress(dest_buf.ptr, bound, data.ptr, data.len, 3);
+                if (zstd.ZSTD_isError(csize) != 0) {
+                    allocator.free(dest_buf);
+                    return error.CompressionFailed;
+                }
+                if (progress_fn) |cb| cb(data.len, data.len, progress_ctx);
+                const result = allocator.realloc(dest_buf, csize) catch {
+                    return dest_buf[0..csize];
+                };
+                return result;
+            }
+
+            // Large data: streaming compress with progress
+            const cctx = zstd.ZSTD_createCCtx() orelse {
+                allocator.free(dest_buf);
+                return error.CompressionFailed;
+            };
+            defer _ = zstd.ZSTD_freeCCtx(cctx);
+
+            _ = zstd.ZSTD_CCtx_setParameter(cctx, zstd.ZSTD_c_compressionLevel, 3);
+
+            var out_buf = zstd.ZSTD_outBuffer{ .dst = dest_buf.ptr, .size = dest_buf.len, .pos = 0 };
+            var src_offset: usize = 0;
+
+            while (src_offset < data.len) {
+                const remaining = data.len - src_offset;
+                const this_chunk = @min(remaining, chunk_size);
+                const is_last = (src_offset + this_chunk >= data.len);
+
+                var in_buf = zstd.ZSTD_inBuffer{ .src = data.ptr + src_offset, .size = this_chunk, .pos = 0 };
+                const directive: c_uint = if (is_last) zstd.ZSTD_e_end else zstd.ZSTD_e_continue;
+
+                while (true) {
+                    const ret = zstd.ZSTD_compressStream2(cctx, &out_buf, &in_buf, directive);
+                    if (zstd.ZSTD_isError(ret) != 0) {
+                        allocator.free(dest_buf);
+                        return error.CompressionFailed;
+                    }
+                    if (is_last) {
+                        if (ret == 0) break; // fully flushed
+                    } else {
+                        if (in_buf.pos >= in_buf.size) break;
+                    }
+                }
+
+                src_offset += this_chunk;
+                if (progress_fn) |cb| cb(src_offset, data.len, progress_ctx);
+            }
+
+            const result = allocator.realloc(dest_buf, out_buf.pos) catch {
+                return dest_buf[0..out_buf.pos];
+            };
+            return result;
+        },
     }
 }
 
@@ -176,7 +243,17 @@ pub fn decompress(allocator: Allocator, algo: ct.CompressionId, data: []const u8
             }
             return out_buf;
         },
-        .zstd => return error.UnsupportedCompression,
+        .zstd => {
+            const out_buf = try allocator.alloc(u8, @intCast(decomp_len));
+            errdefer allocator.free(out_buf);
+
+            const dsize = zstd.ZSTD_decompress(out_buf.ptr, out_buf.len, data.ptr, data.len);
+            if (zstd.ZSTD_isError(dsize) != 0 or dsize != @as(usize, @intCast(decomp_len))) {
+                allocator.free(out_buf);
+                return error.DecompressionFailed;
+            }
+            return out_buf;
+        },
     }
 }
 
@@ -295,9 +372,17 @@ test "LZ4 compress/decompress round-trip (raw bytes)" {
     try testing.expectEqualSlices(u8, original, decompressed);
 }
 
-test "zstd compress returns UnsupportedCompression" {
+test "zstd compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, compress(allocator, .zstd, "test", null, null));
+    const original = "Hello, zstd compression! This is a test of the unified interface.";
+
+    const compressed = try compress(allocator, .zstd, original, null, null);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompress(allocator, .zstd, compressed, original.len);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, original, decompressed);
 }
 
 test "bzip2 compressContainer/decompressContainer round-trip" {
@@ -332,9 +417,20 @@ test "LZ4 compressContainer/decompressContainer round-trip" {
     try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
-test "zstd decompress returns UnsupportedCompression" {
+test "zstd compressContainer/decompressContainer round-trip" {
     const allocator = testing.allocator;
-    try testing.expectError(error.UnsupportedCompression, decompress(allocator, .zstd, "test", 4));
+    const leaf = @import("leaf.zig");
+
+    const inner = try leaf.serializeData(allocator, "Hello, zstd container!");
+    defer allocator.free(inner);
+
+    const compressed = try compressContainer(allocator, .zstd, inner, null, null, null);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompressContainer(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqualSlices(u8, inner, decompressed);
 }
 
 test "compressContainer/decompressContainer round-trip with LZMA2" {
