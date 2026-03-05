@@ -51,19 +51,33 @@ for ALGO in lzma2 bzip2 lz4 zstd; do
   echo ""
   echo "── Testing $ALGO ──"
 
-  # --- blar create -z $ALGO ---
+  # --- blar create -z $ALGO (default: per-file compression) ---
 
   "$BLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_comp.blar" \
     "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
   [ -f "$TMPDIR_TEST/${ALGO}_comp.blar" ] \
-    && pass "$PREFIX blar create produces output" \
-    || fail "$PREFIX blar create produces output"
+    && pass "$PREFIX blar create (per-file) produces output" \
+    || fail "$PREFIX blar create (per-file) produces output"
 
-  # COMP attribute present
+  # Per-file: outer LP header should NOT have COMP attribute
   HEADER_HEX=$(xxd -l 15 -p "$TMPDIR_TEST/${ALGO}_comp.blar" | tr -d '\n')
-  echo "$HEADER_HEX" | grep -q "8110${COMP}" \
-    && pass "$PREFIX COMP=0x${COMP} in LP header" \
-    || fail "$PREFIX COMP=0x${COMP} not found (got $HEADER_HEX)"
+  echo "$HEADER_HEX" | grep -qv "8110${COMP}" \
+    && pass "$PREFIX per-file: no COMP in outer LP header" \
+    || fail "$PREFIX per-file: unexpected COMP in outer header (got $HEADER_HEX)"
+
+  # --- blar create --solid -z $ALGO ---
+
+  "$BLAR" create --solid $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_solid.blar" \
+    "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+  [ -f "$TMPDIR_TEST/${ALGO}_solid.blar" ] \
+    && pass "$PREFIX blar create (solid) produces output" \
+    || fail "$PREFIX blar create (solid) produces output"
+
+  # Solid: outer LP header SHOULD have COMP attribute
+  SOLID_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/${ALGO}_solid.blar" | tr -d '\n')
+  echo "$SOLID_HEADER" | grep -q "8110${COMP}" \
+    && pass "$PREFIX solid: COMP=0x${COMP} in LP header" \
+    || fail "$PREFIX solid: COMP=0x${COMP} not found (got $SOLID_HEADER)"
 
   # --- Transparent decompression: list, extract, verify, info, cat, peek, to-json ---
 
@@ -114,6 +128,25 @@ for ALGO in lzma2 bzip2 lz4 zstd; do
     && pass "$PREFIX to-json valid ($ENTRY_COUNT entries)" \
     || fail "$PREFIX to-json entry count: $ENTRY_COUNT"
 
+  # --- Solid archive: transparent decompression ---
+
+  SOLID_LIST=$("$BLAR" list "$TMPDIR_TEST/${ALGO}_solid.blar" 2>/dev/null)
+  echo "$SOLID_LIST" | grep -q 'hello.txt' \
+    && pass "$PREFIX solid list works" \
+    || fail "$PREFIX solid list — output: $SOLID_LIST"
+
+  SOLID_EXTRACT="$TMPDIR_TEST/${ALGO}_solid_ext"
+  mkdir -p "$SOLID_EXTRACT"
+  "$BLAR" extract "$TMPDIR_TEST/${ALGO}_solid.blar" -C "$SOLID_EXTRACT" 2>/dev/null
+  [ -f "$SOLID_EXTRACT/$NORM_HELLO" ] && [ "$(cat "$SOLID_EXTRACT/$NORM_HELLO")" = "hello world" ] \
+    && pass "$PREFIX solid extract correct" \
+    || fail "$PREFIX solid extract correct"
+
+  SOLID_VERIFY=$("$BLAR" verify "$TMPDIR_TEST/${ALGO}_solid.blar" 2>&1)
+  echo "$SOLID_VERIFY" | grep -q 'OK' \
+    && pass "$PREFIX solid verify passes" \
+    || fail "$PREFIX solid verify — output: $SOLID_VERIFY"
+
   # --- miniblar ---
 
   "$MINIBLAR" create $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_mini.mblar" \
@@ -143,6 +176,20 @@ for ALGO in lzma2 bzip2 lz4 zstd; do
   [ "$MINI_CAT" = "hello world" ] \
     && pass "$PREFIX miniblar cat correct" \
     || fail "$PREFIX miniblar cat (got: '$MINI_CAT')"
+
+  # --- miniblar --solid ---
+
+  "$MINIBLAR" create --solid $Z_FLAG -o "$TMPDIR_TEST/${ALGO}_mini_solid.mblar" \
+    "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+  MINI_SOLID_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/${ALGO}_mini_solid.mblar" | tr -d '\n')
+  echo "$MINI_SOLID_HEADER" | grep -q "8110${COMP}" \
+    && pass "$PREFIX miniblar solid: COMP in header" \
+    || fail "$PREFIX miniblar solid: COMP not found (got $MINI_SOLID_HEADER)"
+
+  MINI_SOLID_LIST=$("$MINIBLAR" list "$TMPDIR_TEST/${ALGO}_mini_solid.mblar" 2>/dev/null)
+  echo "$MINI_SOLID_LIST" | grep -q 'hello.txt' \
+    && pass "$PREFIX miniblar solid list works" \
+    || fail "$PREFIX miniblar solid list — output: $MINI_SOLID_LIST"
 
   # --- Binary round-trip ---
 
@@ -197,37 +244,43 @@ done
 echo ""
 echo "── Non-parameterized tests ──"
 
-# -z alone defaults to lzma2
-"$BLAR" create -z -o "$TMPDIR_TEST/default_z.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
-DEFAULT_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/default_z.blar" | tr -d '\n')
+# -z alone defaults to lzma2 (per-file mode — verify via --solid)
+"$BLAR" create --solid -z -o "$TMPDIR_TEST/default_z_solid.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+DEFAULT_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/default_z_solid.blar" | tr -d '\n')
 echo "$DEFAULT_HEADER" | grep -q "811001" \
-  && pass "-z alone defaults to lzma2 (COMP=0x01)" \
+  && pass "-z alone defaults to lzma2 (--solid COMP=0x01)" \
   || fail "-z alone defaults to lzma2 — got $DEFAULT_HEADER"
 
-# -z lzma explicitly works
-"$BLAR" create -z lzma -o "$TMPDIR_TEST/lzma_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+# -z per-file: content still extractable
+"$BLAR" create -z -o "$TMPDIR_TEST/default_z_pf.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+DZ_PF_LIST=$("$BLAR" list "$TMPDIR_TEST/default_z_pf.blar" 2>/dev/null)
+echo "$DZ_PF_LIST" | grep -q "hello.txt" \
+  && pass "-z per-file: list works" \
+  || fail "-z per-file: list — output: $DZ_PF_LIST"
+
+# -z lzma alias works (verify via --solid)
+"$BLAR" create --solid -z lzma -o "$TMPDIR_TEST/lzma_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
 LZMA_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/lzma_alias.blar" | tr -d '\n')
 echo "$LZMA_HEADER" | grep -q "811001" \
-  && pass "-z lzma alias works (COMP=0x01)" \
+  && pass "-z lzma alias works (--solid COMP=0x01)" \
   || fail "-z lzma alias — got $LZMA_HEADER"
 
-# -z bz2 alias works
-"$BLAR" create -z bz2 -o "$TMPDIR_TEST/bz2_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
+# -z bz2 alias works (verify via --solid)
+"$BLAR" create --solid -z bz2 -o "$TMPDIR_TEST/bz2_alias.blar" "$TMPDIR_TEST/hello.txt" 2>/dev/null
 BZ2_HEADER=$(xxd -l 15 -p "$TMPDIR_TEST/bz2_alias.blar" | tr -d '\n')
 echo "$BZ2_HEADER" | grep -q "811002" \
-  && pass "-z bz2 alias works (COMP=0x02)" \
+  && pass "-z bz2 alias works (--solid COMP=0x02)" \
   || fail "-z bz2 alias — got $BZ2_HEADER"
 
-# Compressed is smaller than uncompressed (text files with lzma2)
+# Solid compressed is smaller than uncompressed (text files with lzma2)
 "$BLAR" create -o "$TMPDIR_TEST/uncompressed.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
-COMP_SIZE=$(wc -c < "$TMPDIR_TEST/default_z.blar" | tr -d ' ')
-# Use a fresh lzma2 archive with same files for fair comparison
-"$BLAR" create -z -o "$TMPDIR_TEST/comp_both.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+# Use solid lzma2 for fair size comparison
+"$BLAR" create --solid -z -o "$TMPDIR_TEST/comp_both.blar" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
 COMP_BOTH=$(wc -c < "$TMPDIR_TEST/comp_both.blar" | tr -d ' ')
 UNCOMP_SIZE=$(wc -c < "$TMPDIR_TEST/uncompressed.blar" | tr -d ' ')
 [ "$COMP_BOTH" -lt "$UNCOMP_SIZE" ] \
-  && pass "lzma2 compressed smaller than uncompressed ($COMP_BOTH < $UNCOMP_SIZE)" \
-  || fail "lzma2 compressed not smaller ($COMP_BOTH >= $UNCOMP_SIZE)"
+  && pass "solid lzma2 compressed smaller than uncompressed ($COMP_BOTH < $UNCOMP_SIZE)" \
+  || fail "solid lzma2 compressed not smaller ($COMP_BOTH >= $UNCOMP_SIZE)"
 
 # Uncompressed archives still work
 UNCOMP_LIST=$("$BLAR" list "$TMPDIR_TEST/uncompressed.blar" 2>/dev/null)
@@ -240,6 +293,9 @@ BLAR_HELP=$("$BLAR" --help 2>&1)
 echo "$BLAR_HELP" | grep -q '\-z' \
   && pass "blar --help mentions -z" \
   || fail "blar --help mentions -z"
+echo "$BLAR_HELP" | grep -q '\-\-solid' \
+  && pass "blar --help mentions --solid" \
+  || fail "blar --help mentions --solid"
 for ALGO in bzip2 lz4; do
   echo "$BLAR_HELP" | grep -q "$ALGO" \
     && pass "blar --help mentions $ALGO" \
@@ -250,6 +306,9 @@ MINI_HELP=$("$MINIBLAR" --help 2>&1)
 echo "$MINI_HELP" | grep -q '\-z' \
   && pass "miniblar --help mentions -z" \
   || fail "miniblar --help mentions -z"
+echo "$MINI_HELP" | grep -q '\-\-solid' \
+  && pass "miniblar --help mentions --solid" \
+  || fail "miniblar --help mentions --solid"
 
 # ── Large payload compression ────────────────────────────────────────────
 

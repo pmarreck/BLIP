@@ -530,6 +530,50 @@ static void write_file_xattrs(const char *path,
 #endif /* HAVE_XATTR */
 }
 
+/* ── MIME-type sorting (for solid compression) ────────────────────────── */
+
+#ifdef HAVE_LIBMAGIC
+#include <magic.h>
+
+static magic_t g_magic = NULL;
+
+static void init_magic(void) {
+    g_magic = magic_open(MAGIC_MIME_TYPE | MAGIC_NO_CHECK_COMPRESS);
+    if (g_magic) magic_load(g_magic, NULL);
+}
+
+static void cleanup_magic(void) {
+    if (g_magic) { magic_close(g_magic); g_magic = NULL; }
+}
+
+static int mime_compare(const void *a, const void *b) {
+    const blip_archive_entry *ea = (const blip_archive_entry *)a;
+    const blip_archive_entry *eb = (const blip_archive_entry *)b;
+    /* Directories first */
+    if (ea->is_dir && !eb->is_dir) return -1;
+    if (!ea->is_dir && eb->is_dir) return 1;
+    if (ea->is_dir && eb->is_dir) return strcmp(ea->path, eb->path);
+    /* Sort files by MIME type */
+    const char *ma = magic_buffer(g_magic, ea->content, ea->content_len);
+    const char *mb = magic_buffer(g_magic, eb->content, eb->content_len);
+    if (!ma) ma = "application/octet-stream";
+    if (!mb) mb = "application/octet-stream";
+    int cmp = strcmp(ma, mb);
+    return cmp != 0 ? cmp : strcmp(ea->path, eb->path);
+}
+
+static void mime_sort_entries(blip_archive_entry *entries, size_t count) {
+    init_magic();
+    if (!g_magic) return; /* graceful fallback */
+    qsort(entries, count, sizeof(blip_archive_entry), mime_compare);
+    cleanup_magic();
+}
+#else
+static void mime_sort_entries(blip_archive_entry *entries, size_t count) {
+    (void)entries; (void)count;
+}
+#endif /* HAVE_LIBMAGIC */
+
 /* ── Progress (via progrez library) ───────────────────────────────────── */
 
 #include "progrez.h"

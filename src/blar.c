@@ -364,6 +364,10 @@ static void print_usage(FILE *out) {
         "\n"
         "Options:\n"
         "  -z [algo]        Compress (lzma2=default, bzip2, lz4, zstd)\n"
+        "                   Default: per-file compression\n"
+        "  --solid          Solid compression (whole archive, better ratio)\n"
+        "                   Auto-enables MIME-type sorting\n"
+        "  --no-sort        Disable MIME sorting (only with --solid)\n"
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
@@ -415,6 +419,8 @@ static int cmd_create(int argc, char **argv) {
     int input_start = 0;
     bool absolute_names = g_absolute_names;
     uint8_t compress_algo = 0;  /* 0 = no compression */
+    bool solid_mode = false;    /* --solid: solid compression (old behavior) */
+    bool no_sort = false;       /* --no-sort: disable MIME sorting in solid mode */
     bool do_encrypt = false;
     uint8_t enc_id = 1;   /* default: AES-256-GCM */
     uint8_t kdf_id = 1;   /* default: Argon2id */
@@ -496,6 +502,16 @@ static int cmd_create(int argc, char **argv) {
             }
             for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
             argc -= 2;
+            i--;
+        } else if (strcmp(argv[i], "--solid") == 0) {
+            solid_mode = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "--no-sort") == 0) {
+            no_sort = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
             i--;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -595,11 +611,25 @@ static int cmd_create(int argc, char **argv) {
         progrez_set_determinate(progress, el.count, el.bytes_seen);
     }
 
+    /* Determine per-file vs solid compression.
+     * Default when -z is used: per-file compression.
+     * --solid: solid compression (wrap entire archive). */
+    uint8_t per_file_comp = 0;
+    if (compress_algo != 0 && !solid_mode) {
+        per_file_comp = compress_algo;
+    }
+
+    /* MIME-sort entries for solid compression (improves ratio) */
+    if (compress_algo != 0 && solid_mode && !no_sort) {
+        mime_sort_entries(el.entries, el.count);
+    }
+
     /* Create the archive via FFI (with progress callback) */
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(el.entries, el.count, create_flags,
+                                           per_file_comp,
                                            progress ? create_progress_cb : NULL,
                                            progress ? phase_cb : NULL,
                                            progress,
@@ -612,8 +642,8 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    /* Optionally compress */
-    if (compress_algo != 0) {
+    /* Solid compression: wrap entire archive in one compressed LP */
+    if (compress_algo != 0 && solid_mode) {
         if (progress) {
             progrez_set_label(progress, "Compressing");
             progrez_set_determinate(progress, 0, archive_len);
@@ -848,10 +878,11 @@ static int cmd_extract(int argc, char **argv) {
             /* mtime for directories is set after all files are extracted */
         } else {
             /* FILE entry: count bytes for progress */
-            const uint8_t *data = NULL;
+            uint8_t *data = NULL;
             size_t data_len = 0;
             if (blip_archive_file_content(buf, buf_len, i, &data, &data_len) == BLIP_OK) {
                 total_bytes += data_len;
+                blip_free_content(data, data_len);
             }
             file_entries++;
         }
@@ -865,8 +896,9 @@ static int cmd_extract(int argc, char **argv) {
     }
 
     uint64_t files_done = 0;
+    uint64_t failed = 0;
 
-    /* Second pass: extract files */
+    /* Second pass: extract files (resilient — continue on per-file errors) */
     for (uint64_t i = 0; i < count; i++) {
         uint8_t entry_type = 0;
         blip_archive_entry_type(buf, buf_len, i, &entry_type);
@@ -876,22 +908,20 @@ static int cmd_extract(int argc, char **argv) {
         size_t path_len = 0;
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
-            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-            fprintf(stderr, "blar: extract: entry %llu: %s\n",
+            fprintf(stderr, "\033[31mERROR: entry %llu: cannot read path: %s\033[0m\n",
                     (unsigned long long)i, blip_error_string(rc));
-            free(buf);
-            return EXIT_IO;
+            failed++;
+            continue;
         }
 
-        const uint8_t *data = NULL;
+        uint8_t *data = NULL;
         size_t data_len = 0;
         rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
         if (rc != BLIP_OK) {
-            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-            fprintf(stderr, "blar: extract: entry %llu: %s\n",
-                    (unsigned long long)i, blip_error_string(rc));
-            free(buf);
-            return EXIT_IO;
+            fprintf(stderr, "\033[31mERROR: skipping '%.*s': %s\033[0m\n",
+                    (int)path_len, path, blip_error_string(rc));
+            failed++;
+            continue;
         }
 
         char out_path[4096];
@@ -899,17 +929,19 @@ static int cmd_extract(int argc, char **argv) {
             int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
                              output_dir, (int)path_len, path);
             if (n < 0 || (size_t)n >= sizeof(out_path)) {
-                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-                fprintf(stderr, "blar: extract: path too long\n");
-                free(buf);
-                return EXIT_IO;
+                fprintf(stderr, "\033[31mERROR: skipping '%.*s': path too long\033[0m\n",
+                        (int)path_len, path);
+                blip_free_content(data, data_len);
+                failed++;
+                continue;
             }
         } else {
             if (path_len >= sizeof(out_path)) {
-                if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-                fprintf(stderr, "blar: extract: path too long\n");
-                free(buf);
-                return EXIT_IO;
+                fprintf(stderr, "\033[31mERROR: skipping '%.*s': path too long\033[0m\n",
+                        (int)path_len, path);
+                blip_free_content(data, data_len);
+                failed++;
+                continue;
             }
             memcpy(out_path, path, path_len);
             out_path[path_len] = '\0';
@@ -917,20 +949,22 @@ static int cmd_extract(int argc, char **argv) {
 
         /* Ensure parent dirs exist (for implicit directories) */
         if (!ensure_parent_dir(out_path)) {
-            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-            fprintf(stderr, "blar: extract: cannot create directory for '%s': %s\n",
-                    out_path, strerror(errno));
-            free(buf);
-            return EXIT_IO;
+            fprintf(stderr, "\033[31mERROR: skipping '%.*s': cannot create directory: %s\033[0m\n",
+                    (int)path_len, path, strerror(errno));
+            blip_free_content(data, data_len);
+            failed++;
+            continue;
         }
 
         if (!write_file(out_path, data, data_len)) {
-            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-            fprintf(stderr, "blar: extract: cannot write '%s': %s\n",
-                    out_path, strerror(errno));
-            free(buf);
-            return EXIT_IO;
+            fprintf(stderr, "\033[31mERROR: skipping '%.*s': cannot write: %s\033[0m\n",
+                    (int)path_len, path, strerror(errno));
+            blip_free_content(data, data_len);
+            failed++;
+            continue;
         }
+
+        blip_free_content(data, data_len);
 
         /* Restore file mode and mtime */
         uint16_t mode = 0;
@@ -975,6 +1009,12 @@ static int cmd_extract(int argc, char **argv) {
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     free(buf);
+
+    if (failed > 0) {
+        fprintf(stderr, "\n%llu extracted, %llu failed\n",
+                (unsigned long long)files_done, (unsigned long long)failed);
+        return EXIT_IO;
+    }
     return EXIT_OK;
 }
 
@@ -1122,7 +1162,7 @@ static int cmd_info(int argc, char **argv) {
             const char *trail = (path_len > 0 && path[path_len - 1] == '/') ? "" : "/";
             printf("%c %04o  %.*s%s\n", type_char, mode, (int)path_len, path, trail);
         } else {
-            const uint8_t *data = NULL;
+            uint8_t *data = NULL;
             size_t data_len = 0;
             rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
             if (rc != BLIP_OK) {
@@ -1140,6 +1180,7 @@ static int cmd_info(int argc, char **argv) {
             printf("%c %04o  %8llu  %.*s\n", type_char, mode,
                    (unsigned long long)data_len, (int)path_len, path);
             total_content += data_len;
+            blip_free_content(data, data_len);
         }
     }
 
@@ -1180,7 +1221,7 @@ static int cmd_cat(int argc, char **argv) {
         return EXIT_IO;
     }
 
-    const uint8_t *data = NULL;
+    uint8_t *data = NULL;
     size_t data_len = 0;
     int32_t rc = blip_archive_file_content_by_path(
         buf, buf_len, file_path, strlen(file_path), &data, &data_len);
@@ -1199,6 +1240,7 @@ static int cmd_cat(int argc, char **argv) {
         fwrite(data, 1, data_len, stdout);
     }
 
+    blip_free_content(data, data_len);
     free(buf);
     return EXIT_OK;
 }

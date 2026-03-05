@@ -48,8 +48,8 @@ const ContainerError = mini_blar.ContainerError;
 const leaf = mini_blar.leaf;
 const dict_mod = mini_blar.dict_mod;
 
-/// Map a full archive error (ContainerError | OutOfMemory) to a C FFI error code.
-fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
+/// Map a full archive error (ContainerError | OutOfMemory | CompressionError) to a C FFI error code.
+fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError || mini_blar.compression_mod.CompressionError)) i32 {
     return switch (err) {
         error.OutOfMemory => -13,
         error.InvalidContainerType => -1,
@@ -67,6 +67,9 @@ fn fullArchiveErrorCode(err: (Allocator.Error || ContainerError)) i32 {
         error.MissingSigil => -25,
         error.InvalidSigilOrder => -26,
         error.MissingDecompLen => -27,
+        error.CompressionFailed => -24,
+        error.DecompressionFailed => -23,
+        error.UnsupportedCompression => -32,
     };
 }
 
@@ -237,6 +240,7 @@ export fn blip_archive_create_full(
     entries: [*]const CArchiveEntry,
     entry_count: usize,
     flags: u32,
+    per_file_comp_algo: u8,
     progress_fn: mini_blar.ProgressFn,
     phase_fn: mini_blar.PhaseFn,
     progress_ctx: ?*anyopaque,
@@ -326,7 +330,12 @@ export fn blip_archive_create_full(
         }
     }
 
-    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, phase_fn, progress_ctx) catch |e| {
+    // Convert per_file_comp_algo: 0=none, 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
+    // Convert per_file_comp_algo: 0=none, 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
+    const CompressionId_ = mini_blar.container_mod.CompressionId;
+    const comp_id: ?CompressionId_ = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompressionId_, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
+
+    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, phase_fn, progress_ctx, comp_id) catch |e| {
         return fullArchiveErrorCode(e);
     };
     out_buf.* = result.ptr;
@@ -370,34 +379,59 @@ export fn blip_archive_file_path(
     return 0;
 }
 
-/// Get file content at the given index (zero-copy pointer into buf).
-/// Only works for FILE entries (reads DATA container element 1).
+/// Get file content at the given index, handling per-file compression transparently.
+/// Caller must free the returned buffer with blip_free_content().
 export fn blip_archive_file_content(
     buf: [*]const u8,
     buf_len: usize,
     index: u64,
-    out_data: *[*]const u8,
+    out_data: *[*]u8,
     out_data_len: *usize,
 ) callconv(.c) i32 {
     const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
-    const content = reader.fileContentAt(index) catch |e| return containerErrorCode(e);
+    const content = reader.fileContentDecompress(index, page_allocator) catch |e| {
+        // Map all possible errors
+        return switch (e) {
+            error.OutOfMemory => @as(i32, -13),
+            error.CompressionFailed => @as(i32, -24),
+            error.DecompressionFailed => @as(i32, -23),
+            error.UnsupportedCompression => @as(i32, -32),
+            else => @as(i32, -1),
+        };
+    };
     out_data.* = content.ptr;
     out_data_len.* = content.len;
     return 0;
 }
 
-/// Get file content by path (zero-copy pointer into buf).
+/// Free content returned by blip_archive_file_content.
+export fn blip_free_content(ptr: [*]u8, len: usize) callconv(.c) void {
+    if (len > 0) {
+        page_allocator.free(ptr[0..len]);
+    }
+}
+
+/// Get file content by path, handling per-file compression transparently.
+/// Caller must free the returned buffer with blip_free_content().
 export fn blip_archive_file_content_by_path(
     buf: [*]const u8,
     buf_len: usize,
     path: [*]const u8,
     path_len: usize,
-    out_data: *[*]const u8,
+    out_data: *[*]u8,
     out_data_len: *usize,
 ) callconv(.c) i32 {
     const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch |e| return containerErrorCode(e);
     const idx = (reader.findFile(path[0..path_len]) catch |e| return containerErrorCode(e)) orelse return -14;
-    const content = reader.fileContentAt(idx) catch |e| return containerErrorCode(e);
+    const content = reader.fileContentDecompress(idx, page_allocator) catch |e| {
+        return switch (e) {
+            error.OutOfMemory => @as(i32, -13),
+            error.CompressionFailed => @as(i32, -24),
+            error.DecompressionFailed => @as(i32, -23),
+            error.UnsupportedCompression => @as(i32, -32),
+            else => @as(i32, -1),
+        };
+    };
     out_data.* = content.ptr;
     out_data_len.* = content.len;
     return 0;
@@ -1319,9 +1353,10 @@ test "C FFI: blip_archive_file_content returns correct data" {
     try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 1, 0, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
-    var data_ptr: [*]const u8 = undefined;
+    var data_ptr: [*]u8 = undefined;
     var data_len: usize = undefined;
     try std.testing.expectEqual(@as(i32, 0), blip_archive_file_content(out_buf, out_len, 0, &data_ptr, &data_len));
+    defer blip_free_content(data_ptr, data_len);
     try std.testing.expectEqualSlices(u8, "hello world", data_ptr[0..data_len]);
 }
 
@@ -1335,10 +1370,11 @@ test "C FFI: blip_archive_file_content_by_path finds file" {
     try std.testing.expectEqual(@as(i32, 0), blip_archive_create(&c_files, 2, 0, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
-    var data_ptr: [*]const u8 = undefined;
+    var data_ptr: [*]u8 = undefined;
     var data_len: usize = undefined;
     try std.testing.expectEqual(@as(i32, 0), blip_archive_file_content_by_path(out_buf, out_len, "b.txt", 5, &data_ptr, &data_len));
     try std.testing.expectEqualSlices(u8, "bbb", data_ptr[0..data_len]);
+    blip_free_content(data_ptr, data_len);
 
     try std.testing.expectEqual(@as(i32, -14), blip_archive_file_content_by_path(out_buf, out_len, "nope", 4, &data_ptr, &data_len));
 }
@@ -1411,7 +1447,7 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var count: u64 = undefined;
@@ -1450,7 +1486,7 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_type: u8 = undefined;
@@ -1477,7 +1513,7 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_mode: u16 = undefined;

@@ -86,15 +86,22 @@ int32_t blip_archive_file_path(const uint8_t *buf, size_t buf_len,
                                 uint64_t index,
                                 const char **out_path, size_t *out_path_len);
 
-/* Get file content from archive by index (zero-copy pointer into buf). */
+/* Get file content from archive by index.
+ * Handles per-file compression transparently (decompresses if needed).
+ * Caller must free the returned buffer with blip_free_content(). */
 int32_t blip_archive_file_content(const uint8_t *buf, size_t buf_len,
                                    uint64_t index,
-                                   const uint8_t **out_data, size_t *out_data_len);
+                                   uint8_t **out_data, size_t *out_data_len);
 
-/* Get file content by path (zero-copy pointer into buf). */
+/* Get file content by path.
+ * Handles per-file compression transparently (decompresses if needed).
+ * Caller must free the returned buffer with blip_free_content(). */
 int32_t blip_archive_file_content_by_path(const uint8_t *buf, size_t buf_len,
                                            const char *path, size_t path_len,
-                                           const uint8_t **out_data, size_t *out_data_len);
+                                           uint8_t **out_data, size_t *out_data_len);
+
+/* Free content returned by blip_archive_file_content or blip_archive_file_content_by_path. */
+void blip_free_content(uint8_t *data, size_t len);
 
 /* Verify a single file's xh64 hash within archive.
  * For DIR entries, verifies the container hash only (no bina check). */
@@ -153,13 +160,16 @@ typedef void (*blip_phase_fn)(const uint8_t *label, size_t label_len,
                                void *user_ctx);
 
 /* Create a full BLIP archive with FILE + DIR entries and metadata.
+ * per_file_comp_algo: 0=none, BLIP_COMP_LZMA2/BZIP2/LZ4/ZSTD for per-file compression.
+ *   When non-zero, each file's DATA is individually compressed; outer archive is NOT compressed.
+ *   For solid compression, pass 0 here and call blip_compress_container() on the result.
  * progress_fn: optional callback for per-entry progress (NULL to skip).
  * phase_fn: optional callback for phase transitions (NULL to skip).
  * progress_ctx: shared user context for both callbacks.
  * Returns 0 on success, negative error code on failure.
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
-                                  uint32_t flags,
+                                  uint32_t flags, uint8_t per_file_comp_algo,
                                   blip_progress_fn progress_fn,
                                   blip_phase_fn phase_fn,
                                   void *progress_ctx,

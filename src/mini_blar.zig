@@ -6,6 +6,7 @@ const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");
 pub const dict_mod = @import("dict.zig");
+pub const compression_mod = @import("compression.zig");
 // data_mod removed in v2 — use leaf directly (data.zig merged into leaf.zig)
 const testing = std.testing;
 
@@ -102,7 +103,7 @@ pub const MAGIC_MBAR: *const [5]u8 = "MBAR\x02";
 ///   [1]: DATA — content bytes
 ///   [2]: DICT — forks (optional, only if xattrs or resource fork present)
 /// Caller owns returned memory.
-pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
+pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8), comp_id: ?ct.CompressionId) (Allocator.Error || ContainerError || compression_mod.CompressionError)![]const u8 {
     // --- Element 0: metadata DICT ---
     // Build metadata key-value pairs with 2-char keys in canonical order:
     // bt < ct < gi < gn < md < mt < pa < ui < un
@@ -214,8 +215,19 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
     const metadata_dict = try dict_mod.serializeDict(allocator, meta_pairs_buf[0..meta_count]);
     try to_free.append(allocator, metadata_dict);
 
-    // --- Element 1: DATA container with xxHash64 checksum ---
-    const data_container = try leaf.serializeDataWithOptions(allocator, file.content, .{ .csum_id = .xxhash64 });
+    // --- Element 1: DATA container with xxHash64 checksum (optionally per-file compressed) ---
+    const data_container = blk: {
+        const raw = try leaf.serializeDataWithOptions(allocator, file.content, .{ .csum_id = .xxhash64 });
+        if (comp_id) |algo| {
+            defer allocator.free(raw);
+            break :blk compression_mod.compressContainer(allocator, algo, raw, null, null, null) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CompressionFailed => return error.CompressionFailed,
+                else => return error.InvalidContainerType,
+            };
+        }
+        break :blk raw;
+    };
     try to_free.append(allocator, data_container);
 
     // --- Element 2: forks DICT (optional) ---
@@ -430,7 +442,7 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
 /// Create a flat BLIP archive from a list of file entries.
 /// Entries are serialized in the order given — caller controls ordering.
 /// Returns the complete archive as a byte slice. Caller owns returned memory.
-pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.Error || ContainerError)![]u8 {
+pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.Error || ContainerError || compression_mod.CompressionError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
@@ -442,7 +454,7 @@ pub fn createArchive(allocator: Allocator, files: []const FileEntry) (Allocator.
     defer file_elements.deinit(allocator);
 
     for (files) |file| {
-        const file_bytes = try serializeFileEntry(allocator, file, &to_free);
+        const file_bytes = try serializeFileEntry(allocator, file, &to_free, null);
         try file_elements.append(allocator, file_bytes);
     }
 
@@ -478,7 +490,8 @@ pub fn createFullArchive(
     progress_fn: ProgressFn,
     phase_fn: PhaseFn,
     progress_ctx: ?*anyopaque,
-) (Allocator.Error || ContainerError)![]u8 {
+    comp_id: ?ct.CompressionId,
+) (Allocator.Error || ContainerError || compression_mod.CompressionError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
@@ -500,7 +513,7 @@ pub fn createFullArchive(
     for (entries) |entry| {
         switch (entry) {
             .file => |file| {
-                const file_bytes = try serializeFileEntry(allocator, file, &to_free);
+                const file_bytes = try serializeFileEntry(allocator, file, &to_free, comp_id);
                 try entry_elements.append(allocator, file_bytes);
                 // Extract xxHash64 from the FILE ARRAY's LP header checksum
                 const file_view = try container.parseLPHeader(file_bytes);
@@ -692,10 +705,38 @@ pub const ArchiveReader = struct {
 
     /// Get the content of a FILE entry at the given index.
     /// Reads the DATA container (element 1 of the FILE ARRAY) and returns payload bytes.
+    /// For uncompressed entries, returns a zero-copy slice into the archive buffer.
     pub fn fileContentAt(self: ArchiveReader, index: u64) ContainerError![]const u8 {
         const arr = try self.fileArrayAt(index);
         const data_view = try arr.elementAt(1);
         return leaf.readData(data_view.buf);
+    }
+
+    /// Get the content of a FILE entry, handling per-file compression transparently.
+    /// If element [1] is a compressed LP container (has COMP attribute), decompresses
+    /// the outer LP to recover the inner DATA LP, then reads the payload.
+    /// If uncompressed, copies the payload into allocator-owned memory.
+    /// Caller owns returned memory and must free it.
+    pub fn fileContentDecompress(self: ArchiveReader, index: u64, allocator: Allocator) ![]u8 {
+        const arr = try self.fileArrayAt(index);
+        const data_view = try arr.elementAt(1);
+
+        // Check if the element has a COMP attribute (per-file compressed)
+        if (data_view.comp_id != null) {
+            // Per-file compressed: decompress outer LP → get inner DATA LP → read payload
+            const inner_lp = try compression_mod.decompressContainer(allocator, data_view.buf);
+            defer allocator.free(inner_lp);
+            const payload = try leaf.readData(inner_lp);
+            const result = try allocator.alloc(u8, payload.len);
+            @memcpy(result, payload);
+            return result;
+        }
+
+        // Uncompressed: read payload, copy to owned buffer
+        const payload = try leaf.readData(data_view.buf);
+        const result = try allocator.alloc(u8, payload.len);
+        @memcpy(result, payload);
+        return result;
     }
 
     /// Verify a FILE entry's DATA checksum and ARRAY checksum.
@@ -909,7 +950,7 @@ test "full archive with DIR + FILE entries round-trips" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1033,7 +1074,7 @@ test "DIR metadata round-trip with 2-char keys" {
             .username = "peter",
         } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1144,7 +1185,7 @@ test "DIR container has xxHash64 checksum" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1209,7 +1250,7 @@ test "Merkle hash uses per-file xxHash64 from FILE ARRAY container" {
         to_free.deinit(allocator);
     }
 
-    const file_bytes = try serializeFileEntry(allocator, file, &to_free);
+    const file_bytes = try serializeFileEntry(allocator, file, &to_free, null);
 
     // Parse the FILE ARRAY header to extract its xxHash64 checksum
     const file_view = try container_mod.parseLPHeader(file_bytes);
@@ -1231,4 +1272,78 @@ test "Merkle hash uses per-file xxHash64 from FILE ARRAY container" {
     var expected_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &expected_bytes, expected, .little);
     try testing.expectEqualSlices(u8, &expected_bytes, &merkle);
+}
+
+test "per-file compression: createFullArchive with comp_id produces recoverable content" {
+    const allocator = testing.allocator;
+
+    const entries = [_]ArchiveEntry{
+        .{ .file = .{ .path = "hello.txt", .content = "Hello, world!\n", .mode = 0o644 } },
+        .{ .file = .{ .path = "data.bin", .content = "some binary data here" } },
+    };
+
+    // Create archive with LZ4 per-file compression
+    const archive = try createFullArchive(allocator, &entries, null, null, null, .lz4);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+    try testing.expect(try reader.verifyMagic());
+    try testing.expectEqual(@as(u64, 2), try reader.entryCount());
+
+    // Element [1] of the first FILE should be a compressed LP container
+    const arr0 = try reader.fileArrayAt(0);
+    const data_view0 = try arr0.elementAt(1);
+    try testing.expectEqual(@as(?ct.CompressionId, .lz4), data_view0.comp_id);
+
+    // fileContentDecompress should recover the original content
+    const content0 = try reader.fileContentDecompress(0, allocator);
+    defer allocator.free(content0);
+    try testing.expectEqualSlices(u8, "Hello, world!\n", content0);
+
+    const content1 = try reader.fileContentDecompress(1, allocator);
+    defer allocator.free(content1);
+    try testing.expectEqualSlices(u8, "some binary data here", content1);
+}
+
+test "fileContentDecompress works on uncompressed archives" {
+    const allocator = testing.allocator;
+
+    const entries = [_]ArchiveEntry{
+        .{ .file = .{ .path = "test.txt", .content = "uncompressed content" } },
+    };
+
+    // Create archive without compression (null comp_id)
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+
+    // Element [1] should NOT be compressed
+    const arr = try reader.fileArrayAt(0);
+    const data_view = try arr.elementAt(1);
+    try testing.expectEqual(@as(?ct.CompressionId, null), data_view.comp_id);
+
+    // fileContentDecompress should still work (returns a copy)
+    const content = try reader.fileContentDecompress(0, allocator);
+    defer allocator.free(content);
+    try testing.expectEqualSlices(u8, "uncompressed content", content);
+}
+
+test "per-file compression with all algorithms" {
+    const allocator = testing.allocator;
+    const algos = [_]ct.CompressionId{ .lz4, .zstd, .lzma2, .bzip2 };
+
+    for (algos) |algo| {
+        const entries = [_]ArchiveEntry{
+            .{ .file = .{ .path = "test.txt", .content = "Hello, per-file compression test!" } },
+        };
+
+        const archive = try createFullArchive(allocator, &entries, null, null, null, algo);
+        defer allocator.free(archive);
+
+        const reader = try ArchiveReader.init(archive);
+        const content = try reader.fileContentDecompress(0, allocator);
+        defer allocator.free(content);
+        try testing.expectEqualSlices(u8, "Hello, per-file compression test!", content);
+    }
 }

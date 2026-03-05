@@ -352,7 +352,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
     if (json_entries.len == 0) {
         // Empty archive
         const empty_entries = &[_]mini_blar.ArchiveEntry{};
-        const result = mini_blar.createFullArchive(allocator, empty_entries, null, null, null) catch |e| return mapContainerError(e);
+        const result = createFullArchiveWrapped(allocator, empty_entries) catch |e| return mapContainerError(e);
         return result;
     }
 
@@ -456,7 +456,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
     }
 
     // Create the archive (Merkle hashes auto-computed by createFullArchive)
-    const result = mini_blar.createFullArchive(allocator, archive_entries, null, null, null) catch |e| return mapContainerError(e);
+    const result = createFullArchiveWrapped(allocator, archive_entries) catch |e| return mapContainerError(e);
     return result;
 }
 
@@ -511,6 +511,18 @@ fn parseJsonXattrs(allocator: Allocator, obj: std.json.ObjectMap, allocated_stri
 // =============================================================================
 // Error mapping helpers
 // =============================================================================
+
+/// Wrapper around createFullArchive that strips CompressionError from the error set
+/// (never fires when comp_id is null).
+fn createFullArchiveWrapped(
+    allocator: std.mem.Allocator,
+    entries: []const mini_blar.ArchiveEntry,
+) (std.mem.Allocator.Error || mini_blar.ContainerError)![]u8 {
+    return mini_blar.createFullArchive(allocator, entries, null, null, null, null) catch |e| switch (e) {
+        error.CompressionFailed, error.DecompressionFailed, error.UnsupportedCompression => unreachable,
+        else => |ce| return ce,
+    };
+}
 
 fn mapContainerError(err: anytype) JsonSerdeError {
     return switch (err) {
@@ -632,7 +644,7 @@ test "full archive round-trip: create → toJson → fromJson → byte-identical
         .{ .file = files[1] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -658,7 +670,7 @@ test "binary content: pb-encodes in JSON, pb-decodes back correctly" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -695,7 +707,7 @@ test "zero-value field omission in output" {
         .{ .file = files[0] },
     };
 
-    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive);
 
     const json = try archiveToJson(allocator, archive);
@@ -724,7 +736,7 @@ test "dir entries with Merkle hash recomputation" {
         } },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -768,7 +780,7 @@ test "empty content round-trip" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -805,7 +817,7 @@ test "xattrs round-trip via JSON" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);

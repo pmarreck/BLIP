@@ -131,6 +131,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the benchmark CLI");
     run_step.dependOn(&run_cmd.step);
 
+    // libmagic dependency — provides MIME-type detection for solid-mode sorting
+    const magic_dep = b.dependency("libmagic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const magic_lib = magic_dep.artifact("magic");
+
     // blar CLI executable — C program that links against the static lib
     const blar = b.addExecutable(.{
         .name = "blar",
@@ -143,10 +150,11 @@ pub fn build(b: *std.Build) void {
     });
     blar.addCSourceFile(.{
         .file = b.path("src/blar.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic" },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-DHAVE_LIBMAGIC" },
     });
     blar.linkLibrary(static_lib);
     blar.linkLibrary(progrez_lib);
+    blar.linkLibrary(magic_lib);
     blar.root_module.addIncludePath(b.path("src"));
     blar.root_module.addIncludePath(progrez_dep.path("include"));
     b.installArtifact(blar);
