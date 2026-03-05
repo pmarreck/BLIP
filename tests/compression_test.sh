@@ -310,6 +310,92 @@ echo "$MINI_HELP" | grep -q '\-\-solid' \
   && pass "miniblar --help mentions --solid" \
   || fail "miniblar --help mentions --solid"
 
+# ══════════════════════════════════════════════════════════════════════════
+# Thread count (-j) tests
+# ══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "── Thread count (-j) tests ──"
+
+# -j 1 single-threaded still works
+"$BLAR" create -z lz4 -j 1 -o "$TMPDIR_TEST/j1_test.blar" \
+  "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+J1_LIST=$("$BLAR" list "$TMPDIR_TEST/j1_test.blar" 2>/dev/null)
+echo "$J1_LIST" | grep -q 'hello.txt' \
+  && pass "-j 1 single-threaded works" \
+  || fail "-j 1 single-threaded — output: $J1_LIST"
+
+# -j 0 auto-thread works
+"$BLAR" create -z lz4 -j 0 -o "$TMPDIR_TEST/j0_test.blar" \
+  "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+J0_LIST=$("$BLAR" list "$TMPDIR_TEST/j0_test.blar" 2>/dev/null)
+echo "$J0_LIST" | grep -q 'hello.txt' \
+  && pass "-j 0 auto-thread works" \
+  || fail "-j 0 auto-thread — output: $J0_LIST"
+
+# -j 4 explicit thread count works
+"$BLAR" create -z lz4 -j 4 -o "$TMPDIR_TEST/j4_test.blar" \
+  "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" "$TMPDIR_TEST/random.bin" 2>/dev/null
+J4_EXT="$TMPDIR_TEST/j4_extract"
+mkdir -p "$J4_EXT"
+"$BLAR" extract "$TMPDIR_TEST/j4_test.blar" -C "$J4_EXT" 2>/dev/null
+[ -f "$J4_EXT/$NORM_HELLO" ] && [ "$(cat "$J4_EXT/$NORM_HELLO")" = "hello world" ] \
+  && pass "-j 4 extract content correct" \
+  || fail "-j 4 extract content"
+cmp -s "$TMPDIR_TEST/random.bin" "$J4_EXT/$NORM_RANDOM" \
+  && pass "-j 4 binary round-trip" \
+  || fail "-j 4 binary round-trip"
+
+# --solid -j 4 passes thread count to solid compression
+"$BLAR" create --solid -z lz4 -j 4 -o "$TMPDIR_TEST/j4_solid.blar" \
+  "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+J4_SOLID_LIST=$("$BLAR" list "$TMPDIR_TEST/j4_solid.blar" 2>/dev/null)
+echo "$J4_SOLID_LIST" | grep -q 'hello.txt' \
+  && pass "--solid -j 4 works" \
+  || fail "--solid -j 4 — output: $J4_SOLID_LIST"
+
+# --threads long form works
+"$BLAR" create -z lz4 --threads 2 -o "$TMPDIR_TEST/threads_long.blar" \
+  "$TMPDIR_TEST/hello.txt" 2>/dev/null
+[ -f "$TMPDIR_TEST/threads_long.blar" ] \
+  && pass "--threads long form works" \
+  || fail "--threads long form"
+
+# miniblar -j works
+"$MINIBLAR" create -z lz4 -j 2 -o "$TMPDIR_TEST/mini_j2.mblar" \
+  "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/goodbye.txt" 2>/dev/null
+MINI_J2_LIST=$("$MINIBLAR" list "$TMPDIR_TEST/mini_j2.mblar" 2>/dev/null)
+echo "$MINI_J2_LIST" | grep -q 'hello.txt' \
+  && pass "miniblar -j 2 works" \
+  || fail "miniblar -j 2 — output: $MINI_J2_LIST"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Info --json tests
+# ══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "── Info --json tests ──"
+
+# blar info --json valid JSON
+BJ_OUT=$("$BLAR" info --json "$TMPDIR_TEST/lzma2_comp.blar" 2>/dev/null)
+echo "$BJ_OUT" | python3 -m json.tool >/dev/null 2>&1 \
+  && pass "blar info --json valid JSON" \
+  || fail "blar info --json valid JSON"
+
+echo "$BJ_OUT" | grep -q '"integrity"' \
+  && pass "blar info --json has integrity field" \
+  || fail "blar info --json has integrity field"
+
+# miniblar info --json valid JSON
+MJ_OUT=$("$MINIBLAR" info --json "$TMPDIR_TEST/lzma2_mini.mblar" 2>/dev/null)
+echo "$MJ_OUT" | python3 -m json.tool >/dev/null 2>&1 \
+  && pass "miniblar info --json valid JSON" \
+  || fail "miniblar info --json valid JSON"
+
+echo "$MJ_OUT" | grep -q '"integrity"' \
+  && pass "miniblar info --json has integrity field" \
+  || fail "miniblar info --json has integrity field"
+
 # ── Large payload compression ────────────────────────────────────────────
 
 echo ""

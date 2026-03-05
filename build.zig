@@ -268,4 +268,82 @@ pub fn build(b: *std.Build) void {
     bench_run.step.dependOn(b.getInstallStep());
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&bench_run.step);
+
+    // compile-commands step — generates compile_commands.json for clangd/clang analysis
+    const cc_gen = CompileCommandsGen.create(b, .{
+        .src_include = b.path("src"),
+        .progrez_include = progrez_dep.path("include"),
+        .magic_include = magic_dep.path("src"),
+    });
+    const cc_step = b.step("compile-commands", "Generate compile_commands.json for clang tooling");
+    cc_step.dependOn(&cc_gen.step);
 }
+
+/// Custom build step that generates compile_commands.json for C source files.
+/// Resolves Zig dependency include paths to actual filesystem paths at build time.
+const CompileCommandsGen = struct {
+    step: std.Build.Step,
+    src_include: std.Build.LazyPath,
+    progrez_include: std.Build.LazyPath,
+    magic_include: std.Build.LazyPath,
+
+    const Options = struct {
+        src_include: std.Build.LazyPath,
+        progrez_include: std.Build.LazyPath,
+        magic_include: std.Build.LazyPath,
+    };
+
+    fn create(b: *std.Build, opts: Options) *CompileCommandsGen {
+        const self = b.allocator.create(CompileCommandsGen) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "generate compile_commands.json",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .src_include = opts.src_include,
+            .progrez_include = opts.progrez_include,
+            .magic_include = opts.magic_include,
+        };
+        opts.src_include.addStepDependencies(&self.step);
+        opts.progrez_include.addStepDependencies(&self.step);
+        opts.magic_include.addStepDependencies(&self.step);
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *CompileCommandsGen = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const alloc = b.allocator;
+
+        const project_root = b.build_root.path orelse ".";
+        const src_inc = try self.src_include.getPath3(b, step).toString(alloc);
+        const progrez_inc = try self.progrez_include.getPath3(b, step).toString(alloc);
+        const magic_inc = try self.magic_include.getPath3(b, step).toString(alloc);
+
+        const content = try std.fmt.allocPrint(alloc,
+            \\[
+            \\  {{
+            \\    "directory": "{s}",
+            \\    "file": "src/blar.c",
+            \\    "arguments": ["cc", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-DHAVE_LIBMAGIC", "-I{s}", "-I{s}", "-I{s}", "src/blar.c"]
+            \\  }},
+            \\  {{
+            \\    "directory": "{s}",
+            \\    "file": "src/miniblar.c",
+            \\    "arguments": ["cc", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-I{s}", "-I{s}", "src/miniblar.c"]
+            \\  }}
+            \\]
+            \\
+        , .{
+            project_root, src_inc, progrez_inc, magic_inc,
+            project_root, src_inc, progrez_inc,
+        });
+
+        const out_path = try std.fs.path.join(alloc, &.{ project_root, "compile_commands.json" });
+        var file = try std.fs.cwd().createFile(out_path, .{});
+        defer file.close();
+        try file.writeAll(content);
+    }
+};

@@ -30,6 +30,7 @@ pub const PhaseFn = ?*const fn ([*]const u8, usize, ?*anyopaque) callconv(.c) vo
 
 /// Compress data using the specified algorithm.
 /// progress_fn/progress_ctx: optional callback reporting (bytes_done, bytes_total).
+/// num_threads: 0=auto (detect CPU count), 1=single-threaded, N=use N threads.
 /// Returns compressed bytes. Caller owns returned memory.
 pub fn compress(
     allocator: Allocator,
@@ -37,6 +38,7 @@ pub fn compress(
     data: []const u8,
     progress_fn: CompressProgressFn,
     progress_ctx: ?*anyopaque,
+    num_threads: u8,
 ) (Allocator.Error || CompressionError)![]u8 {
     switch (algo) {
         .lzma2 => {
@@ -50,9 +52,9 @@ pub fn compress(
             };
         },
         .bzip2 => {
-            // bzip2z does not yet support progress callbacks.
-            // Report completion at the end so callers see 100%.
-            const result = bzip2z.bzip2.compress(allocator, data) catch |e| switch (e) {
+            const result = bzip2z.bzip2.compressWithOptions(allocator, data, .{
+                .threads = num_threads,
+            }) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CompressionFailed,
             };
@@ -129,7 +131,7 @@ pub fn compress(
             return result;
         },
         .zstd => {
-            // Use zstd simple API with chunked progress reporting.
+            // Use zstd CCtx API with chunked progress reporting and threading.
             const chunk_size: usize = 4 * 1024 * 1024; // 4 MB chunks
             const bound = zstd.ZSTD_compressBound(data.len);
             if (zstd.ZSTD_isError(bound) != 0) return error.CompressionFailed;
@@ -137,9 +139,25 @@ pub fn compress(
             const dest_buf = try allocator.alloc(u8, bound);
             errdefer allocator.free(dest_buf);
 
+            // Always use CCtx so we can set nbWorkers for threading
+            const cctx = zstd.ZSTD_createCCtx() orelse {
+                allocator.free(dest_buf);
+                return error.CompressionFailed;
+            };
+            defer _ = zstd.ZSTD_freeCCtx(cctx);
+
+            _ = zstd.ZSTD_CCtx_setParameter(cctx, zstd.ZSTD_c_compressionLevel, 3);
+            if (num_threads != 1) {
+                const resolved: c_int = if (num_threads == 0)
+                    @intCast(std.Thread.getCpuCount() catch 1)
+                else
+                    @intCast(num_threads);
+                _ = zstd.ZSTD_CCtx_setParameter(cctx, zstd.ZSTD_c_nbWorkers, resolved);
+            }
+
             if (data.len <= chunk_size) {
-                // Small data: single-shot compress (level 3 = default)
-                const csize = zstd.ZSTD_compress(dest_buf.ptr, bound, data.ptr, data.len, 3);
+                // Small data: single-shot via CCtx
+                const csize = zstd.ZSTD_compress2(cctx, dest_buf.ptr, bound, data.ptr, data.len);
                 if (zstd.ZSTD_isError(csize) != 0) {
                     allocator.free(dest_buf);
                     return error.CompressionFailed;
@@ -150,15 +168,6 @@ pub fn compress(
                 };
                 return result;
             }
-
-            // Large data: streaming compress with progress
-            const cctx = zstd.ZSTD_createCCtx() orelse {
-                allocator.free(dest_buf);
-                return error.CompressionFailed;
-            };
-            defer _ = zstd.ZSTD_freeCCtx(cctx);
-
-            _ = zstd.ZSTD_CCtx_setParameter(cctx, zstd.ZSTD_c_compressionLevel, 3);
 
             var out_buf = zstd.ZSTD_outBuffer{ .dst = dest_buf.ptr, .size = dest_buf.len, .pos = 0 };
             var src_offset: usize = 0;
@@ -269,8 +278,9 @@ pub fn compressContainer(
     progress_fn: CompressProgressFn,
     phase_fn: PhaseFn,
     progress_ctx: ?*anyopaque,
+    num_threads: u8,
 ) (Allocator.Error || ContainerError || CompressionError)![]u8 {
-    const compressed = try compress(allocator, algo, container_bytes, progress_fn, progress_ctx);
+    const compressed = try compress(allocator, algo, container_bytes, progress_fn, progress_ctx, num_threads);
     defer allocator.free(compressed);
 
     // Signal phase change: wrapping compressed data in LP container + checksumming
@@ -337,7 +347,7 @@ test "LZMA2 compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
     const original = "Hello, compression module! This is a test of the unified interface.";
 
-    const compressed = try compress(allocator, .lzma2, original, null, null);
+    const compressed = try compress(allocator, .lzma2, original, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompress(allocator, .lzma2, compressed, original.len);
@@ -350,7 +360,7 @@ test "bzip2 compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
     const original = "Hello, bzip2 compression! This is a test of the unified interface.";
 
-    const compressed = try compress(allocator, .bzip2, original, null, null);
+    const compressed = try compress(allocator, .bzip2, original, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompress(allocator, .bzip2, compressed, original.len);
@@ -363,7 +373,7 @@ test "LZ4 compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
     const original = "Hello, LZ4 compression! This is a test of the unified interface.";
 
-    const compressed = try compress(allocator, .lz4, original, null, null);
+    const compressed = try compress(allocator, .lz4, original, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompress(allocator, .lz4, compressed, original.len);
@@ -376,7 +386,7 @@ test "zstd compress/decompress round-trip (raw bytes)" {
     const allocator = testing.allocator;
     const original = "Hello, zstd compression! This is a test of the unified interface.";
 
-    const compressed = try compress(allocator, .zstd, original, null, null);
+    const compressed = try compress(allocator, .zstd, original, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompress(allocator, .zstd, compressed, original.len);
@@ -392,7 +402,7 @@ test "bzip2 compressContainer/decompressContainer round-trip" {
     const inner = try leaf.serializeData(allocator, "Hello, bzip2 container!");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .bzip2, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .bzip2, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompressContainer(allocator, compressed);
@@ -408,7 +418,7 @@ test "LZ4 compressContainer/decompressContainer round-trip" {
     const inner = try leaf.serializeData(allocator, "Hello, LZ4 container!");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .lz4, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .lz4, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompressContainer(allocator, compressed);
@@ -424,7 +434,7 @@ test "zstd compressContainer/decompressContainer round-trip" {
     const inner = try leaf.serializeData(allocator, "Hello, zstd container!");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .zstd, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .zstd, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompressContainer(allocator, compressed);
@@ -440,7 +450,7 @@ test "compressContainer/decompressContainer round-trip with LZMA2" {
     const inner = try leaf.serializeData(allocator, "Hello, unified compression!");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     const decompressed = try decompressContainer(allocator, compressed);
@@ -456,7 +466,7 @@ test "isCompressed returns true for compressed container" {
     const inner = try leaf.serializeData(allocator, "test");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     try testing.expect(isCompressed(compressed));
@@ -479,7 +489,7 @@ test "decompressContainer verifies checksum and rejects corruption" {
     const inner = try leaf.serializeData(allocator, "integrity check");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     // Corrupt a byte in the middle (not in checksum area)
@@ -505,7 +515,7 @@ test "compressContainer LP attributes are correct" {
     const inner = try leaf.serializeData(allocator, "attribute verification");
     defer allocator.free(inner);
 
-    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null);
+    const compressed = try compressContainer(allocator, .lzma2, inner, null, null, null, 0);
     defer allocator.free(compressed);
 
     const view = try container.parseLPHeader(compressed);

@@ -29,6 +29,7 @@ pub const FileEntry = struct {
     groupname: []const u8 = &.{}, // group name string
     xattrs: []const XattrEntry = &.{}, // extended attributes
     resource_fork: []const u8 = &.{}, // resource fork data (macOS)
+    zip_compression_method: ?u16 = null, // original zip method for re-zipping (0=store, 8=deflate)
 };
 
 /// An xattr key-value pair.
@@ -50,6 +51,7 @@ pub const DirEntry = struct {
     username: []const u8 = &.{},
     groupname: []const u8 = &.{},
     xattrs: []const XattrEntry = &.{},
+    container_type: []const u8 = &.{}, // "zip" = this DIR represents an expanded container file
 };
 
 /// A unified archive entry: either a file or a directory.
@@ -106,8 +108,8 @@ pub const MAGIC_MBAR: *const [5]u8 = "MBAR\x02";
 pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.ArrayList([]u8), comp_id: ?ct.CompressionId) (Allocator.Error || ContainerError || compression_mod.CompressionError)![]const u8 {
     // --- Element 0: metadata DICT ---
     // Build metadata key-value pairs with 2-char keys in canonical order:
-    // bt < ct < gi < gn < md < mt < pa < ui < un
-    var meta_pairs_buf: [9]dict_mod.KeyValue = undefined;
+    // bt < ct < gi < gn < md < mt < pa < ui < un < zc
+    var meta_pairs_buf: [10]dict_mod.KeyValue = undefined;
     var meta_count: usize = 0;
 
     // bt (birthtime)
@@ -212,6 +214,18 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         meta_count += 1;
     }
 
+    // zc (zip compression method)
+    if (file.zip_compression_method) |zc| {
+        const key = try leaf.serializeUtf8(allocator, "zc");
+        try to_free.append(allocator, key);
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, zc, .little);
+        const val = try leaf.serializeData(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
     const metadata_dict = try dict_mod.serializeDict(allocator, meta_pairs_buf[0..meta_count]);
     try to_free.append(allocator, metadata_dict);
 
@@ -220,7 +234,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         const raw = try leaf.serializeDataWithOptions(allocator, file.content, .{ .csum_id = .xxhash64 });
         if (comp_id) |algo| {
             defer allocator.free(raw);
-            break :blk compression_mod.compressContainer(allocator, algo, raw, null, null, null) catch |e| switch (e) {
+            break :blk compression_mod.compressContainer(allocator, algo, raw, null, null, null, 1) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CompressionFailed => return error.CompressionFailed,
                 else => return error.InvalidContainerType,
@@ -288,8 +302,8 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
 /// Serialize a single DirEntry into a DIR container with 2-char keys.
 fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
     // Build key-value pairs with 2-char keys in canonical order:
-    // bt < ct < gi < gn < md < mt < pa < ui < un < xa < xh
-    var pairs_buf: [11]dict_mod.KeyValue = undefined;
+    // bt < co < ct < gi < gn < md < mt < pa < ui < un < xa < xh
+    var pairs_buf: [12]dict_mod.KeyValue = undefined;
     var pair_count: usize = 0;
 
     // bt (birthtime)
@@ -299,6 +313,16 @@ fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayLis
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, dir.birthtime_ns, .little);
         const val = try leaf.serializeData(allocator, &bytes);
+        try to_free.append(allocator, val);
+        pairs_buf[pair_count] = .{ .key = key, .value = val };
+        pair_count += 1;
+    }
+
+    // co (container type)
+    if (dir.container_type.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "co");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, dir.container_type);
         try to_free.append(allocator, val);
         pairs_buf[pair_count] = .{ .key = key, .value = val };
         pair_count += 1;
@@ -491,11 +515,20 @@ pub fn createFullArchive(
     phase_fn: PhaseFn,
     progress_ctx: ?*anyopaque,
     comp_id: ?ct.CompressionId,
+    num_threads: u8,
 ) (Allocator.Error || ContainerError || compression_mod.CompressionError)![]u8 {
     var to_free: std.ArrayList([]u8) = .{};
     defer {
         for (to_free.items) |item| allocator.free(item);
         to_free.deinit(allocator);
+    }
+
+    // Items allocated by parallel threads using page_allocator (thread-safe)
+    const pa = std.heap.page_allocator;
+    var parallel_to_free: std.ArrayList([]u8) = .{};
+    defer {
+        for (parallel_to_free.items) |item| pa.free(item);
+        parallel_to_free.deinit(allocator);
     }
 
     var entry_elements: std.ArrayList([]const u8) = .{};
@@ -510,28 +543,194 @@ pub fn createFullArchive(
     var entries_done: u64 = 0;
     var bytes_done: u64 = 0;
 
+    // Count files and build index mapping for parallel path
+    var file_count: usize = 0;
     for (entries) |entry| {
         switch (entry) {
-            .file => |file| {
-                const file_bytes = try serializeFileEntry(allocator, file, &to_free, comp_id);
-                try entry_elements.append(allocator, file_bytes);
-                // Extract xxHash64 from the FILE ARRAY's LP header checksum
-                const file_view = try container.parseLPHeader(file_bytes);
-                const csum = file_view.checksumSlice();
-                if (csum.len == 8) {
-                    var hash: [8]u8 = undefined;
-                    @memcpy(&hash, csum[0..8]);
-                    try file_hashes.put(file.path, hash);
+            .file => file_count += 1,
+            .dir => has_dir = true,
+        }
+    }
+
+    // Pre-allocate entry_elements with placeholders
+    try entry_elements.ensureTotalCapacity(allocator, entries.len);
+    for (entries) |_| {
+        entry_elements.appendAssumeCapacity(&.{});
+    }
+
+    const resolved_threads: usize = if (num_threads == 0)
+        (std.Thread.getCpuCount() catch 1)
+    else
+        @intCast(num_threads);
+
+    if (resolved_threads > 1 and file_count > 1 and comp_id != null) {
+        // Parallel path: serialize files concurrently using thread pool
+        const FileResult = struct {
+            bytes: []const u8,
+            hash: [8]u8,
+            to_free_items: std.ArrayList([]u8),
+            err: ?(Allocator.Error || ContainerError || compression_mod.CompressionError),
+        };
+
+        // Build file slot mapping: slot index → entry index
+        const file_slots = try allocator.alloc(usize, file_count);
+        defer allocator.free(file_slots);
+        // Also compute total_file_bytes for progress tracking
+        var total_file_bytes: u64 = 0;
+        {
+            var slot: usize = 0;
+            for (entries, 0..) |entry, idx| {
+                switch (entry) {
+                    .file => |f| {
+                        file_slots[slot] = idx;
+                        total_file_bytes += f.content.len;
+                        slot += 1;
+                    },
+                    .dir => {},
                 }
-                entries_done += 1;
-                bytes_done += file.content.len;
-                if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
-            },
-            .dir => {
-                // Placeholder — will be filled after Merkle computation
-                try entry_elements.append(allocator, &.{});
-                has_dir = true;
-            },
+            }
+        }
+
+        const file_results = try allocator.alloc(FileResult, file_count);
+        defer allocator.free(file_results);
+        for (file_results) |*r| {
+            r.* = .{
+                .bytes = &.{},
+                .hash = .{0} ** 8,
+                .to_free_items = .{},
+                .err = null,
+            };
+        }
+
+        // Use per-file single-threaded compression to avoid oversubscription
+        var pool: std.Thread.Pool = undefined;
+        pool.init(.{
+            .allocator = allocator,
+            .n_jobs = @intCast(@min(resolved_threads, file_count)),
+        }) catch return error.OutOfMemory;
+        defer pool.deinit();
+
+        // Use page_allocator for per-thread work — it's thread-safe (mmap-based).
+        // The caller's allocator may not be thread-safe (e.g., testing.allocator).
+        const thread_alloc = std.heap.page_allocator;
+
+        // Atomic counters for progress reporting from parallel workers
+        var atomic_files_done = std.atomic.Value(u64).init(0);
+        var atomic_bytes_done = std.atomic.Value(u64).init(0);
+
+        var wg: std.Thread.WaitGroup = .{};
+        for (file_slots, 0..) |entry_idx, slot| {
+            pool.spawnWg(&wg, struct {
+                fn work(
+                    alloc: Allocator,
+                    file: FileEntry,
+                    cid: ?ct.CompressionId,
+                    result: *FileResult,
+                    a_files: *std.atomic.Value(u64),
+                    a_bytes: *std.atomic.Value(u64),
+                ) void {
+                    var local_to_free: std.ArrayList([]u8) = .{};
+                    const file_bytes = serializeFileEntry(alloc, file, &local_to_free, cid) catch |e| {
+                        result.err = e;
+                        // Clean up on error
+                        for (local_to_free.items) |item| alloc.free(item);
+                        local_to_free.deinit(alloc);
+                        // Still increment so progress loop terminates
+                        _ = a_files.fetchAdd(1, .release);
+                        _ = a_bytes.fetchAdd(file.content.len, .release);
+                        return;
+                    };
+
+                    // Extract xxHash64
+                    const file_view = container.parseLPHeader(file_bytes) catch |e| {
+                        result.err = e;
+                        for (local_to_free.items) |item| alloc.free(item);
+                        local_to_free.deinit(alloc);
+                        _ = a_files.fetchAdd(1, .release);
+                        _ = a_bytes.fetchAdd(file.content.len, .release);
+                        return;
+                    };
+                    const csum = file_view.checksumSlice();
+                    var hash: [8]u8 = .{0} ** 8;
+                    if (csum.len == 8) {
+                        @memcpy(&hash, csum[0..8]);
+                    }
+
+                    result.bytes = file_bytes;
+                    result.hash = hash;
+                    result.to_free_items = local_to_free;
+
+                    // Signal completion for progress tracking
+                    _ = a_files.fetchAdd(1, .release);
+                    _ = a_bytes.fetchAdd(file.content.len, .release);
+                }
+            }.work, .{ thread_alloc, entries[entry_idx].file, comp_id, &file_results[slot], &atomic_files_done, &atomic_bytes_done });
+        }
+
+        // Poll progress while workers compress files.
+        // Main thread doesn't participate as a worker (pool has enough threads).
+        while (atomic_files_done.load(.acquire) < file_count) {
+            if (progress_fn) |cb| {
+                cb(entries_done + atomic_files_done.load(.acquire),
+                    bytes_done + atomic_bytes_done.load(.acquire),
+                    progress_ctx);
+            }
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        // Formally wait for pool (should return near-instantly since all work is done)
+        pool.waitAndWork(&wg);
+
+        // Final progress update
+        entries_done += file_count;
+        bytes_done += total_file_bytes;
+        if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
+
+        // Check for errors, collect results into entry_elements and file_hashes
+        for (file_results, 0..) |*r, slot| {
+            if (r.err) |e| {
+                // Clean up all results on error
+                for (file_results) |*cr| {
+                    for (cr.to_free_items.items) |item| thread_alloc.free(item);
+                    cr.to_free_items.deinit(thread_alloc);
+                }
+                return e;
+            }
+
+            const entry_idx = file_slots[slot];
+            const file = entries[entry_idx].file;
+            entry_elements.items[entry_idx] = r.bytes;
+            try file_hashes.put(file.path, r.hash);
+
+            // Transfer ownership to parallel_to_free (freed with page_allocator)
+            for (r.to_free_items.items) |item| {
+                try parallel_to_free.append(allocator, item);
+            }
+            // Free the ArrayList container (not its items, they're now in to_free)
+            r.to_free_items.items = &.{};
+            r.to_free_items.deinit(thread_alloc);
+        }
+    } else {
+        // Sequential path (existing behavior)
+        for (entries, 0..) |entry, i| {
+            switch (entry) {
+                .file => |file| {
+                    const file_bytes = try serializeFileEntry(allocator, file, &to_free, comp_id);
+                    entry_elements.items[i] = file_bytes;
+                    const file_view = try container.parseLPHeader(file_bytes);
+                    const csum = file_view.checksumSlice();
+                    if (csum.len == 8) {
+                        var hash: [8]u8 = undefined;
+                        @memcpy(&hash, csum[0..8]);
+                        try file_hashes.put(file.path, hash);
+                    }
+                    entries_done += 1;
+                    bytes_done += file.content.len;
+                    if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
+                },
+                .dir => {
+                    // Already has placeholder from pre-allocation
+                },
+            }
         }
     }
 
@@ -950,7 +1149,7 @@ test "full archive with DIR + FILE entries round-trips" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1074,7 +1273,7 @@ test "DIR metadata round-trip with 2-char keys" {
             .username = "peter",
         } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1185,7 +1384,7 @@ test "DIR container has xxHash64 checksum" {
         .{ .dir = .{ .path = "src", .xh64 = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 }, .mode = 0o755 } },
         .{ .file = .{ .path = "src/main.zig", .content = "pub fn main() void {}", .mode = 0o644 } },
     };
-    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1283,7 +1482,7 @@ test "per-file compression: createFullArchive with comp_id produces recoverable 
     };
 
     // Create archive with LZ4 per-file compression
-    const archive = try createFullArchive(allocator, &entries, null, null, null, .lz4);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, .lz4, 0);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1313,7 +1512,7 @@ test "fileContentDecompress works on uncompressed archives" {
     };
 
     // Create archive without compression (null comp_id)
-    const archive = try createFullArchive(allocator, &entries, null, null, null, null);
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive);
 
     const reader = try ArchiveReader.init(archive);
@@ -1338,7 +1537,7 @@ test "per-file compression with all algorithms" {
             .{ .file = .{ .path = "test.txt", .content = "Hello, per-file compression test!" } },
         };
 
-        const archive = try createFullArchive(allocator, &entries, null, null, null, algo);
+        const archive = try createFullArchive(allocator, &entries, null, null, null, algo, 0);
         defer allocator.free(archive);
 
         const reader = try ArchiveReader.init(archive);

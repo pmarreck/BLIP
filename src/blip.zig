@@ -642,6 +642,7 @@ pub const json_serde = @import("json_serde.zig");
 pub const lzma2_mod = @import("lzma2.zig");
 pub const compression_mod = @import("compression.zig");
 pub const encryption = @import("encryption.zig");
+pub const zip_mod = @import("zip.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -669,4 +670,5 @@ test {
     _ = @import("compression.zig");
     _ = @import("encryption.zig");
     _ = @import("checksum.zig");
+    _ = @import("zip.zig");
 }

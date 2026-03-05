@@ -260,6 +260,10 @@ pub fn archiveToJson(allocator: Allocator, buf: []const u8) JsonSerdeError![]u8 
                     try out.appendSlice(allocator, ",\n      \"resource_fork\": ");
                     try writeJsonString(allocator, &out, encoded_rf);
                 }
+                if (f.zip_compression_method) |zc| {
+                    try out.appendSlice(allocator, ",\n      \"compression_method\": ");
+                    try writeJsonInt(allocator, &out, u16, zc);
+                }
             },
             .dir => |d| {
                 try out.appendSlice(allocator, "\n      \"type\": \"dir\"");
@@ -305,6 +309,10 @@ pub fn archiveToJson(allocator: Allocator, buf: []const u8) JsonSerdeError![]u8 
                 if (d.groupname.len > 0) {
                     try out.appendSlice(allocator, ",\n      \"groupname\": ");
                     try writeJsonString(allocator, &out, d.groupname);
+                }
+                if (d.container_type.len > 0) {
+                    try out.appendSlice(allocator, ",\n      \"container_type\": ");
+                    try writeJsonString(allocator, &out, d.container_type);
                 }
                 if (d.xattrs.len > 0) {
                     try out.appendSlice(allocator, ",\n      \"xattrs\": {");
@@ -415,6 +423,12 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                 break :blk rf;
             } else @as([]u8, &.{});
 
+            // Parse compression_method (optional)
+            const compression_method: ?u16 = blk: {
+                const cm = getJsonU32(obj, "compression_method");
+                break :blk if (cm > 0) @intCast(cm) else null;
+            };
+
             archive_entries[i] = .{
                 .file = .{
                     .path = path,
@@ -429,11 +443,20 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                     .groupname = groupname,
                     .xattrs = xattrs,
                     .resource_fork = resource_fork,
+                    .zip_compression_method = compression_method,
                 },
             };
         } else if (std.mem.eql(u8, type_str, "dir")) {
             // Parse xattrs for dirs
             const xattrs = try parseJsonXattrs(allocator, obj, &allocated_strings);
+
+            // Parse container_type (optional)
+            const container_type_str = getJsonString(obj, "container_type") orelse "";
+            const container_type = if (container_type_str.len > 0) blk: {
+                const ct = allocator.dupe(u8, container_type_str) catch return error.OutOfMemory;
+                allocated_strings.append(allocator, ct) catch return error.OutOfMemory;
+                break :blk ct;
+            } else @as([]u8, &.{});
 
             archive_entries[i] = .{
                 .dir = .{
@@ -448,6 +471,7 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                     .username = username,
                     .groupname = groupname,
                     .xattrs = xattrs,
+                    .container_type = container_type,
                 },
             };
         } else {
@@ -518,7 +542,7 @@ fn createFullArchiveWrapped(
     allocator: std.mem.Allocator,
     entries: []const mini_blar.ArchiveEntry,
 ) (std.mem.Allocator.Error || mini_blar.ContainerError)![]u8 {
-    return mini_blar.createFullArchive(allocator, entries, null, null, null, null) catch |e| switch (e) {
+    return mini_blar.createFullArchive(allocator, entries, null, null, null, null, 0) catch |e| switch (e) {
         error.CompressionFailed, error.DecompressionFailed, error.UnsupportedCompression => unreachable,
         else => |ce| return ce,
     };
@@ -644,7 +668,7 @@ test "full archive round-trip: create → toJson → fromJson → byte-identical
         .{ .file = files[1] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -670,7 +694,7 @@ test "binary content: pb-encodes in JSON, pb-decodes back correctly" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -707,7 +731,7 @@ test "zero-value field omission in output" {
         .{ .file = files[0] },
     };
 
-    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive);
 
     const json = try archiveToJson(allocator, archive);
@@ -736,7 +760,7 @@ test "dir entries with Merkle hash recomputation" {
         } },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -780,7 +804,7 @@ test "empty content round-trip" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);
@@ -817,7 +841,7 @@ test "xattrs round-trip via JSON" {
         .{ .file = files[0] },
     };
 
-    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null);
+    const archive1 = try mini_blar.createFullArchive(allocator, &entries, null, null, null, null, 0);
     defer allocator.free(archive1);
 
     const json = try archiveToJson(allocator, archive1);

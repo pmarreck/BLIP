@@ -334,6 +334,53 @@ else
   fi
 fi
 
+# --------------- 22. Info --json produces valid JSON ---------------
+JSON_OUT="$("$BLAR" info --json "$ARCHIVE_DIR" 2>/dev/null)"
+if echo "$JSON_OUT" | python3 -m json.tool >/dev/null 2>&1; then
+  pass "info --json produces valid JSON"
+else
+  fail "info --json produces valid JSON"
+fi
+
+# --------------- 23. Info --json contains expected fields ---------------
+if echo "$JSON_OUT" | grep -q '"files"' && \
+   echo "$JSON_OUT" | grep -q '"integrity"' && \
+   echo "$JSON_OUT" | grep -q '"entries"' && \
+   echo "$JSON_OUT" | grep -q '"total_content"'; then
+  pass "info --json contains expected fields"
+else
+  fail "info --json contains expected fields"
+fi
+
+# --------------- 24. Info --json shows directory and file types ---------------
+if echo "$JSON_OUT" | grep -q '"type": "directory"' && \
+   echo "$JSON_OUT" | grep -q '"type": "file"'; then
+  pass "info --json shows directory and file types"
+else
+  fail "info --json shows directory and file types"
+fi
+
+# --------------- 25. -j explicit thread count creates archive ---------------
+J_ARCHIVE="$TMPDIR_TEST/threads_test.blar"
+"$BLAR" create -z lz4 -j 2 -o "$J_ARCHIVE" "$TMPDIR_TEST/hello.txt" "$TMPDIR_TEST/foo.txt" 2>/dev/null
+if [[ -f "$J_ARCHIVE" ]]; then
+  pass "-j 2 creates archive successfully"
+else
+  fail "-j 2 creates archive"
+fi
+
+# --------------- 26. -j archive content matches ---------------
+J_EXTRACT="$TMPDIR_TEST/threads_extract"
+mkdir -p "$J_EXTRACT"
+"$BLAR" extract "$J_ARCHIVE" -C "$J_EXTRACT" 2>/dev/null
+J_NORM_HELLO="${TMPDIR_TEST#/}/hello.txt"
+if [[ -f "$J_EXTRACT/$J_NORM_HELLO" ]] && \
+   [[ "$(cat "$J_EXTRACT/$J_NORM_HELLO")" == "hello world" ]]; then
+  pass "-j archive content roundtrip matches"
+else
+  fail "-j archive content roundtrip matches"
+fi
+
 # =============================================================================
 # Summary
 # =============================================================================

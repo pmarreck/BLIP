@@ -9,7 +9,7 @@
  *   miniblar list <archive>
  *   miniblar extract <archive> [-C dir]
  *   miniblar verify <archive>
- *   miniblar info <archive>
+ *   miniblar info [--json] <archive>
  *   miniblar cat <archive> <path>
  *
  * Tar-style shorthand (hyphen optional):
@@ -114,7 +114,7 @@ static void print_usage(FILE *out) {
         "  list <archive>                     List files in archive\n"
         "  extract <archive> [-C <dir>]       Extract files from archive\n"
         "  verify <archive>                   Verify archive integrity\n"
-        "  info <archive>                     Show archive information\n"
+        "  info [--json] <archive>            Show archive information\n"
         "  cat <archive> <path>               Print file contents to stdout\n"
         "  peek <archive> [<path>] [flags]    Inspect archive structure\n"
         "  poke <archive> <path> [options]    Modify a value in archive\n"
@@ -140,6 +140,8 @@ static void print_usage(FILE *out) {
         "  -z [algo]        Compress (lzma2=default, bzip2, lz4, zstd)\n"
         "                   Default: per-file compression\n"
         "  --solid          Solid compression (whole archive, better ratio)\n"
+        "  -j <N>, --threads <N>  Thread count (0=auto, default: 0)\n"
+        "  -f, --force      Overwrite output file without prompting\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
@@ -189,6 +191,8 @@ static int cmd_create(int argc, char **argv) {
     bool absolute_names = g_absolute_names;
     uint8_t compress_algo = 0;  /* 0 = no compression */
     bool solid_mode = false;    /* --solid: solid compression (old behavior) */
+    uint8_t num_threads = 0;    /* 0 = auto */
+    bool force = false;        /* -f/--force: overwrite without prompting */
 
     if (argc < 1) {
         fprintf(stderr, "miniblar: create: missing arguments\n");
@@ -230,10 +234,29 @@ static int cmd_create(int argc, char **argv) {
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+            force = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
         } else if (strcmp(argv[i], "--solid") == 0) {
             solid_mode = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
+            i--;
+        } else if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "miniblar: create: %s requires an argument\n", argv[i]);
+                return EXIT_USAGE;
+            }
+            int t = atoi(argv[i+1]);
+            if (t < 0 || t > 255) {
+                fprintf(stderr, "miniblar: create: thread count must be 0-255\n");
+                return EXIT_USAGE;
+            }
+            num_threads = (uint8_t)t;
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -310,6 +333,25 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
+    /* Check for existing output file — prompt before overwriting */
+    if (!force) {
+        struct stat out_st;
+        if (stat(out_path, &out_st) == 0) {
+            if (isatty(STDIN_FILENO)) {
+                fprintf(stderr, "miniblar: '%s' already exists. Overwrite? (y/N) ", out_path);
+                int ch = getchar();
+                if (ch != 'y' && ch != 'Y') {
+                    fprintf(stderr, "miniblar: not overwriting\n");
+                    return EXIT_USAGE;
+                }
+                while (ch != '\n' && ch != EOF) ch = getchar();
+            } else {
+                fprintf(stderr, "miniblar: '%s' already exists (use -f to overwrite)\n", out_path);
+                return EXIT_USAGE;
+            }
+        }
+    }
+
     /* Read all input files and collect metadata. */
     blip_archive_entry *entries = calloc((size_t)file_count, sizeof(blip_archive_entry));
     if (!entries) {
@@ -323,6 +365,7 @@ static int cmd_create(int argc, char **argv) {
     progrez_ctx *progress = progrez_create("Scanning");
     if (progress) {
         progrez_set_identity(progress, "miniblar", "archive creation");
+        progrez_set_sparkline(progress, true);
         progrez_set_indeterminate(progress);
     }
 
@@ -372,10 +415,12 @@ static int cmd_create(int argc, char **argv) {
     }
 
     /* Progress: switch to determinate "Creating" phase.
-     * The FFI now calls back per-entry so we get real progress. */
+     * The FFI now calls back per-entry so we get real progress.
+     * Reset counters since scanning left them at final values. */
     if (progress) {
         progrez_set_label(progress, "Creating");
         progrez_set_determinate(progress, (uint64_t)file_count, bytes_done);
+        progrez_update(progress, 0, 0);
     }
 
     /* Determine per-file vs solid compression.
@@ -390,7 +435,7 @@ static int cmd_create(int argc, char **argv) {
     size_t archive_len = 0;
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(entries, (size_t)file_count, create_flags,
-                                           per_file_comp,
+                                           per_file_comp, num_threads,
                                            progress ? create_progress_cb : NULL,
                                            progress ? phase_cb : NULL,
                                            progress,
@@ -414,10 +459,11 @@ static int cmd_create(int argc, char **argv) {
         if (progress) {
             progrez_set_label(progress, "Compressing");
             progrez_set_determinate(progress, 0, archive_len);
+            progrez_update(progress, 0, 0);
         }
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
-        rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+        rc = blip_compress_container(archive_buf, archive_len, compress_algo, num_threads,
                                       progress ? compress_progress_cb : NULL,
                                       progress ? phase_cb : NULL,
                                       progress,
@@ -436,6 +482,7 @@ static int cmd_create(int argc, char **argv) {
     if (progress) {
         progrez_set_label(progress, "Writing");
         progrez_set_determinate(progress, 0, archive_len);
+        progrez_update(progress, 0, 0);
     }
 
     if (!(progress ? write_file_progress(out_path, archive_buf, archive_len, write_progress_cb, progress)
@@ -449,8 +496,16 @@ static int cmd_create(int argc, char **argv) {
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     char size_buf[32];
-    fprintf(stderr, "Created %s (%s)\n", out_path,
-            format_size(archive_len, size_buf, sizeof(size_buf)));
+    if (bytes_done > 0 && archive_len < bytes_done) {
+        char orig_buf[32];
+        double pct = (double)archive_len / (double)bytes_done * 100.0;
+        fprintf(stderr, "Created %s (%s -> %s, %.2f%% of original)\n", out_path,
+                format_size(bytes_done, orig_buf, sizeof(orig_buf)),
+                format_size(archive_len, size_buf, sizeof(size_buf)), pct);
+    } else {
+        fprintf(stderr, "Created %s (%s)\n", out_path,
+                format_size(archive_len, size_buf, sizeof(size_buf)));
+    }
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
@@ -553,6 +608,7 @@ static int cmd_extract(int argc, char **argv) {
     progrez_ctx *progress = progrez_create("Extracting");
     if (progress) {
         progrez_set_identity(progress, "miniblar", "archive extraction");
+        progrez_set_sparkline(progress, true);
         progrez_set_determinate(progress, count, total_bytes);
     }
 
@@ -727,13 +783,48 @@ static int cmd_verify(int argc, char **argv) {
 
 /* ── cmd_info ─────────────────────────────────────────────────────────── */
 
+/* Print a JSON-escaped string (handles ", \, control chars). */
+static void json_print_escaped(FILE *f, const char *s, size_t len) {
+    fputc('"', f);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f);  break;
+        case '\f': fputs("\\f", f);  break;
+        case '\n': fputs("\\n", f);  break;
+        case '\r': fputs("\\r", f);  break;
+        case '\t': fputs("\\t", f);  break;
+        default:
+            if (c < 0x20) fprintf(f, "\\u%04x", c);
+            else fputc(c, f);
+        }
+    }
+    fputc('"', f);
+}
+
 static int cmd_info(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "miniblar: info: missing archive path\n");
         return EXIT_USAGE;
     }
 
-    const char *archive_path = argv[0];
+    /* Parse flags */
+    bool json_mode = false;
+    const char *archive_path = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0) {
+            json_mode = true;
+        } else if (!archive_path) {
+            archive_path = argv[i];
+        }
+    }
+    if (!archive_path) {
+        fprintf(stderr, "miniblar: info: missing archive path\n");
+        return EXIT_USAGE;
+    }
+
     size_t buf_len = 0;
     uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
@@ -750,6 +841,58 @@ static int cmd_info(int argc, char **argv) {
         return EXIT_IO;
     }
 
+    if (json_mode) {
+        /* ── JSON output ── */
+        printf("{\n");
+        printf("  \"archive\": "); json_print_escaped(stdout, archive_path, strlen(archive_path)); printf(",\n");
+        printf("  \"size\": %llu,\n", (unsigned long long)buf_len);
+        printf("  \"files\": %llu,\n", (unsigned long long)count);
+        printf("  \"entries\": [\n");
+
+        uint64_t total_content = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            const char *path = NULL;
+            size_t path_len = 0;
+            rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "miniblar: info: file %llu: %s\n",
+                        (unsigned long long)i, blip_error_string(rc));
+                free(buf);
+                return EXIT_IO;
+            }
+
+            uint8_t *data = NULL;
+            size_t data_len = 0;
+            rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
+            if (rc == BLIP_OK) {
+                printf("    {\"path\": "); json_print_escaped(stdout, path, path_len);
+                printf(", \"size\": %llu}", (unsigned long long)data_len);
+                printf("%s\n", (i + 1 < count) ? "," : "");
+                total_content += data_len;
+                blip_free_content(data, data_len);
+            }
+        }
+
+        printf("  ],\n");
+        printf("  \"total_content\": %llu,\n", (unsigned long long)total_content);
+
+        bool ok = blip_archive_verify(buf, buf_len);
+        if (ok) {
+            for (uint64_t i = 0; i < count; i++) {
+                if (blip_archive_file_verify(buf, buf_len, i) != BLIP_OK) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        printf("  \"integrity\": \"%s\"\n", ok ? "ok" : "failed");
+        printf("}\n");
+
+        free(buf);
+        return ok ? EXIT_OK : EXIT_VERIFY;
+    }
+
+    /* ── Human-readable output ── */
     printf("Archive: %s\n", archive_path);
     printf("Size:    %llu bytes\n", (unsigned long long)buf_len);
     printf("Files:   %llu\n", (unsigned long long)count);

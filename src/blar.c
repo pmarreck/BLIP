@@ -9,7 +9,7 @@
  *   blar list <archive>
  *   blar extract <archive> [-C dir]
  *   blar verify <archive>
- *   blar info <archive>
+ *   blar info [--json] <archive>
  *   blar cat <archive> <path>
  *
  * Tar-style shorthand (hyphen optional):
@@ -57,6 +57,8 @@ typedef struct {
     size_t content_capacity;
     progrez_ctx *progress;  /* optional progress context (updated during collection) */
     uint64_t bytes_seen;    /* running total for progress updates */
+    bool expand_containers; /* expand zip containers into DIR+FILE entries */
+    bool expand_all_zips;   /* also expand .zip/.gz files (normally excluded) */
 } entry_list_t;
 
 static void entry_list_init(entry_list_t *el) {
@@ -68,6 +70,8 @@ static void entry_list_init(entry_list_t *el) {
     el->content_capacity = 0;
     el->progress = NULL;
     el->bytes_seen = 0;
+    el->expand_containers = false;
+    el->expand_all_zips = false;
 }
 
 static bool entry_list_add(entry_list_t *el, blip_archive_entry entry) {
@@ -119,6 +123,182 @@ static char *entry_list_strdup(entry_list_t *el, const char *s) {
         return NULL;
     }
     return dup;
+}
+
+/* ── Zip container expansion helpers ──────────────────────────────────── */
+
+/* Check if a file extension indicates an intentional archive (not a container). */
+static bool is_archive_extension(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return false;
+    dot++; /* skip the dot */
+    /* Case-insensitive comparison */
+    static const char *archive_exts[] = {
+        "zip", "gz", "tgz", "tar", "bz2", "xz", "7z", "rar", "lz4",
+        "zst", "zstd", "blar", "lzma", "lzo", "cab", "arj", "z", NULL
+    };
+    for (const char **ext = archive_exts; *ext; ext++) {
+        if (strcasecmp(dot, *ext) == 0) return true;
+    }
+    return false;
+}
+
+/* Convert MS-DOS date/time to nanoseconds since epoch. */
+static int64_t msdos_to_ns(uint16_t dos_time, uint16_t dos_date) {
+    if (dos_date == 0 && dos_time == 0) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_sec  = (dos_time & 0x1F) * 2;
+    tm.tm_min  = (dos_time >> 5) & 0x3F;
+    tm.tm_hour = (dos_time >> 11) & 0x1F;
+    tm.tm_mday = dos_date & 0x1F;
+    tm.tm_mon  = ((dos_date >> 5) & 0x0F) - 1;
+    tm.tm_year = ((dos_date >> 9) & 0x7F) + 80;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1) return 0;
+    return (int64_t)t * 1000000000LL;
+}
+
+/* Convert nanoseconds since epoch to MS-DOS date/time. */
+static void ns_to_msdos(int64_t ns, uint16_t *out_time, uint16_t *out_date) {
+    if (ns == 0) {
+        *out_time = 0;
+        *out_date = 0;
+        return;
+    }
+    time_t t = (time_t)(ns / 1000000000LL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    *out_time = (uint16_t)((tm.tm_sec / 2) | (tm.tm_min << 5) | (tm.tm_hour << 11));
+    *out_date = (uint16_t)(tm.tm_mday | ((tm.tm_mon + 1) << 5) | ((tm.tm_year - 80) << 9));
+}
+
+/* Expand a zip container into DIR + FILE entries in the entry list.
+ * Returns true on success, false on failure (caller should fall back to opaque). */
+static bool expand_zip_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    /* Check for encryption — don't expand encrypted zips */
+    if (blip_zip_has_encrypted(content, content_len)) return false;
+
+    /* Get entry count */
+    uint64_t zip_count = 0;
+    int32_t rc = blip_zip_entry_count(content, content_len, &zip_count);
+    if (rc != BLIP_OK) return false;
+
+    /* Create the container DIR entry (using the original file's metadata) */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "zip";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    memset(dir_entry.xh64, 0, 8);
+
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* Add each zip inner entry */
+    for (uint64_t i = 0; i < zip_count; i++) {
+        const char *inner_path = NULL;
+        size_t inner_path_len = 0;
+        uint16_t comp_method = 0;
+        uint64_t uncomp_size = 0;
+        uint16_t mtime = 0, mdate = 0;
+        uint8_t is_dir = 0;
+
+        rc = blip_zip_entry_info(content, content_len, i,
+            &inner_path, &inner_path_len, &comp_method,
+            &uncomp_size, &mtime, &mdate, &is_dir);
+        if (rc != BLIP_OK) return false;
+
+        /* Build combined path: archive_path/inner_path */
+        size_t combined_len = file_entry->path_len + 1 + inner_path_len;
+        char *combined = malloc(combined_len + 1);
+        if (!combined) return false;
+        memcpy(combined, file_entry->path, file_entry->path_len);
+        combined[file_entry->path_len] = '/';
+        memcpy(combined + file_entry->path_len + 1, inner_path, inner_path_len);
+        combined[combined_len] = '\0';
+
+        /* Strip trailing slash for dir entries (BLIP convention) */
+        if (is_dir && combined_len > 0 && combined[combined_len - 1] == '/') {
+            combined[--combined_len] = '\0';
+        }
+
+        if (!entry_list_add_content(el, (uint8_t *)combined)) {
+            free(combined);
+            return false;
+        }
+
+        int64_t entry_mtime_ns = msdos_to_ns(mtime, mdate);
+
+        if (is_dir) {
+            blip_archive_entry nested_dir;
+            memset(&nested_dir, 0, sizeof(nested_dir));
+            nested_dir.path = combined;
+            nested_dir.path_len = combined_len;
+            nested_dir.is_dir = 1;
+            nested_dir.mtime_ns = entry_mtime_ns;
+            nested_dir.container_type = NULL;
+            nested_dir.container_type_len = 0;
+            nested_dir.zip_compression_method = 0xFFFF;
+            memset(nested_dir.xh64, 0, 8);
+            if (!entry_list_add(el, nested_dir)) return false;
+        } else {
+            /* Extract file content */
+            uint8_t *data = NULL;
+            size_t data_len = 0;
+            rc = blip_zip_extract_entry(content, content_len, i, &data, &data_len);
+            if (rc != BLIP_OK) return false;
+
+            /* Copy to malloc'd buffer (blip_free vs free) */
+            uint8_t *owned = malloc(data_len);
+            if (!owned) {
+                blip_free(data, data_len);
+                return false;
+            }
+            memcpy(owned, data, data_len);
+            blip_free(data, data_len);
+
+            if (!entry_list_add_content(el, owned)) {
+                free(owned);
+                return false;
+            }
+
+            blip_archive_entry file_ent;
+            memset(&file_ent, 0, sizeof(file_ent));
+            file_ent.path = combined;
+            file_ent.path_len = combined_len;
+            file_ent.content = owned;
+            file_ent.content_len = data_len;
+            file_ent.is_dir = 0;
+            file_ent.mtime_ns = entry_mtime_ns;
+            file_ent.zip_compression_method = comp_method;
+            file_ent.container_type = NULL;
+            file_ent.container_type_len = 0;
+            memset(file_ent.xh64, 0, 8);
+            if (!entry_list_add(el, file_ent)) return false;
+
+            el->bytes_seen += data_len;
+        }
+    }
+
+    return true;
 }
 
 static bool collect_entries_recurse(const char *path, entry_list_t *el);
@@ -252,6 +432,24 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.resource_fork = rfork;
         entry.resource_fork_len = rfork_len;
 
+        /* Try to expand zip containers when -z is active */
+        if (el->expand_containers && content_len >= 4 &&
+            blip_is_zip(content, content_len) &&
+            (el->expand_all_zips || !is_archive_extension(path))) {
+            if (expand_zip_container(el, content, content_len, &entry)) {
+                /* Register xattr buffers for cleanup (used by container DIR) */
+                if (xa) entry_list_add_content(el, (uint8_t *)xa);
+                for (size_t xi = 0; xi < xa_count; xi++) {
+                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+                }
+                if (rfork) entry_list_add_content(el, rfork);
+                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
+                return true; /* expanded successfully, skip opaque file entry */
+            }
+            /* Expansion failed — fall through to add as opaque file */
+        }
+
         if (!entry_list_add(el, entry)) {
             free_file_xattrs(xa, xa_count, rfork);
             return false;
@@ -340,7 +538,7 @@ static void print_usage(FILE *out) {
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
-        "  info <archive>                         Show archive information\n"
+        "  info [--json] <archive>                Show archive information\n"
         "  cat <archive> <path>                   Print file contents to stdout\n"
         "  peek <archive> [<path>] [flags]        Inspect archive structure\n"
         "  poke <archive> <path> [options]        Modify a value in archive\n"
@@ -368,8 +566,12 @@ static void print_usage(FILE *out) {
         "  --solid          Solid compression (whole archive, better ratio)\n"
         "                   Auto-enables MIME-type sorting\n"
         "  --no-sort        Disable MIME sorting (only with --solid)\n"
+        "  -j <N>, --threads <N>  Thread count (0=auto, default: 0)\n"
+        "  -f, --force      Overwrite output file without prompting\n"
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
+        "  --no-expand-containers  Don't expand zip containers (with -z)\n"
+        "  --expand-all-zips      Also expand .zip files (normally opaque)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
@@ -421,9 +623,13 @@ static int cmd_create(int argc, char **argv) {
     uint8_t compress_algo = 0;  /* 0 = no compression */
     bool solid_mode = false;    /* --solid: solid compression (old behavior) */
     bool no_sort = false;       /* --no-sort: disable MIME sorting in solid mode */
+    uint8_t num_threads = 0;    /* 0 = auto */
+    bool force = false;        /* -f/--force: overwrite without prompting */
     bool do_encrypt = false;
     uint8_t enc_id = 1;   /* default: AES-256-GCM */
     uint8_t kdf_id = 1;   /* default: Argon2id */
+    bool no_expand = false;     /* --no-expand-containers */
+    bool expand_all = false;    /* --expand-all-zips */
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
@@ -508,10 +714,39 @@ static int cmd_create(int argc, char **argv) {
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+            force = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
         } else if (strcmp(argv[i], "--no-sort") == 0) {
             no_sort = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
+            i--;
+        } else if (strcmp(argv[i], "--no-expand-containers") == 0) {
+            no_expand = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "--expand-all-zips") == 0) {
+            expand_all = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: create: %s requires an argument\n", argv[i]);
+                return EXIT_USAGE;
+            }
+            int t = atoi(argv[i+1]);
+            if (t < 0 || t > 255) {
+                fprintf(stderr, "blar: create: thread count must be 0-255\n");
+                return EXIT_USAGE;
+            }
+            num_threads = (uint8_t)t;
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -577,14 +812,40 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
+    /* Check for existing output file — prompt before overwriting */
+    if (!force) {
+        struct stat out_st;
+        if (stat(out_path, &out_st) == 0) {
+            if (isatty(STDIN_FILENO)) {
+                fprintf(stderr, "blar: '%s' already exists. Overwrite? (y/N) ", out_path);
+                int ch = getchar();
+                if (ch != 'y' && ch != 'Y') {
+                    fprintf(stderr, "blar: not overwriting\n");
+                    return EXIT_USAGE;
+                }
+                /* Consume rest of line */
+                while (ch != '\n' && ch != EOF) ch = getchar();
+            } else {
+                fprintf(stderr, "blar: '%s' already exists (use -f to overwrite)\n", out_path);
+                return EXIT_USAGE;
+            }
+        }
+    }
+
     /* Collect all entries (files and directories, recursively) */
     entry_list_t el;
     entry_list_init(&el);
+    /* Container expansion: enabled by default when -z is used */
+    if (compress_algo != 0 && !no_expand) {
+        el.expand_containers = true;
+        el.expand_all_zips = expand_all;
+    }
 
     /* Progress: indeterminate scanning phase */
     progrez_ctx *progress = progrez_create("Scanning");
     if (progress) {
         progrez_set_identity(progress, "blar", "archive creation");
+        progrez_set_sparkline(progress, true);
         progrez_set_indeterminate(progress);
         el.progress = progress;
     }
@@ -605,10 +866,12 @@ static int cmd_create(int argc, char **argv) {
     }
 
     /* Progress: switch to determinate "Creating" phase.
-     * The FFI now calls back per-entry so we get real progress. */
+     * The FFI now calls back per-entry so we get real progress.
+     * Reset counters since scanning left them at final values. */
     if (progress) {
         progrez_set_label(progress, "Creating");
         progrez_set_determinate(progress, el.count, el.bytes_seen);
+        progrez_update(progress, 0, 0);
     }
 
     /* Determine per-file vs solid compression.
@@ -629,11 +892,12 @@ static int cmd_create(int argc, char **argv) {
     size_t archive_len = 0;
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(el.entries, el.count, create_flags,
-                                           per_file_comp,
+                                           per_file_comp, num_threads,
                                            progress ? create_progress_cb : NULL,
                                            progress ? phase_cb : NULL,
                                            progress,
                                            &archive_buf, &archive_len);
+    uint64_t original_bytes = el.bytes_seen;
     entry_list_free(&el);
 
     if (rc != BLIP_OK) {
@@ -647,10 +911,11 @@ static int cmd_create(int argc, char **argv) {
         if (progress) {
             progrez_set_label(progress, "Compressing");
             progrez_set_determinate(progress, 0, archive_len);
+            progrez_update(progress, 0, 0);
         }
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
-        rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+        rc = blip_compress_container(archive_buf, archive_len, compress_algo, num_threads,
                                       progress ? compress_progress_cb : NULL,
                                       progress ? phase_cb : NULL,
                                       progress,
@@ -699,6 +964,7 @@ static int cmd_create(int argc, char **argv) {
     if (progress) {
         progrez_set_label(progress, "Writing");
         progrez_set_determinate(progress, 0, archive_len);
+        progrez_update(progress, 0, 0);
     }
 
     if (!(progress ? write_file_progress(out_path, archive_buf, archive_len, write_progress_cb, progress)
@@ -712,8 +978,16 @@ static int cmd_create(int argc, char **argv) {
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     char size_buf[32];
-    fprintf(stderr, "Created %s (%s)\n", out_path,
-            format_size(archive_len, size_buf, sizeof(size_buf)));
+    if (original_bytes > 0 && archive_len < original_bytes) {
+        char orig_buf[32];
+        double pct = (double)archive_len / (double)original_bytes * 100.0;
+        fprintf(stderr, "Created %s (%s -> %s, %.2f%% of original)\n", out_path,
+                format_size(original_bytes, orig_buf, sizeof(orig_buf)),
+                format_size(archive_len, size_buf, sizeof(size_buf)), pct);
+    } else {
+        fprintf(stderr, "Created %s (%s)\n", out_path,
+                format_size(archive_len, size_buf, sizeof(size_buf)));
+    }
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
@@ -748,6 +1022,16 @@ static int cmd_list(int argc, char **argv) {
         uint8_t entry_type = 0;
         blip_archive_entry_type(buf, buf_len, i, &entry_type);
         char type_char = (entry_type == 0x07) ? 'd' : '-';
+
+        /* Check for container DIR */
+        if (entry_type == 0x07) {
+            const char *co_type = NULL;
+            size_t co_type_len = 0;
+            if (blip_archive_entry_container_type(buf, buf_len, i,
+                    &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
+                type_char = 'z';
+            }
+        }
 
         const char *path = NULL;
         size_t path_len = 0;
@@ -807,6 +1091,11 @@ static int cmd_extract(int argc, char **argv) {
     uint64_t bytes_done = 0;
     uint64_t file_entries = 0; /* count of non-dir entries for progress */
 
+    /* Container tracking: indices of container DIRs */
+    uint64_t *container_indices = NULL;
+    size_t container_count = 0;
+    size_t container_cap = 0;
+
     /* First pass: create directories, count bytes for progress */
     for (uint64_t i = 0; i < count; i++) {
         uint8_t entry_type = 0;
@@ -818,6 +1107,7 @@ static int cmd_extract(int argc, char **argv) {
         if (rc != BLIP_OK) {
             fprintf(stderr, "blar: extract: entry %llu: %s\n",
                     (unsigned long long)i, blip_error_string(rc));
+            free(container_indices);
             free(buf);
             return EXIT_IO;
         }
@@ -828,12 +1118,14 @@ static int cmd_extract(int argc, char **argv) {
                              output_dir, (int)path_len, path);
             if (n < 0 || (size_t)n >= sizeof(out_path)) {
                 fprintf(stderr, "blar: extract: path too long\n");
+                free(container_indices);
                 free(buf);
                 return EXIT_IO;
             }
         } else {
             if (path_len >= sizeof(out_path)) {
                 fprintf(stderr, "blar: extract: path too long\n");
+                free(container_indices);
                 free(buf);
                 return EXIT_IO;
             }
@@ -842,37 +1134,92 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         if (entry_type == 0x07) {
-            /* DIR entry: create directory */
-            uint16_t mode = 0;
-            int64_t mtime_ns = 0;
-            const char *owner = NULL;
-            size_t owner_len = 0;
-            blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
-
-            if (!mkdirp(out_path)) {
-                fprintf(stderr, "blar: extract: cannot create directory '%s': %s\n",
-                        out_path, strerror(errno));
-                free(buf);
-                return EXIT_IO;
-            }
-            if (mode != 0) {
-                chmod(out_path, mode);
-            }
-
-            /* Restore xattrs on directory */
-            blip_xattr_entry *dir_xattrs = NULL;
-            size_t dir_xattr_count = 0;
-            uint8_t *dir_rfork = NULL;
-            size_t dir_rfork_len = 0;
-            if (blip_archive_entry_xattrs(buf, buf_len, i,
-                    &dir_xattrs, &dir_xattr_count,
-                    &dir_rfork, &dir_rfork_len) == BLIP_OK) {
-                if (dir_xattr_count > 0 || dir_rfork_len > 0) {
-                    write_file_xattrs(out_path, dir_xattrs, dir_xattr_count,
-                                       dir_rfork, dir_rfork_len);
+            /* Check if this is a container DIR */
+            const char *co_type = NULL;
+            size_t co_type_len = 0;
+            bool is_container = false;
+            if (blip_archive_entry_container_type(buf, buf_len, i,
+                    &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
+                is_container = true;
+                /* Track this container for pass 3 */
+                if (container_count >= container_cap) {
+                    size_t new_cap = container_cap == 0 ? 16 : container_cap * 2;
+                    uint64_t *new_arr = realloc(container_indices, new_cap * sizeof(uint64_t));
+                    if (!new_arr) {
+                        free(container_indices);
+                        free(buf);
+                        return EXIT_IO;
+                    }
+                    container_indices = new_arr;
+                    container_cap = new_cap;
                 }
-                blip_free_xattrs(dir_xattrs, dir_xattr_count,
-                                  dir_rfork, dir_rfork_len);
+                container_indices[container_count++] = i;
+            }
+
+            /* Check if this DIR is a child of an existing container DIR */
+            if (!is_container) {
+                bool in_container = false;
+                for (size_t ci = 0; ci < container_count; ci++) {
+                    const char *co_path = NULL;
+                    size_t co_path_len = 0;
+                    if (blip_archive_file_path(buf, buf_len, container_indices[ci],
+                            &co_path, &co_path_len) == BLIP_OK) {
+                        if (path_len > co_path_len + 1 &&
+                            memcmp(path, co_path, co_path_len) == 0 &&
+                            path[co_path_len] == '/') {
+                            in_container = true;
+                            break;
+                        }
+                    }
+                }
+                if (in_container) continue; /* skip — will be inside re-created zip */
+            }
+
+            if (!is_container) {
+                /* Normal DIR entry: create directory */
+                uint16_t mode = 0;
+                int64_t mtime_ns = 0;
+                const char *owner = NULL;
+                size_t owner_len = 0;
+                blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+                if (!mkdirp(out_path)) {
+                    fprintf(stderr, "blar: extract: cannot create directory '%s': %s\n",
+                            out_path, strerror(errno));
+                    free(container_indices);
+                    free(buf);
+                    return EXIT_IO;
+                }
+                if (mode != 0) {
+                    chmod(out_path, mode);
+                }
+
+                /* Restore xattrs on directory */
+                blip_xattr_entry *dir_xattrs = NULL;
+                size_t dir_xattr_count = 0;
+                uint8_t *dir_rfork = NULL;
+                size_t dir_rfork_len = 0;
+                if (blip_archive_entry_xattrs(buf, buf_len, i,
+                        &dir_xattrs, &dir_xattr_count,
+                        &dir_rfork, &dir_rfork_len) == BLIP_OK) {
+                    if (dir_xattr_count > 0 || dir_rfork_len > 0) {
+                        write_file_xattrs(out_path, dir_xattrs, dir_xattr_count,
+                                           dir_rfork, dir_rfork_len);
+                    }
+                    blip_free_xattrs(dir_xattrs, dir_xattr_count,
+                                      dir_rfork, dir_rfork_len);
+                }
+            }
+            /* Container DIRs: skip creating directory (will become a file in pass 3).
+             * Ensure parent directory exists though. */
+            if (is_container) {
+                if (!ensure_parent_dir(out_path)) {
+                    fprintf(stderr, "blar: extract: cannot create parent dir for container '%s': %s\n",
+                            out_path, strerror(errno));
+                    free(container_indices);
+                    free(buf);
+                    return EXIT_IO;
+                }
             }
 
             /* mtime for directories is set after all files are extracted */
@@ -892,6 +1239,7 @@ static int cmd_extract(int argc, char **argv) {
     progrez_ctx *progress = progrez_create("Extracting");
     if (progress) {
         progrez_set_identity(progress, "blar", "archive extraction");
+        progrez_set_sparkline(progress, true);
         progrez_set_determinate(progress, file_entries, total_bytes);
     }
 
@@ -906,6 +1254,25 @@ static int cmd_extract(int argc, char **argv) {
 
         const char *path = NULL;
         size_t path_len = 0;
+        rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+        if (rc == BLIP_OK) {
+            /* Skip files belonging to a container DIR */
+            bool in_container = false;
+            for (size_t ci = 0; ci < container_count; ci++) {
+                const char *co_path = NULL;
+                size_t co_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, container_indices[ci],
+                        &co_path, &co_path_len) == BLIP_OK) {
+                    if (path_len > co_path_len + 1 &&
+                        memcmp(path, co_path, co_path_len) == 0 &&
+                        path[co_path_len] == '/') {
+                        in_container = true;
+                        break;
+                    }
+                }
+            }
+            if (in_container) continue;
+        }
         rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
         if (rc != BLIP_OK) {
             fprintf(stderr, "\033[31mERROR: entry %llu: cannot read path: %s\033[0m\n",
@@ -1007,6 +1374,266 @@ static int cmd_extract(int argc, char **argv) {
         if (progress) progrez_update(progress, files_done, bytes_done);
     }
 
+    /* Third pass: re-assemble container DIRs as zip files */
+    for (size_t ci = 0; ci < container_count; ci++) {
+        uint64_t co_idx = container_indices[ci];
+        const char *co_path = NULL;
+        size_t co_path_len = 0;
+        rc = blip_archive_file_path(buf, buf_len, co_idx, &co_path, &co_path_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "\033[31mERROR: container %llu: cannot read path: %s\033[0m\n",
+                    (unsigned long long)co_idx, blip_error_string(rc));
+            failed++;
+            continue;
+        }
+
+        /* Collect child entries belonging to this container */
+        size_t child_cap = 32;
+        size_t child_count = 0;
+        blip_zip_write_entry *zip_entries = malloc(child_cap * sizeof(blip_zip_write_entry));
+        size_t buf_cap = child_cap * 2; /* files add 2 bufs each (data + name) */
+        uint8_t **child_bufs = malloc(buf_cap * sizeof(uint8_t *)); /* buffers to free */
+        size_t child_buf_count = 0;
+        if (!zip_entries || !child_bufs) {
+            free(zip_entries);
+            free(child_bufs);
+            failed++;
+            continue;
+        }
+
+        bool container_ok = true;
+        for (uint64_t j = 0; j < count && container_ok; j++) {
+            if (j == co_idx) continue;
+            const char *j_path = NULL;
+            size_t j_path_len = 0;
+            if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                continue;
+
+            /* Check if this entry is a direct child of the container */
+            if (j_path_len <= co_path_len + 1 ||
+                memcmp(j_path, co_path, co_path_len) != 0 ||
+                j_path[co_path_len] != '/') {
+                continue;
+            }
+
+            /* Strip container prefix to get inner path */
+            const char *inner_path = j_path + co_path_len + 1;
+            size_t inner_path_len = j_path_len - co_path_len - 1;
+
+            uint8_t j_type = 0;
+            blip_archive_entry_type(buf, buf_len, j, &j_type);
+
+            /* Get mtime for MS-DOS timestamps */
+            uint16_t j_mode = 0;
+            int64_t j_mtime_ns = 0;
+            const char *j_owner = NULL;
+            size_t j_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, j, &j_mode, &j_mtime_ns, &j_owner, &j_owner_len);
+            uint16_t dos_time = 0, dos_date = 0;
+            ns_to_msdos(j_mtime_ns, &dos_time, &dos_date);
+
+            /* Grow arrays if needed (child_bufs grows ~2x faster: files add 2 bufs each) */
+            if (child_count >= child_cap || child_buf_count + 2 >= buf_cap) {
+                child_cap *= 2;
+                buf_cap = child_cap * 2;
+                blip_zip_write_entry *new_ze = realloc(zip_entries, child_cap * sizeof(blip_zip_write_entry));
+                uint8_t **new_cb = realloc(child_bufs, buf_cap * sizeof(uint8_t *));
+                if (!new_ze || !new_cb) {
+                    if (new_ze) zip_entries = new_ze;
+                    if (new_cb) child_bufs = new_cb;
+                    container_ok = false;
+                    break;
+                }
+                zip_entries = new_ze;
+                child_bufs = new_cb;
+            }
+
+            if (j_type == 0x07) {
+                /* Nested DIR inside container → zip directory entry */
+                /* Add trailing slash for zip directory convention */
+                char *dir_name = malloc(inner_path_len + 2);
+                if (!dir_name) { container_ok = false; break; }
+                memcpy(dir_name, inner_path, inner_path_len);
+                if (inner_path_len == 0 || inner_path[inner_path_len - 1] != '/') {
+                    dir_name[inner_path_len] = '/';
+                    dir_name[inner_path_len + 1] = '\0';
+                    inner_path_len++;
+                } else {
+                    dir_name[inner_path_len] = '\0';
+                }
+
+                child_bufs[child_buf_count++] = (uint8_t *)dir_name;
+                blip_zip_write_entry ze;
+                memset(&ze, 0, sizeof(ze));
+                ze.filename = dir_name;
+                ze.filename_len = inner_path_len;
+                ze.content = NULL;
+                ze.content_len = 0;
+                ze.compression_method = 0; /* store for dirs */
+                ze.mtime = dos_time;
+                ze.mdate = dos_date;
+                ze.external_attributes = 0x10 << 16; /* MS-DOS directory attribute */
+                zip_entries[child_count++] = ze;
+            } else {
+                /* FILE inside container → zip file entry */
+                uint8_t *data = NULL;
+                size_t data_len = 0;
+                rc = blip_archive_file_content(buf, buf_len, j, &data, &data_len);
+                if (rc != BLIP_OK) {
+                    fprintf(stderr, "\033[31mERROR: container child '%.*s': %s\033[0m\n",
+                            (int)j_path_len, j_path, blip_error_string(rc));
+                    container_ok = false;
+                    break;
+                }
+
+                /* Copy to malloc'd buffer */
+                uint8_t *owned = malloc(data_len > 0 ? data_len : 1);
+                if (!owned) {
+                    blip_free_content(data, data_len);
+                    container_ok = false;
+                    break;
+                }
+                if (data_len > 0) memcpy(owned, data, data_len);
+                blip_free_content(data, data_len);
+                child_bufs[child_buf_count++] = owned;
+
+                /* Duplicate inner_path for the entry */
+                char *fname = strndup(inner_path, inner_path_len);
+                if (!fname) { container_ok = false; break; }
+                child_bufs[child_buf_count++] = (uint8_t *)fname;
+
+                /* Get original zip compression method if stored */
+                uint16_t zc_method = 0; /* default: store */
+                blip_archive_entry_zip_comp(buf, buf_len, j, &zc_method);
+                if (zc_method == 0xFFFF) zc_method = 8; /* default to deflate */
+
+                blip_zip_write_entry ze;
+                memset(&ze, 0, sizeof(ze));
+                ze.filename = fname;
+                ze.filename_len = inner_path_len;
+                ze.content = owned;
+                ze.content_len = data_len;
+                ze.compression_method = zc_method;
+                ze.mtime = dos_time;
+                ze.mdate = dos_date;
+                ze.external_attributes = 0;
+                zip_entries[child_count++] = ze;
+            }
+        }
+
+        if (!container_ok || child_count == 0) {
+            for (size_t k = 0; k < child_buf_count; k++) free(child_bufs[k]);
+            free(child_bufs);
+            free(zip_entries);
+            if (!container_ok) failed++;
+            continue;
+        }
+
+        /* Create the zip */
+        uint8_t *zip_buf = NULL;
+        size_t zip_len = 0;
+        rc = blip_zip_create(zip_entries, child_count, &zip_buf, &zip_len);
+
+        /* Free child buffers */
+        for (size_t k = 0; k < child_buf_count; k++) free(child_bufs[k]);
+        free(child_bufs);
+        free(zip_entries);
+
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "\033[31mERROR: container '%.*s': zip creation failed: %s\033[0m\n",
+                    (int)co_path_len, co_path, blip_error_string(rc));
+            failed++;
+            continue;
+        }
+
+        /* Write the zip file */
+        char out_path[4096];
+        if (output_dir) {
+            int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                             output_dir, (int)co_path_len, co_path);
+            if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                fprintf(stderr, "\033[31mERROR: container '%.*s': path too long\033[0m\n",
+                        (int)co_path_len, co_path);
+                blip_free(zip_buf, zip_len);
+                failed++;
+                continue;
+            }
+        } else {
+            if (co_path_len >= sizeof(out_path)) {
+                blip_free(zip_buf, zip_len);
+                failed++;
+                continue;
+            }
+            memcpy(out_path, co_path, co_path_len);
+            out_path[co_path_len] = '\0';
+        }
+
+        if (!ensure_parent_dir(out_path)) {
+            fprintf(stderr, "\033[31mERROR: container '%.*s': cannot create parent dir: %s\033[0m\n",
+                    (int)co_path_len, co_path, strerror(errno));
+            blip_free(zip_buf, zip_len);
+            failed++;
+            continue;
+        }
+
+        /* Copy to malloc'd buffer for write_file */
+        uint8_t *write_buf = malloc(zip_len);
+        if (write_buf) {
+            memcpy(write_buf, zip_buf, zip_len);
+        }
+        blip_free(zip_buf, zip_len);
+        if (!write_buf) { failed++; continue; }
+
+        if (!write_file(out_path, write_buf, zip_len)) {
+            fprintf(stderr, "\033[31mERROR: container '%.*s': cannot write: %s\033[0m\n",
+                    (int)co_path_len, co_path, strerror(errno));
+            free(write_buf);
+            failed++;
+            continue;
+        }
+        free(write_buf);
+
+        /* Restore container DIR metadata (mode, mtime, xattrs) on the resulting file */
+        uint16_t co_mode = 0;
+        int64_t co_mtime_ns = 0;
+        const char *co_owner = NULL;
+        size_t co_owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+
+        if (co_mode != 0) {
+            chmod(out_path, co_mode);
+        }
+        if (co_mtime_ns != 0) {
+            struct timespec times[2];
+            times[0].tv_sec = 0;
+            times[0].tv_nsec = UTIME_OMIT;
+            times[1].tv_sec = (time_t)(co_mtime_ns / 1000000000LL);
+            times[1].tv_nsec = (long)(co_mtime_ns % 1000000000LL);
+            utimensat(AT_FDCWD, out_path, times, 0);
+        }
+
+        /* Restore xattrs on container file */
+        blip_xattr_entry *co_xattrs = NULL;
+        size_t co_xattr_count = 0;
+        uint8_t *co_rfork = NULL;
+        size_t co_rfork_len = 0;
+        if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                &co_xattrs, &co_xattr_count,
+                &co_rfork, &co_rfork_len) == BLIP_OK) {
+            if (co_xattr_count > 0 || co_rfork_len > 0) {
+                write_file_xattrs(out_path, co_xattrs, co_xattr_count,
+                                   co_rfork, co_rfork_len);
+            }
+            blip_free_xattrs(co_xattrs, co_xattr_count,
+                              co_rfork, co_rfork_len);
+        }
+
+        files_done++;
+        if (progress) progrez_update(progress, files_done, bytes_done);
+    }
+
+    free(container_indices);
+
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     free(buf);
 
@@ -1096,6 +1723,29 @@ static int cmd_verify(int argc, char **argv) {
     return EXIT_OK;
 }
 
+/* ── JSON helpers ─────────────────────────────────────────────────────── */
+
+/* Print a JSON-escaped string (handles ", \, control chars). */
+static void json_print_escaped(FILE *f, const char *s, size_t len) {
+    fputc('"', f);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f);  break;
+        case '\f': fputs("\\f", f);  break;
+        case '\n': fputs("\\n", f);  break;
+        case '\r': fputs("\\r", f);  break;
+        case '\t': fputs("\\t", f);  break;
+        default:
+            if (c < 0x20) fprintf(f, "\\u%04x", c);
+            else fputc(c, f);
+        }
+    }
+    fputc('"', f);
+}
+
 /* ── cmd_info ─────────────────────────────────────────────────────────── */
 
 static int cmd_info(int argc, char **argv) {
@@ -1104,7 +1754,21 @@ static int cmd_info(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
-    const char *archive_path = argv[0];
+    /* Parse flags */
+    bool json_mode = false;
+    const char *archive_path = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0) {
+            json_mode = true;
+        } else if (!archive_path) {
+            archive_path = argv[i];
+        }
+    }
+    if (!archive_path) {
+        fprintf(stderr, "blar: info: missing archive path\n");
+        return EXIT_USAGE;
+    }
+
     size_t buf_len = 0;
     uint8_t *buf = read_archive(archive_path, &buf_len);
     if (!buf) {
@@ -1130,6 +1794,109 @@ static int cmd_info(int argc, char **argv) {
         else file_count++;
     }
 
+    if (json_mode) {
+        /* ── JSON output ── */
+        printf("{\n");
+        printf("  \"archive\": "); json_print_escaped(stdout, archive_path, strlen(archive_path)); printf(",\n");
+        printf("  \"size\": %llu,\n", (unsigned long long)buf_len);
+        printf("  \"files\": %llu,\n", (unsigned long long)file_count);
+        printf("  \"directories\": %llu,\n", (unsigned long long)dir_count);
+        printf("  \"entries\": [\n");
+
+        uint64_t total_content = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            uint8_t entry_type = 0;
+            blip_archive_entry_type(buf, buf_len, i, &entry_type);
+            bool is_dir = (entry_type == 0x07);
+
+            const char *path = NULL;
+            size_t path_len = 0;
+            rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "blar: info: entry %llu: %s\n",
+                        (unsigned long long)i, blip_error_string(rc));
+                free(buf);
+                return EXIT_IO;
+            }
+
+            /* Full metadata */
+            uint16_t mode = 0;
+            int64_t mtime_ns = 0, ctime_ns = 0, birthtime_ns = 0;
+            uint32_t uid = 0, gid = 0;
+            const char *owner = NULL, *groupname = NULL;
+            size_t owner_len = 0, groupname_len = 0;
+            blip_archive_entry_metadata_full(buf, buf_len, i,
+                &mode, &mtime_ns, &ctime_ns, &birthtime_ns,
+                &uid, &gid, &owner, &owner_len, &groupname, &groupname_len);
+
+            printf("    {");
+            printf("\"type\": \"%s\"", is_dir ? "directory" : "file");
+            printf(", \"path\": "); json_print_escaped(stdout, path, path_len);
+            printf(", \"mode\": %u", (unsigned)mode);
+
+            if (!is_dir) {
+                uint8_t *data = NULL;
+                size_t data_len = 0;
+                rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
+                if (rc == BLIP_OK) {
+                    printf(", \"size\": %llu", (unsigned long long)data_len);
+                    total_content += data_len;
+                    blip_free_content(data, data_len);
+                }
+            }
+
+            if (mtime_ns != 0)     printf(", \"mtime_ns\": %lld", (long long)mtime_ns);
+            if (ctime_ns != 0)     printf(", \"ctime_ns\": %lld", (long long)ctime_ns);
+            if (birthtime_ns != 0) printf(", \"birthtime_ns\": %lld", (long long)birthtime_ns);
+            if (uid != 0)          printf(", \"uid\": %u", (unsigned)uid);
+            if (gid != 0)          printf(", \"gid\": %u", (unsigned)gid);
+            if (owner && owner_len > 0) {
+                printf(", \"owner\": "); json_print_escaped(stdout, owner, owner_len);
+            }
+            if (groupname && groupname_len > 0) {
+                printf(", \"group\": "); json_print_escaped(stdout, groupname, groupname_len);
+            }
+
+            /* Container metadata */
+            if (is_dir) {
+                const char *co_type = NULL;
+                size_t co_type_len = 0;
+                if (blip_archive_entry_container_type(buf, buf_len, i,
+                        &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
+                    printf(", \"container_type\": ");
+                    json_print_escaped(stdout, co_type, co_type_len);
+                }
+            } else {
+                uint16_t zc_method = 0xFFFF;
+                if (blip_archive_entry_zip_comp(buf, buf_len, i,
+                        &zc_method) == BLIP_OK && zc_method != 0xFFFF) {
+                    printf(", \"zip_compression_method\": %u", (unsigned)zc_method);
+                }
+            }
+
+            printf("}%s\n", (i + 1 < count) ? "," : "");
+        }
+
+        printf("  ],\n");
+        printf("  \"total_content\": %llu,\n", (unsigned long long)total_content);
+
+        bool ok = blip_archive_verify(buf, buf_len);
+        if (ok) {
+            for (uint64_t i = 0; i < count; i++) {
+                if (blip_archive_file_verify(buf, buf_len, i) != BLIP_OK) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        printf("  \"integrity\": \"%s\"\n", ok ? "ok" : "failed");
+        printf("}\n");
+
+        free(buf);
+        return ok ? EXIT_OK : EXIT_VERIFY;
+    }
+
+    /* ── Human-readable output ── */
     printf("Archive:     %s\n", archive_path);
     printf("Size:        %llu bytes\n", (unsigned long long)buf_len);
     printf("Files:       %llu\n", (unsigned long long)file_count);
@@ -1141,6 +1908,16 @@ static int cmd_info(int argc, char **argv) {
         uint8_t entry_type = 0;
         blip_archive_entry_type(buf, buf_len, i, &entry_type);
         char type_char = (entry_type == 0x07) ? 'd' : '-';
+
+        /* Check for container DIR in human-readable output */
+        if (entry_type == 0x07) {
+            const char *co_type = NULL;
+            size_t co_type_len = 0;
+            if (blip_archive_entry_container_type(buf, buf_len, i,
+                    &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
+                type_char = 'z';
+            }
+        }
 
         const char *path = NULL;
         size_t path_len = 0;

@@ -144,6 +144,9 @@ typedef struct {
     size_t xattr_count;               /* 0 = none */
     const uint8_t *resource_fork;     /* resource fork data (macOS), NULL = none */
     size_t resource_fork_len;         /* 0 = none */
+    const char *container_type;       /* "zip" etc., NULL = normal dir */
+    size_t container_type_len;        /* 0 = not a container */
+    uint16_t zip_compression_method;  /* original zip method (0=store, 8=deflate), 0xFFFF = not set */
 } blip_archive_entry;
 
 /* Progress callback for archive creation.
@@ -170,6 +173,7 @@ typedef void (*blip_phase_fn)(const uint8_t *label, size_t label_len,
  * Caller must free the output buffer with blip_free(). */
 int32_t blip_archive_create_full(const blip_archive_entry *entries, size_t entry_count,
                                   uint32_t flags, uint8_t per_file_comp_algo,
+                                  uint8_t num_threads,
                                   blip_progress_fn progress_fn,
                                   blip_phase_fn phase_fn,
                                   void *progress_ctx,
@@ -186,6 +190,14 @@ int32_t blip_archive_entry_metadata(const uint8_t *buf, size_t buf_len,
                                      int64_t *out_mtime_ns,
                                      const char **out_owner,
                                      size_t *out_owner_len);
+
+/* Extract full metadata from an entry (all timestamps, uid/gid, groupname). */
+int32_t blip_archive_entry_metadata_full(const uint8_t *buf, size_t buf_len,
+    uint64_t index,
+    uint16_t *out_mode, int64_t *out_mtime_ns, int64_t *out_ctime_ns, int64_t *out_birthtime_ns,
+    uint32_t *out_uid, uint32_t *out_gid,
+    const char **out_owner, size_t *out_owner_len,
+    const char **out_groupname, size_t *out_groupname_len);
 
 /* Extract xattrs and resource fork from an archive entry.
  * Returns heap-allocated arrays; caller must free with blip_free_xattrs().
@@ -302,6 +314,12 @@ int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
 #define BLIP_ERR_ENCRYPTION        -30
 #define BLIP_ERR_DECRYPTION        -31
 
+/* ZIP container errors */
+#define BLIP_ERR_INVALID_ZIP       -33
+#define BLIP_ERR_ENCRYPTED_ZIP     -34
+#define BLIP_ERR_ZIP64             -35
+#define BLIP_ERR_ZIP_UNSUPPORTED   -36
+
 /* Check if a buffer is a compressed LP container (has COMP attribute). */
 bool blip_is_compressed(const uint8_t *buf, size_t buf_len);
 
@@ -332,7 +350,7 @@ typedef void (*blip_compress_progress_fn)(uint64_t bytes_done, uint64_t bytes_to
  * Returns 0 on success, negative error code on failure.
  * Caller must free output buffer with blip_free(). */
 int32_t blip_compress_container(const uint8_t *buf, size_t buf_len,
-                                 uint8_t algo_id,
+                                 uint8_t algo_id, uint8_t num_threads,
                                  blip_compress_progress_fn progress_fn,
                                  blip_phase_fn phase_fn,
                                  void *progress_ctx,
@@ -367,6 +385,55 @@ int32_t blip_encrypt_container(const uint8_t *buf, size_t buf_len,
 int32_t blip_decrypt_container(const uint8_t *buf, size_t buf_len,
                                 const char *password, size_t password_len,
                                 uint8_t **out_buf, size_t *out_len);
+
+/* --- ZIP container operations --- */
+
+/* Check if buffer starts with ZIP magic bytes (PK\x03\x04). */
+bool blip_is_zip(const uint8_t *buf, size_t buf_len);
+
+/* Check if a ZIP buffer contains any encrypted entries. */
+bool blip_zip_has_encrypted(const uint8_t *buf, size_t buf_len);
+
+/* Get the number of entries in a ZIP buffer. */
+int32_t blip_zip_entry_count(const uint8_t *buf, size_t buf_len, uint64_t *out_count);
+
+/* Get info about a specific ZIP entry by index. */
+int32_t blip_zip_entry_info(const uint8_t *buf, size_t buf_len, uint64_t index,
+    const char **out_path, size_t *out_path_len, uint16_t *out_comp_method,
+    uint64_t *out_uncompressed_size, uint16_t *out_mtime, uint16_t *out_mdate,
+    uint8_t *out_is_dir);
+
+/* Extract (decompress) a specific ZIP entry by index.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_zip_extract_entry(const uint8_t *buf, size_t buf_len, uint64_t index,
+    uint8_t **out_data, size_t *out_data_len);
+
+/* Entry for creating a ZIP archive. */
+typedef struct {
+    const char *filename;
+    size_t filename_len;
+    const uint8_t *content;
+    size_t content_len;
+    uint16_t compression_method;
+    uint16_t mtime;
+    uint16_t mdate;
+    uint32_t external_attributes;
+} blip_zip_write_entry;
+
+/* Create a ZIP archive from entries.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_zip_create(const blip_zip_write_entry *entries, size_t count,
+    uint8_t **out_buf, size_t *out_len);
+
+/* Read container_type from a DIR entry in a BLIP archive.
+ * Sets out_type to NULL if not a container dir. */
+int32_t blip_archive_entry_container_type(const uint8_t *buf, size_t buf_len,
+    uint64_t index, const char **out_type, size_t *out_type_len);
+
+/* Read zip_compression_method from a FILE entry in a BLIP archive.
+ * Sets out_method to 0xFFFF if not set. */
+int32_t blip_archive_entry_zip_comp(const uint8_t *buf, size_t buf_len,
+    uint64_t index, uint16_t *out_method);
 
 #ifdef __cplusplus
 }

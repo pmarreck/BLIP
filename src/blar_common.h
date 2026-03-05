@@ -1220,7 +1220,7 @@ static int cmd_from_json_common(const char *prog, int argc, char **argv) {
     if (compress_algo != 0) {
         uint8_t *compressed_buf = NULL;
         size_t compressed_len = 0;
-        rc = blip_compress_container(archive_buf, archive_len, compress_algo,
+        rc = blip_compress_container(archive_buf, archive_len, compress_algo, 0,
                                       NULL, NULL, NULL,
                                       &compressed_buf, &compressed_len);
         blip_free(archive_buf, archive_len);

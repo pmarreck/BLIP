@@ -15,7 +15,7 @@ const LPContainerError = container.LPContainerError;
 /// Delegates to the unified compression module.
 /// Caller owns returned memory.
 pub fn compressContainer(allocator: Allocator, container_bytes: []const u8) (Allocator.Error || ContainerError || compression.CompressionError)![]u8 {
-    return compression.compressContainer(allocator, .lzma2, container_bytes, null, null, null);
+    return compression.compressContainer(allocator, .lzma2, container_bytes, null, null, null, 0);
 }
 
 /// Decompress an LP container with COMP=lzma2 attribute, verifying checksum

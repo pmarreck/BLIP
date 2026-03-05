@@ -130,6 +130,10 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -30 => "encryption failed",
         -31 => "decryption failed",
         -32 => "unsupported compression algorithm",
+        -33 => "invalid zip container",
+        -34 => "encrypted zip container",
+        -35 => "zip64 not supported",
+        -36 => "unsupported zip compression method",
         else => "unknown error",
     };
 }
@@ -205,6 +209,9 @@ const CArchiveEntry = extern struct {
     xattr_count: usize, // 0 = none
     resource_fork: ?[*]const u8, // resource fork data, NULL = none
     resource_fork_len: usize, // 0 = none
+    container_type: ?[*]const u8, // "zip" etc., NULL = normal dir
+    container_type_len: usize, // 0 = not a container
+    zip_compression_method: u16, // original zip method (0=store, 8=deflate), 0xFFFF = not set
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -241,6 +248,7 @@ export fn blip_archive_create_full(
     entry_count: usize,
     flags: u32,
     per_file_comp_algo: u8,
+    num_threads: u8,
     progress_fn: mini_blar.ProgressFn,
     phase_fn: mini_blar.PhaseFn,
     progress_ctx: ?*anyopaque,
@@ -293,6 +301,8 @@ export fn blip_archive_create_full(
 
         const rfork: []const u8 = if (e.resource_fork) |rf| rf[0..e.resource_fork_len] else &.{};
 
+        const ct_str: []const u8 = if (e.container_type) |ct| ct[0..e.container_type_len] else &.{};
+
         if (e.is_dir != 0) {
             archive_entries[i] = .{
                 .dir = .{
@@ -307,6 +317,7 @@ export fn blip_archive_create_full(
                     .username = username,
                     .groupname = gname,
                     .xattrs = xattr_slice,
+                    .container_type = ct_str,
                 },
             };
         } else {
@@ -325,6 +336,7 @@ export fn blip_archive_create_full(
                     .groupname = gname,
                     .xattrs = xattr_slice,
                     .resource_fork = rfork,
+                    .zip_compression_method = if (e.zip_compression_method == 0xFFFF) null else e.zip_compression_method,
                 },
             };
         }
@@ -335,7 +347,7 @@ export fn blip_archive_create_full(
     const CompressionId_ = mini_blar.container_mod.CompressionId;
     const comp_id: ?CompressionId_ = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompressionId_, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
 
-    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, phase_fn, progress_ctx, comp_id) catch |e| {
+    const result = mini_blar.createFullArchive(page_allocator, archive_entries, progress_fn, phase_fn, progress_ctx, comp_id, num_threads) catch |e| {
         return fullArchiveErrorCode(e);
     };
     out_buf.* = result.ptr;
@@ -554,6 +566,94 @@ fn readMetadataFromDict(
         const un_val = try leaf.readUtf8(un_container);
         out_owner.* = un_val.ptr;
         out_owner_len.* = un_val.len;
+    }
+}
+
+/// Extract full metadata from an archive entry (all timestamp fields, uid/gid, groupname).
+export fn blip_archive_entry_metadata_full(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_mode: *u16,
+    out_mtime_ns: *i64,
+    out_ctime_ns: *i64,
+    out_birthtime_ns: *i64,
+    out_uid: *u32,
+    out_gid: *u32,
+    out_owner: *[*]const u8,
+    out_owner_len: *usize,
+    out_groupname: *[*]const u8,
+    out_groupname_len: *usize,
+) callconv(.c) i32 {
+    const slice = buf[0..buf_len];
+    const reader = mini_blar.ArchiveReader.init(slice) catch |e| return containerErrorCode(e);
+
+    out_mode.* = 0;
+    out_mtime_ns.* = 0;
+    out_ctime_ns.* = 0;
+    out_birthtime_ns.* = 0;
+    out_uid.* = 0;
+    out_gid.* = 0;
+    out_owner.* = @as([*]const u8, "");
+    out_owner_len.* = 0;
+    out_groupname.* = @as([*]const u8, "");
+    out_groupname_len.* = 0;
+
+    const entry_type = reader.entryTypeAt(index) catch |e| return containerErrorCode(e);
+
+    const dict_reader = if (entry_type == .file) blk: {
+        const arr = reader.fileArrayAt(index) catch |e| return containerErrorCode(e);
+        const meta_view = arr.elementAt(0) catch |e| return containerErrorCode(e);
+        const meta_start = @intFromPtr(meta_view.buf.ptr) - @intFromPtr(slice.ptr);
+        const meta_end = meta_start + @as(usize, @intCast(meta_view.total_length));
+        break :blk dict_mod.DictReader.init(slice[meta_start..meta_end]) catch |e| return containerErrorCode(e);
+    } else blk: {
+        break :blk reader.dirDictAt(index) catch |e| return containerErrorCode(e);
+    };
+
+    // Read basic metadata
+    readMetadataFromDict(dict_reader, out_mode, out_mtime_ns, out_owner, out_owner_len) catch |e| return containerErrorCode(e);
+
+    // Read extended fields
+    readExtendedMetadata(dict_reader, out_ctime_ns, out_birthtime_ns, out_uid, out_gid, out_groupname, out_groupname_len) catch |e| return containerErrorCode(e);
+
+    return 0;
+}
+
+fn readExtendedMetadata(
+    dict_reader: dict_mod.DictReader,
+    out_ctime_ns: *i64,
+    out_birthtime_ns: *i64,
+    out_uid: *u32,
+    out_gid: *u32,
+    out_groupname: *[*]const u8,
+    out_groupname_len: *usize,
+) ContainerError!void {
+    if (try dict_reader.findKey("ct")) |idx| {
+        const c = try dict_reader.valueAt(idx);
+        const v = try leaf.readData(c);
+        if (v.len >= 8) out_ctime_ns.* = std.mem.readInt(i64, v[0..8], .little);
+    }
+    if (try dict_reader.findKey("bt")) |idx| {
+        const c = try dict_reader.valueAt(idx);
+        const v = try leaf.readData(c);
+        if (v.len >= 8) out_birthtime_ns.* = std.mem.readInt(i64, v[0..8], .little);
+    }
+    if (try dict_reader.findKey("ui")) |idx| {
+        const c = try dict_reader.valueAt(idx);
+        const v = try leaf.readData(c);
+        if (v.len >= 4) out_uid.* = std.mem.readInt(u32, v[0..4], .little);
+    }
+    if (try dict_reader.findKey("gi")) |idx| {
+        const c = try dict_reader.valueAt(idx);
+        const v = try leaf.readData(c);
+        if (v.len >= 4) out_gid.* = std.mem.readInt(u32, v[0..4], .little);
+    }
+    if (try dict_reader.findKey("gn")) |idx| {
+        const c = try dict_reader.valueAt(idx);
+        const v = try leaf.readUtf8(c);
+        out_groupname.* = v.ptr;
+        out_groupname_len.* = v.len;
     }
 }
 
@@ -1054,6 +1154,7 @@ export fn blip_compress_container(
     buf: [*]const u8,
     buf_len: usize,
     algo_id: u8,
+    num_threads: u8,
     progress_fn: compression_mod.CompressProgressFn,
     phase_fn: compression_mod.PhaseFn,
     progress_ctx: ?*anyopaque,
@@ -1062,7 +1163,7 @@ export fn blip_compress_container(
 ) callconv(.c) i32 {
     const algo = std.meta.intToEnum(CompressionId, @as(u7, @truncate(algo_id))) catch return -32;
     const slice = buf[0..buf_len];
-    const result = compression_mod.compressContainer(page_allocator, algo, slice, progress_fn, phase_fn, progress_ctx) catch |e| switch (e) {
+    const result = compression_mod.compressContainer(page_allocator, algo, slice, progress_fn, phase_fn, progress_ctx, num_threads) catch |e| switch (e) {
         error.OutOfMemory => return -13,
         error.CompressionFailed => return -24,
         error.UnsupportedCompression => return -32,
@@ -1169,6 +1270,187 @@ fn encryptionErrorCode(err: anytype) i32 {
         error.HashMismatch => -7,
         error.UnsupportedEncryption, error.UnsupportedKdf => -1,
         else => -99,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// ZIP container C FFI exports
+// ---------------------------------------------------------------------------
+
+const zip_mod = blip.zip_mod;
+
+/// Check if buffer starts with ZIP magic bytes (PK\x03\x04).
+export fn blip_is_zip(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    if (buf_len < 4) return false;
+    return zip_mod.isZipMagic(buf[0..buf_len]);
+}
+
+/// Check if a ZIP buffer contains any encrypted entries.
+export fn blip_zip_has_encrypted(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return zip_mod.hasEncryptedEntries(page_allocator, buf[0..buf_len]) catch false;
+}
+
+/// Get the number of entries in a ZIP buffer.
+export fn blip_zip_entry_count(buf: [*]const u8, buf_len: usize, out_count: *u64) callconv(.c) i32 {
+    const entries = zip_mod.readEntries(page_allocator, buf[0..buf_len]) catch |e| return zipErrorCode(e);
+    defer page_allocator.free(entries);
+    out_count.* = entries.len;
+    return 0;
+}
+
+/// Get info about a specific ZIP entry by index.
+export fn blip_zip_entry_info(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_path: *[*]const u8,
+    out_path_len: *usize,
+    out_comp_method: *u16,
+    out_uncompressed_size: *u64,
+    out_mtime: *u16,
+    out_mdate: *u16,
+    out_is_dir: *u8,
+) callconv(.c) i32 {
+    const entries = zip_mod.readEntries(page_allocator, buf[0..buf_len]) catch |e| return zipErrorCode(e);
+    defer page_allocator.free(entries);
+    if (index >= entries.len) return -8; // index out of bounds
+    const entry = entries[index];
+    out_path.* = entry.filename.ptr;
+    out_path_len.* = entry.filename.len;
+    out_comp_method.* = entry.compression_method;
+    out_uncompressed_size.* = entry.uncompressed_size;
+    out_mtime.* = entry.last_modification_time;
+    out_mdate.* = entry.last_modification_date;
+    out_is_dir.* = if (entry.is_dir) 1 else 0;
+    return 0;
+}
+
+/// Extract (decompress) a specific ZIP entry by index.
+/// Caller must free returned buffer with blip_free().
+export fn blip_zip_extract_entry(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_data: *[*]u8,
+    out_data_len: *usize,
+) callconv(.c) i32 {
+    const entries = zip_mod.readEntries(page_allocator, buf[0..buf_len]) catch |e| return zipErrorCode(e);
+    defer page_allocator.free(entries);
+    if (index >= entries.len) return -8;
+    const content = zip_mod.extractEntry(page_allocator, entries[index]) catch |e| return zipErrorCode(e);
+    out_data.* = content.ptr;
+    out_data_len.* = content.len;
+    return 0;
+}
+
+/// C-compatible struct for zip write entries.
+const CZipWriteEntry = extern struct {
+    filename: [*]const u8,
+    filename_len: usize,
+    content: [*]const u8,
+    content_len: usize,
+    compression_method: u16,
+    mtime: u16,
+    mdate: u16,
+    external_attributes: u32,
+};
+
+/// Create a ZIP archive from entries.
+/// Caller must free returned buffer with blip_free().
+export fn blip_zip_create(
+    c_entries: [*]const CZipWriteEntry,
+    count: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    // Convert C entries to Zig entries
+    const zig_entries = page_allocator.alloc(zip_mod.ZipWriteEntry, count) catch return -13;
+    defer page_allocator.free(zig_entries);
+    for (0..count) |i| {
+        const ce = c_entries[i];
+        zig_entries[i] = .{
+            .filename = ce.filename[0..ce.filename_len],
+            .content = ce.content[0..ce.content_len],
+            .compression_method = ce.compression_method,
+            .last_modification_time = ce.mtime,
+            .last_modification_date = ce.mdate,
+            .external_attributes = ce.external_attributes,
+        };
+    }
+    const result = zip_mod.createZip(page_allocator, zig_entries) catch |e| return zipErrorCode(e);
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Read container_type from a DIR entry in a BLIP archive.
+export fn blip_archive_entry_container_type(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_type: *?[*]const u8,
+    out_type_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const entry_type = reader.entryTypeAt(index) catch return -8;
+    if (entry_type != .dir) {
+        out_type.* = null;
+        out_type_len.* = 0;
+        return 0;
+    }
+    const dir_dict = reader.dirDictAt(index) catch return -1;
+    // Look for "co" key
+    const co_idx = (dir_dict.findKey("co") catch return -1) orelse {
+        out_type.* = null;
+        out_type_len.* = 0;
+        return 0;
+    };
+    const co_container = dir_dict.valueAt(co_idx) catch return -1;
+    const co_val = mini_blar.leaf.readUtf8(co_container) catch return -1;
+    out_type.* = co_val.ptr;
+    out_type_len.* = co_val.len;
+    return 0;
+}
+
+/// Read zip_compression_method from a FILE entry in a BLIP archive.
+export fn blip_archive_entry_zip_comp(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_method: *u16,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const entry_type = reader.entryTypeAt(index) catch return -8;
+    if (entry_type != .file) {
+        out_method.* = 0xFFFF;
+        return 0;
+    }
+    const file_array = reader.fileArrayAt(index) catch return -1;
+    const meta_view = file_array.elementAt(0) catch return -1;
+    const meta_dict = dict_mod.DictReader.init(meta_view.buf[0..@intCast(meta_view.total_length)]) catch return -1;
+    // Look for "zc" key
+    const zc_idx = (meta_dict.findKey("zc") catch return -1) orelse {
+        out_method.* = 0xFFFF;
+        return 0;
+    };
+    const zc_container = meta_dict.valueAt(zc_idx) catch return -1;
+    const zc_bytes = mini_blar.leaf.readData(zc_container) catch return -1;
+    if (zc_bytes.len != 2) return -1;
+    out_method.* = std.mem.readInt(u16, zc_bytes[0..2], .little);
+    return 0;
+}
+
+fn zipErrorCode(err: anytype) i32 {
+    return switch (err) {
+        error.InvalidZip => -33,
+        error.EncryptedZip => -34,
+        error.Zip64Unsupported => -35,
+        error.UnsupportedMethod => -36,
+        error.OutOfMemory => -13,
+        error.BadCrc32 => -7,
+        error.DecompressFailed => -23,
+        error.CompressFailed => -24,
+        error.TruncatedData => -11,
     };
 }
 
@@ -1404,7 +1686,7 @@ test "C FFI: bzip2 compress+decompress multi-block archive" {
 
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    const rc = blip_compress_container(&data, data.len, 2, null, null, null, &out_buf, &out_len);
+    const rc = blip_compress_container(&data, data.len, 2, 0, null, null, null, &out_buf, &out_len);
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer blip_free(out_buf, out_len);
 
@@ -1431,6 +1713,8 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xattrs = null, .xattr_count = 0,
             .resource_fork = null, .resource_fork_len = 0,
+            .container_type = null, .container_type_len = 0,
+            .zip_compression_method = 0xFFFF,
         },
         .{
             .path = "mydir/file.txt", .path_len = 14,
@@ -1443,11 +1727,13 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xattrs = null, .xattr_count = 0,
             .resource_fork = null, .resource_fork_len = 0,
+            .container_type = null, .container_type_len = 0,
+            .zip_compression_method = 0xFFFF,
         },
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var count: u64 = undefined;
@@ -1470,6 +1756,8 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xattrs = null, .xattr_count = 0,
             .resource_fork = null, .resource_fork_len = 0,
+            .container_type = null, .container_type_len = 0,
+            .zip_compression_method = 0xFFFF,
         },
         .{
             .path = "bfile.txt", .path_len = 9,
@@ -1482,11 +1770,13 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xattrs = null, .xattr_count = 0,
             .resource_fork = null, .resource_fork_len = 0,
+            .container_type = null, .container_type_len = 0,
+            .zip_compression_method = 0xFFFF,
         },
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 2, 0, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_type: u8 = undefined;
@@ -1509,11 +1799,13 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
             .xh64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xattrs = null, .xattr_count = 0,
             .resource_fork = null, .resource_fork_len = 0,
+            .container_type = null, .container_type_len = 0,
+            .zip_compression_method = 0xFFFF,
         },
     };
     var out_buf: [*]u8 = undefined;
     var out_len: usize = undefined;
-    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, 0, null, null, null, &out_buf, &out_len));
+    try std.testing.expectEqual(@as(i32, 0), blip_archive_create_full(&entries, 1, 0, 0, 0, null, null, null, &out_buf, &out_len));
     defer blip_free(out_buf, out_len);
 
     var out_mode: u16 = undefined;
