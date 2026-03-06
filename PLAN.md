@@ -98,6 +98,20 @@
 - [x] Integration tests: 14 encryption tests (all passing)
 - [x] All existing tests still pass (236 shell tests + all Zig unit tests)
 
+## Transparent Zip Container Expansion (Completed 2026-03-05)
+- [x] src/zip.zig — Pure in-memory zip reader/writer (store + deflate)
+- [x] "co"/"zc" metadata keys in mini_blar.zig (container_type, zip_compression_method)
+- [x] C FFI: blip_is_zip, blip_zip_entry_count/info/extract, blip_zip_create, blip_archive_entry_container_type/zip_comp
+- [x] blar create: PK magic detection, container expansion into DIR+FILE entries
+- [x] blar extract: 3-pass container re-assembly (skip container dirs, skip children, re-zip)
+- [x] CLI flags: --no-expand-containers, --expand-all-zips
+- [x] blar list: 'z' prefix for container dirs; info --json: container_type, zip_compression_method
+- [x] poke.zig + json_serde.zig: "co"/"zc" roundtrip support
+- [x] Fix: flate decompressor panic (direct mode avoids fixed-capacity window overflow)
+- [x] Fix: heap corruption in extraction (child_bufs 2x growth rate vs zip_entries)
+- [x] 19 container expansion integration tests (all passing)
+- [x] All existing tests still pass (27 blar + 144 compression + Zig unit tests)
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
@@ -106,3 +120,6 @@
 - [ ] Segmentation container type — a new top-level container for splitting large archives into fixed-size segments (e.g. for transport over size-limited channels, span across volumes, or resumable transfers)
 - [ ] Per-MIME-type zstd dictionaries — When using zstd with per-file compression: (1) group files by MIME type, (2) train a zstd dictionary per group on the fly, (3) store dictionaries in a MAP container within the archive keyed by MIME type, (4) compress each file with its group's dictionary. Dictionary-level compression gains without solid-archive fragility. If a dictionary is corrupted, only its group's files are lost. Design questions: minimum sample threshold for training (zstd recommends 100+ samples), CLI UX (`-z zstd-dict` vs automatic).
 - [ ] Archive metadata inspection (`blar info --depth N`) — Rich metadata reporting at the FFI level, exposed through CLI. Reports: compression algorithm(s), encryption algorithm(s), compressed/expanded sizes and ratio, creation date, format version, master checksum and validation status. `--depth` parameter (default: shallow/1) controls how deep to inspect nested containers for additional compression/encryption layers. Encrypted containers remain opaque (with warning) unless password is supplied. All reporting available via C FFI functions (e.g. `blip_archive_info()`) so any consumer can access it, not just the CLI.
+- [ ] PDF container expansion — Treat PDFs as containers (like zip), expanding into constituent streams (text, fonts, images, metadata). Leverage validate project's PDF parser for structure extraction. On extraction, faithfully reassemble the PDF. Container type: `"co" -> "pdf"`.
+- [ ] JPEG XL lossless image recompression — For image streams inside expanded containers (PDF, zip, etc.), losslessly transcode JPEG (~20% smaller) and PNG (~50% smaller) to JPEG XL for storage. On extraction, transcode back to original bytes (bit-exact roundtrip). Store recompression method in entry metadata (e.g. `"jx" -> "jpeg"` or `"jx" -> "png"`). JPEG XL isn't yet a finalized standard but blar controls both sides so this is safe for archiving. Requires libjxl or equivalent.
+- [ ] macOS bundle container types — Recognize `.app`, `.framework`, `.bundle`, `.plugin`, `.kext` directories as containers with appropriate tags (`"co" -> "app"`, `"co" -> "framework"`, etc.). Preserves bundle structure awareness (code signing, `Info.plist` placement, `_CodeSignature/`) and enables bundle-aware deduplication (shared frameworks across apps).
