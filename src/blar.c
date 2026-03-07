@@ -788,6 +788,15 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
 
         return collect_dir_children(path, el);
     } else if (S_ISREG(st.st_mode)) {
+        /* Update progress label with current filename */
+        if (el->progress) {
+            const char *basename = strrchr(path, '/');
+            basename = basename ? basename + 1 : path;
+            char label_buf[256];
+            snprintf(label_buf, sizeof(label_buf), "Scanning: %s", basename);
+            progrez_set_label(el->progress, label_buf);
+        }
+
         size_t content_len = 0;
         uint8_t *content = read_file(path, &content_len);
         if (!content) {
@@ -820,55 +829,8 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.resource_fork = rfork;
         entry.resource_fork_len = rfork_len;
 
-        /* Try to expand zip containers when -z is active */
-        if (el->expand_containers && content_len >= 4 &&
-            blip_is_zip(content, content_len) &&
-            (el->expand_all_zips || !is_archive_extension(path))) {
-            if (expand_zip_container(el, content, content_len, &entry)) {
-                /* Register xattr buffers for cleanup (used by container DIR) */
-                if (xa) entry_list_add_content(el, (uint8_t *)xa);
-                for (size_t xi = 0; xi < xa_count; xi++) {
-                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
-                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
-                }
-                if (rfork) entry_list_add_content(el, rfork);
-                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
-                return true; /* expanded successfully, skip opaque file entry */
-            }
-            /* Expansion failed — fall through to add as opaque file */
-        }
-
-        /* Try to expand PDF containers when -z is active */
-        if (el->expand_containers && content_len >= 5 &&
-            blip_is_pdf(content, content_len)) {
-            if (expand_pdf_container(el, content, content_len, &entry)) {
-                if (xa) entry_list_add_content(el, (uint8_t *)xa);
-                for (size_t xi = 0; xi < xa_count; xi++) {
-                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
-                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
-                }
-                if (rfork) entry_list_add_content(el, rfork);
-                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
-                return true; /* expanded successfully, skip opaque file entry */
-            }
-            /* Expansion failed — fall through to add as opaque file */
-        }
-
-        /* Try to expand PNG containers when -z is active */
-        if (el->expand_containers && content_len >= 8 &&
-            blip_is_png(content, content_len)) {
-            if (expand_png_container(el, content, content_len, &entry)) {
-                if (xa) entry_list_add_content(el, (uint8_t *)xa);
-                for (size_t xi = 0; xi < xa_count; xi++) {
-                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
-                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
-                }
-                if (rfork) entry_list_add_content(el, rfork);
-                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
-                return true; /* expanded successfully, skip opaque file entry */
-            }
-            /* Expansion failed — fall through to add as opaque file */
-        }
+        /* Container expansion is deferred to a separate pass (expand_containers_pass)
+         * so it can have its own progress bar and potentially be parallelized. */
 
         if (!entry_list_add(el, entry)) {
             free_file_xattrs(xa, xa_count, rfork);
@@ -884,6 +846,110 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
 
         el->bytes_seen += content_len;
         if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
+    }
+
+    return true;
+}
+
+/* ── Container expansion pass (separate phase with progress) ─────────── */
+
+/* Try to expand containers in the entry list. This runs after scanning,
+ * so we know the total count and can show determinate progress.
+ * Expanded entries replace the original at its index (DIR entry) and
+ * append child entries at the end of the list. */
+static bool expand_containers_pass(entry_list_t *el) {
+    /* Count expandable files for progress */
+    size_t expandable = 0;
+    for (size_t i = 0; i < el->count; i++) {
+        if (el->entries[i].is_dir) continue;
+        const uint8_t *content = el->entries[i].content;
+        size_t content_len = el->entries[i].content_len;
+        if (content_len >= 4 && blip_is_zip(content, content_len) &&
+            (el->expand_all_zips || !is_archive_extension(el->entries[i].path))) {
+            expandable++;
+        } else if (content_len >= 5 && blip_is_pdf(content, content_len)) {
+            expandable++;
+        } else if (content_len >= 8 && blip_is_png(content, content_len)) {
+            expandable++;
+        }
+    }
+    if (expandable == 0) return true;
+
+    /* Set up progress for expansion phase */
+    if (el->progress) {
+        progrez_set_label(el->progress, "Expanding");
+        progrez_set_determinate(el->progress, expandable, 0);
+        progrez_update(el->progress, 0, 0);
+    }
+
+    /* Iterate over the ORIGINAL count — expansion appends new entries
+     * beyond this range, so we won't re-process them. */
+    size_t original_count = el->count;
+    size_t done = 0;
+    uint64_t bytes_expanded = 0;
+    for (size_t i = 0; i < original_count; i++) {
+        if (el->entries[i].is_dir) continue;
+        const uint8_t *content = el->entries[i].content;
+        size_t content_len = el->entries[i].content_len;
+        blip_archive_entry *entry = &el->entries[i];
+
+        bool expanded = false;
+
+        /* Update label with current filename */
+        if (el->progress) {
+            const char *basename = strrchr(entry->path, '/');
+            basename = basename ? basename + 1 : entry->path;
+            char label_buf[256];
+            snprintf(label_buf, sizeof(label_buf), "Expanding: %s", basename);
+            progrez_set_label(el->progress, label_buf);
+        }
+
+        /* Try ZIP */
+        if (!expanded && content_len >= 4 &&
+            blip_is_zip(content, content_len) &&
+            (el->expand_all_zips || !is_archive_extension(entry->path))) {
+            if (expand_zip_container(el, content, content_len, entry)) {
+                expanded = true;
+            }
+        }
+
+        /* Try PDF */
+        if (!expanded && content_len >= 5 &&
+            blip_is_pdf(content, content_len)) {
+            if (expand_pdf_container(el, content, content_len, entry)) {
+                expanded = true;
+            }
+        }
+
+        /* Try PNG */
+        if (!expanded && content_len >= 8 &&
+            blip_is_png(content, content_len)) {
+            if (expand_png_container(el, content, content_len, entry)) {
+                expanded = true;
+            }
+        }
+
+        if (expanded) {
+            /* The expand_*_container functions appended new entries to el.
+             * The original entry at index i was passed as file_entry
+             * (used for metadata). We need to remove the opaque entry at
+             * index i since the expanded DIR+children replaced it.
+             * The expand functions already added the DIR entry — we just
+             * need to mark this slot as consumed. Overwrite with the last
+             * original entry and adjust. Actually — the expand functions
+             * add entries at the end, including the DIR. So the original
+             * opaque entry at index i is now stale. Remove it by shifting. */
+            /* Shift remaining entries down */
+            memmove(&el->entries[i], &el->entries[i + 1],
+                    (el->count - i - 1) * sizeof(blip_archive_entry));
+            el->count--;
+            original_count--;
+            i--; /* re-examine this index */
+            done++;
+            bytes_expanded += content_len;
+            if (el->progress)
+                progrez_update(el->progress, done, bytes_expanded);
+        }
     }
 
     return true;
@@ -1283,6 +1349,15 @@ static int cmd_create(int argc, char **argv) {
         fprintf(stderr, "blar: create: no entries to archive\n");
         entry_list_free(&el);
         return EXIT_USAGE;
+    }
+
+    /* Container expansion pass: separate phase with its own progress bar */
+    if (el.expand_containers) {
+        if (!expand_containers_pass(&el)) {
+            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
+            entry_list_free(&el);
+            return EXIT_IO;
+        }
     }
 
     /* Progress: switch to determinate "Creating" phase.
