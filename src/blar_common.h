@@ -220,8 +220,7 @@ static uint8_t *read_archive(const char *path, size_t *out_len) {
         int32_t rc = blip_decompress_container(buf, *out_len, &decompressed, &decomp_len);
         free(buf);
         if (rc != BLIP_OK) {
-            fprintf(stderr, "Failed to decompress archive: %s\n",
-                    blip_error_string(rc));
+            fprintf(stderr, "Failed to decompress archive: %s\n", blip_error_string(rc));
             return NULL;
         }
         /* Copy into malloc'd buffer so caller can free() uniformly */

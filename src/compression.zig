@@ -215,9 +215,12 @@ pub fn decompress(allocator: Allocator, algo: ct.CompressionId, data: []const u8
             errdefer allocator.free(out_buf);
             var input_stream = std.io.fixedBufferStream(data);
             var output_stream = std.io.fixedBufferStream(out_buf);
-            std.compress.lzma2.decompress(allocator, input_stream.reader(), output_stream.writer()) catch {
+            std.compress.lzma2.decompress(allocator, input_stream.reader(), output_stream.writer()) catch |e| {
                 allocator.free(out_buf);
-                return error.DecompressionFailed;
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.DecompressionFailed,
+                };
             };
             if (output_stream.pos != @as(usize, @intCast(decomp_len))) {
                 allocator.free(out_buf);
@@ -354,6 +357,37 @@ test "LZMA2 compress/decompress round-trip (raw bytes)" {
     defer allocator.free(decompressed);
 
     try testing.expectEqualSlices(u8, original, decompressed);
+}
+
+test "LZMA2 compress/decompress round-trip (large data, parallel path)" {
+    const allocator = std.heap.page_allocator;
+
+    // 2GB with mostly high-entropy data (like book archives with compressed content)
+    const data_size: usize = 2 * 1024 * 1024 * 1024;
+    const data = try allocator.alloc(u8, data_size);
+    defer allocator.free(data);
+
+    // Mostly random (high-entropy) with occasional compressible runs
+    // This mimics book archives where most data is JPEG/compressed PDF streams
+    var rng = std.Random.DefaultPrng.init(42);
+    const random = rng.random();
+    for (0..data_size) |i| {
+        if (i % (512 * 1024) < 4096) {
+            // 4KB compressible every 512KB (like metadata between compressed images)
+            data[i] = @intCast(i % 256);
+        } else {
+            data[i] = random.int(u8);
+        }
+    }
+
+    const compressed = try compress(allocator, .lzma2, data, null, null, 0);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompress(allocator, .lzma2, compressed, data_size);
+    defer allocator.free(decompressed);
+
+    try testing.expectEqual(data_size, decompressed.len);
+    try testing.expectEqualSlices(u8, data, decompressed);
 }
 
 test "bzip2 compress/decompress round-trip (raw bytes)" {
