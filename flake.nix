@@ -39,7 +39,12 @@
           buildInputs = with pkgs; [
             zig
             hyperfine
+            libjxl
           ];
+          shellHook = ''
+            export JXL_INCLUDE_PATH="${pkgs.libjxl.dev}/include"
+            export JXL_LIB_PATH="${pkgs.libjxl}/lib"
+          '';
         };
 
         packages.default = pkgs.stdenv.mkDerivation {
@@ -50,6 +55,7 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
+          buildInputs = [ pkgs.libjxl ];
           dontConfigure = true;
           dontInstall = true;
           dontFixup = true;
@@ -59,7 +65,9 @@
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
             chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            zig build --prefix $out -Doptimize=ReleaseFast
+            zig build --prefix $out -Doptimize=ReleaseFast \
+              -Djxl-include-path=${pkgs.libjxl.dev}/include \
+              -Djxl-lib-path=${pkgs.libjxl}/lib
           '';
         };
 
@@ -72,6 +80,7 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
+          buildInputs = [ pkgs.libjxl ];
           dontConfigure = true;
           dontFixup = true;
           buildPhase = ''
@@ -80,7 +89,10 @@
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
             chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            timeout 600 zig build test || { echo "Tests failed"; exit 1; }
+            timeout 600 zig build test \
+              -Djxl-include-path=${pkgs.libjxl.dev}/include \
+              -Djxl-lib-path=${pkgs.libjxl}/lib \
+              || { echo "Tests failed"; exit 1; }
           '';
           installPhase = ''
             mkdir -p $out

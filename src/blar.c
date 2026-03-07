@@ -208,6 +208,8 @@ static bool expand_zip_container(entry_list_t *el,
     dir_entry.container_type = "zip";
     dir_entry.container_type_len = 3;
     dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
     memset(dir_entry.xh64, 0, 8);
 
     if (!entry_list_add(el, dir_entry)) return false;
@@ -257,6 +259,8 @@ static bool expand_zip_container(entry_list_t *el,
             nested_dir.container_type = NULL;
             nested_dir.container_type_len = 0;
             nested_dir.zip_compression_method = 0xFFFF;
+            nested_dir.pdf_stream_offset = UINT64_MAX;
+            nested_dir.pdf_stream_length = UINT64_MAX;
             memset(nested_dir.xh64, 0, 8);
             if (!entry_list_add(el, nested_dir)) return false;
         } else {
@@ -289,6 +293,8 @@ static bool expand_zip_container(entry_list_t *el,
             file_ent.is_dir = 0;
             file_ent.mtime_ns = entry_mtime_ns;
             file_ent.zip_compression_method = comp_method;
+            file_ent.pdf_stream_offset = UINT64_MAX;
+            file_ent.pdf_stream_length = UINT64_MAX;
             file_ent.container_type = NULL;
             file_ent.container_type_len = 0;
             memset(file_ent.xh64, 0, 8);
@@ -298,6 +304,388 @@ static bool expand_zip_container(entry_list_t *el,
         }
     }
 
+    return true;
+}
+
+/* Expand a PDF file by extracting JPEG streams as JXL files.
+ * Returns true on success, false on failure (caller should fall back to opaque). */
+static bool expand_pdf_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    /* Count JPEG streams */
+    uint64_t jpeg_count = 0;
+    if (blip_pdf_jpeg_count(content, content_len, &jpeg_count) != BLIP_OK)
+        return false;
+    if (jpeg_count == 0) return false; /* no benefit to expansion */
+
+    /* Gather stream info */
+    uint64_t *offsets = calloc(jpeg_count, sizeof(uint64_t));
+    uint64_t *lengths = calloc(jpeg_count, sizeof(uint64_t));
+    uint32_t *obj_nums = calloc(jpeg_count, sizeof(uint32_t));
+    uint32_t *gen_nums = calloc(jpeg_count, sizeof(uint32_t));
+    if (!offsets || !lengths || !obj_nums || !gen_nums) {
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        return false;
+    }
+
+    for (uint64_t i = 0; i < jpeg_count; i++) {
+        if (blip_pdf_jpeg_info(content, content_len, i,
+                &offsets[i], &lengths[i], &obj_nums[i], &gen_nums[i]) != BLIP_OK) {
+            free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+            return false;
+        }
+    }
+
+    /* Transcode each JPEG to JXL; track which succeeded */
+    uint8_t **jxl_bufs = calloc(jpeg_count, sizeof(uint8_t *));
+    size_t *jxl_lens = calloc(jpeg_count, sizeof(size_t));
+    if (!jxl_bufs || !jxl_lens) {
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        return false;
+    }
+
+    size_t success_count = 0;
+    for (uint64_t i = 0; i < jpeg_count; i++) {
+        uint8_t *jxl_data = NULL;
+        size_t jxl_len = 0;
+        if (blip_jxl_from_jpeg(content + offsets[i], (size_t)lengths[i],
+                               &jxl_data, &jxl_len) == BLIP_OK) {
+            jxl_bufs[i] = jxl_data;
+            jxl_lens[i] = jxl_len;
+            success_count++;
+        }
+    }
+
+    if (success_count == 0) {
+        /* All transcodes failed — no benefit */
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        return false;
+    }
+
+    /* Build shell: only zero out streams that were successfully transcoded */
+    uint64_t *shell_offsets = calloc(success_count, sizeof(uint64_t));
+    uint64_t *shell_lengths = calloc(success_count, sizeof(uint64_t));
+    if (!shell_offsets || !shell_lengths) {
+        for (uint64_t i = 0; i < jpeg_count; i++)
+            if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        free(shell_offsets); free(shell_lengths);
+        return false;
+    }
+    size_t si = 0;
+    for (uint64_t i = 0; i < jpeg_count; i++) {
+        if (jxl_bufs[i]) {
+            shell_offsets[si] = offsets[i];
+            shell_lengths[si] = lengths[i];
+            si++;
+        }
+    }
+
+    uint8_t *shell = NULL;
+    size_t shell_len = 0;
+    int32_t rc = blip_pdf_create_shell(content, content_len,
+        shell_offsets, shell_lengths, success_count, &shell, &shell_len);
+    free(shell_offsets); free(shell_lengths);
+
+    if (rc != BLIP_OK) {
+        for (uint64_t i = 0; i < jpeg_count; i++)
+            if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        return false;
+    }
+
+    /* Copy shell to malloc'd buffer */
+    uint8_t *shell_owned = malloc(shell_len);
+    if (!shell_owned) {
+        blip_free(shell, shell_len);
+        for (uint64_t i = 0; i < jpeg_count; i++)
+            if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        return false;
+    }
+    memcpy(shell_owned, shell, shell_len);
+    blip_free(shell, shell_len);
+
+    if (!entry_list_add_content(el, shell_owned)) {
+        free(shell_owned);
+        for (uint64_t i = 0; i < jpeg_count; i++)
+            if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
+        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        free(jxl_bufs); free(jxl_lens);
+        return false;
+    }
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "pdf";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) goto fail;
+
+    /* Add __body__ FILE entry (the shell) */
+    {
+        size_t body_path_len = file_entry->path_len + strlen("/__body__");
+        char *body_path = malloc(body_path_len + 1);
+        if (!body_path) goto fail;
+        memcpy(body_path, file_entry->path, file_entry->path_len);
+        memcpy(body_path + file_entry->path_len, "/__body__", strlen("/__body__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)body_path)) {
+            free(body_path);
+            goto fail;
+        }
+
+        blip_archive_entry body_ent;
+        memset(&body_ent, 0, sizeof(body_ent));
+        body_ent.path = body_path;
+        body_ent.path_len = body_path_len;
+        body_ent.content = shell_owned;
+        body_ent.content_len = shell_len;
+        body_ent.is_dir = 0;
+        body_ent.mode = file_entry->mode;
+        body_ent.mtime_ns = file_entry->mtime_ns;
+        body_ent.zip_compression_method = 0xFFFF;
+        body_ent.pdf_stream_offset = UINT64_MAX;
+        body_ent.pdf_stream_length = UINT64_MAX;
+        memset(body_ent.xh64, 0, 8);
+        if (!entry_list_add(el, body_ent)) goto fail;
+    }
+
+    /* Add JXL image FILE entries */
+    for (uint64_t i = 0; i < jpeg_count; i++) {
+        if (!jxl_bufs[i]) continue;
+
+        /* Copy JXL data to malloc'd buffer */
+        uint8_t *jxl_owned = malloc(jxl_lens[i]);
+        if (!jxl_owned) goto fail;
+        memcpy(jxl_owned, jxl_bufs[i], jxl_lens[i]);
+        blip_free(jxl_bufs[i], jxl_lens[i]);
+        jxl_bufs[i] = NULL;
+
+        if (!entry_list_add_content(el, jxl_owned)) {
+            free(jxl_owned);
+            goto fail;
+        }
+
+        /* Build path: {pdf_path}/__img_{obj}_{gen}.jxl */
+        char img_name[64];
+        snprintf(img_name, sizeof(img_name), "/__img_%u_%u.jxl",
+                 (unsigned)obj_nums[i], (unsigned)gen_nums[i]);
+        size_t img_path_len = file_entry->path_len + strlen(img_name);
+        char *img_path = malloc(img_path_len + 1);
+        if (!img_path) goto fail;
+        memcpy(img_path, file_entry->path, file_entry->path_len);
+        memcpy(img_path + file_entry->path_len, img_name, strlen(img_name) + 1);
+        if (!entry_list_add_content(el, (uint8_t *)img_path)) {
+            free(img_path);
+            goto fail;
+        }
+
+        blip_archive_entry img_ent;
+        memset(&img_ent, 0, sizeof(img_ent));
+        img_ent.path = img_path;
+        img_ent.path_len = img_path_len;
+        img_ent.content = jxl_owned;
+        img_ent.content_len = jxl_lens[i];
+        img_ent.is_dir = 0;
+        img_ent.mode = file_entry->mode;
+        img_ent.mtime_ns = file_entry->mtime_ns;
+        img_ent.zip_compression_method = 0xFFFF;
+        img_ent.pdf_stream_offset = offsets[i];
+        img_ent.pdf_stream_length = lengths[i];
+        img_ent.jxl_source_format = "jpeg";
+        img_ent.jxl_source_format_len = 4;
+        memset(img_ent.xh64, 0, 8);
+        if (!entry_list_add(el, img_ent)) goto fail;
+
+        el->bytes_seen += jxl_lens[i];
+    }
+
+    free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+    free(jxl_bufs); free(jxl_lens);
+    return true;
+
+fail:
+    for (uint64_t i = 0; i < jpeg_count; i++)
+        if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
+    free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+    free(jxl_bufs); free(jxl_lens);
+    return false;
+}
+
+/* Expand a PNG file by decomposing into JXL lossless pixels + metadata.
+ * Returns true on success, false on failure (caller should fall back to opaque). */
+static bool expand_png_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    /* Skip tiny PNGs — overhead not worth it */
+    if (content_len < 1024) return false;
+
+    /* Parse PNG into pixels + metadata */
+    uint8_t *pixels = NULL;
+    size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_png_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    /* Encode pixels to JXL lossless */
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    /* Size check: if JXL+meta >= 90% of original, not worth expanding */
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    /* Copy JXL data to malloc'd buffer */
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    /* Copy meta to malloc'd buffer */
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) {
+        free(jxl_owned);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, jxl_owned) ||
+        !entry_list_add_content(el, meta_owned)) {
+        return false;
+    }
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "png";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* Add __meta__ FILE entry */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) return false;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) {
+            free(meta_path);
+            return false;
+        }
+
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path;
+        meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta_owned;
+        meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0;
+        meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX;
+        meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) return false;
+    }
+
+    /* Add __pixels__.jxl FILE entry */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__pixels__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__pixels__.jxl", strlen("/__pixels__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path)) {
+            free(jxl_path);
+            return false;
+        }
+
+        blip_archive_entry jxl_ent;
+        memset(&jxl_ent, 0, sizeof(jxl_ent));
+        jxl_ent.path = jxl_path;
+        jxl_ent.path_len = jxl_path_len;
+        jxl_ent.content = jxl_owned;
+        jxl_ent.content_len = jxl_len;
+        jxl_ent.is_dir = 0;
+        jxl_ent.mode = file_entry->mode;
+        jxl_ent.mtime_ns = file_entry->mtime_ns;
+        jxl_ent.zip_compression_method = 0xFFFF;
+        jxl_ent.pdf_stream_offset = UINT64_MAX;
+        jxl_ent.pdf_stream_length = UINT64_MAX;
+        jxl_ent.jxl_source_format = "png";
+        jxl_ent.jxl_source_format_len = 3;
+        memset(jxl_ent.xh64, 0, 8);
+        if (!entry_list_add(el, jxl_ent)) return false;
+    }
+
+    el->bytes_seen += jxl_len + meta_len;
     return true;
 }
 
@@ -438,6 +826,38 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
             (el->expand_all_zips || !is_archive_extension(path))) {
             if (expand_zip_container(el, content, content_len, &entry)) {
                 /* Register xattr buffers for cleanup (used by container DIR) */
+                if (xa) entry_list_add_content(el, (uint8_t *)xa);
+                for (size_t xi = 0; xi < xa_count; xi++) {
+                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+                }
+                if (rfork) entry_list_add_content(el, rfork);
+                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
+                return true; /* expanded successfully, skip opaque file entry */
+            }
+            /* Expansion failed — fall through to add as opaque file */
+        }
+
+        /* Try to expand PDF containers when -z is active */
+        if (el->expand_containers && content_len >= 5 &&
+            blip_is_pdf(content, content_len)) {
+            if (expand_pdf_container(el, content, content_len, &entry)) {
+                if (xa) entry_list_add_content(el, (uint8_t *)xa);
+                for (size_t xi = 0; xi < xa_count; xi++) {
+                    if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+                    if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+                }
+                if (rfork) entry_list_add_content(el, rfork);
+                if (el->progress) progrez_update(el->progress, el->count, el->bytes_seen);
+                return true; /* expanded successfully, skip opaque file entry */
+            }
+            /* Expansion failed — fall through to add as opaque file */
+        }
+
+        /* Try to expand PNG containers when -z is active */
+        if (el->expand_containers && content_len >= 8 &&
+            blip_is_png(content, content_len)) {
+            if (expand_png_container(el, content, content_len, &entry)) {
                 if (xa) entry_list_add_content(el, (uint8_t *)xa);
                 for (size_t xi = 0; xi < xa_count; xi++) {
                     if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
@@ -1029,7 +1449,12 @@ static int cmd_list(int argc, char **argv) {
             size_t co_type_len = 0;
             if (blip_archive_entry_container_type(buf, buf_len, i,
                     &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
-                type_char = 'z';
+                if (co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0)
+                    type_char = 'p';
+                else if (co_type_len == 3 && memcmp(co_type, "png", 3) == 0)
+                    type_char = 'n';
+                else
+                    type_char = 'z';
             }
         }
 
@@ -1374,7 +1799,7 @@ static int cmd_extract(int argc, char **argv) {
         if (progress) progrez_update(progress, files_done, bytes_done);
     }
 
-    /* Third pass: re-assemble container DIRs as zip files */
+    /* Third pass: re-assemble container DIRs */
     for (size_t ci = 0; ci < container_count; ci++) {
         uint64_t co_idx = container_indices[ci];
         const char *co_path = NULL;
@@ -1387,7 +1812,351 @@ static int cmd_extract(int argc, char **argv) {
             continue;
         }
 
-        /* Collect child entries belonging to this container */
+        /* Detect container type */
+        const char *co_type = NULL;
+        size_t co_type_len = 0;
+        blip_archive_entry_container_type(buf, buf_len, co_idx, &co_type, &co_type_len);
+
+        /* PDF container re-assembly */
+        if (co_type && co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0) {
+            /* Find __body__ child → read shell */
+            uint8_t *shell_data = NULL;
+            size_t shell_len = 0;
+            bool found_body = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                /* Check: {co_path}/__body__ */
+                if (j_path_len == co_path_len + 9 &&
+                    memcmp(j_path, co_path, co_path_len) == 0 &&
+                    memcmp(j_path + co_path_len, "/__body__", 9) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &shell_data, &shell_len);
+                    if (rc == BLIP_OK) found_body = true;
+                    break;
+                }
+            }
+
+            if (!found_body) {
+                fprintf(stderr, "\033[31mERROR: PDF container '%.*s': no __body__ found\033[0m\n",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            /* Copy shell to mutable malloc'd buffer */
+            uint8_t *pdf_buf = malloc(shell_len);
+            if (!pdf_buf) {
+                blip_free_content(shell_data, shell_len);
+                failed++;
+                continue;
+            }
+            memcpy(pdf_buf, shell_data, shell_len);
+            blip_free_content(shell_data, shell_len);
+
+            /* For each __img_*.jxl child: decode JXL→JPEG, splice into shell */
+            bool pdf_ok = true;
+            for (uint64_t j = 0; j < count && pdf_ok; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                /* Check: child of co_path, starts with __img_, ends with .jxl */
+                if (j_path_len <= co_path_len + 1 ||
+                    memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/')
+                    continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len < 10 || memcmp(inner, "__img_", 6) != 0)
+                    continue;
+                if (inner_len < 5 || memcmp(inner + inner_len - 4, ".jxl", 4) != 0)
+                    continue;
+
+                /* Read po (offset) and pl (length) metadata */
+                uint64_t po = UINT64_MAX, pl = UINT64_MAX;
+                blip_archive_entry_pdf_offset(buf, buf_len, j, &po);
+                blip_archive_entry_pdf_length(buf, buf_len, j, &pl);
+                if (po == UINT64_MAX || pl == UINT64_MAX) {
+                    fprintf(stderr, "\033[31mERROR: PDF container '%.*s': image '%.*s' missing po/pl metadata\033[0m\n",
+                            (int)co_path_len, co_path, (int)inner_len, inner);
+                    pdf_ok = false;
+                    break;
+                }
+
+                /* Read JXL content */
+                uint8_t *jxl_data = NULL;
+                size_t jxl_len = 0;
+                rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_len);
+                if (rc != BLIP_OK) {
+                    fprintf(stderr, "\033[31mERROR: PDF container '%.*s': cannot read '%.*s': %s\033[0m\n",
+                            (int)co_path_len, co_path, (int)inner_len, inner, blip_error_string(rc));
+                    pdf_ok = false;
+                    break;
+                }
+
+                /* Decode JXL → JPEG */
+                uint8_t *jpeg_data = NULL;
+                size_t jpeg_len = 0;
+                rc = blip_jxl_to_jpeg(jxl_data, jxl_len, &jpeg_data, &jpeg_len);
+                blip_free_content(jxl_data, jxl_len);
+                if (rc != BLIP_OK) {
+                    fprintf(stderr, "\033[31mERROR: PDF container '%.*s': JXL decode failed for '%.*s'\033[0m\n",
+                            (int)co_path_len, co_path, (int)inner_len, inner);
+                    pdf_ok = false;
+                    break;
+                }
+
+                /* Verify length matches */
+                if (jpeg_len != pl) {
+                    fprintf(stderr, "\033[31mERROR: PDF container '%.*s': JPEG length mismatch for '%.*s': "
+                            "expected %llu, got %zu\033[0m\n",
+                            (int)co_path_len, co_path, (int)inner_len, inner,
+                            (unsigned long long)pl, jpeg_len);
+                    blip_free(jpeg_data, jpeg_len);
+                    pdf_ok = false;
+                    break;
+                }
+
+                /* Splice JPEG data into shell at offset po */
+                if (po + pl > shell_len) {
+                    fprintf(stderr, "\033[31mERROR: PDF container '%.*s': offset+length exceeds shell for '%.*s'\033[0m\n",
+                            (int)co_path_len, co_path, (int)inner_len, inner);
+                    blip_free(jpeg_data, jpeg_len);
+                    pdf_ok = false;
+                    break;
+                }
+                memcpy(pdf_buf + po, jpeg_data, jpeg_len);
+                blip_free(jpeg_data, jpeg_len);
+            }
+
+            if (!pdf_ok) {
+                free(pdf_buf);
+                failed++;
+                continue;
+            }
+
+            /* Write the reconstructed PDF */
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    free(pdf_buf);
+                    failed++;
+                    continue;
+                }
+            } else {
+                if (co_path_len >= sizeof(out_path)) {
+                    free(pdf_buf);
+                    failed++;
+                    continue;
+                }
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path)) {
+                fprintf(stderr, "\033[31mERROR: PDF container '%.*s': cannot create parent dir: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                free(pdf_buf);
+                failed++;
+                continue;
+            }
+
+            if (!write_file(out_path, pdf_buf, shell_len)) {
+                fprintf(stderr, "\033[31mERROR: PDF container '%.*s': cannot write: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                free(pdf_buf);
+                failed++;
+                continue;
+            }
+            free(pdf_buf);
+
+            /* Restore metadata */
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = (time_t)(co_mtime_ns / 1000000000LL);
+                times[1].tv_nsec = (long)(co_mtime_ns % 1000000000LL);
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress) progrez_update(progress, files_done, bytes_done);
+            continue;
+        }
+
+        /* PNG container re-assembly */
+        if (co_type && co_type_len == 3 && memcmp(co_type, "png", 3) == 0) {
+            /* Find __meta__ and __pixels__.jxl children */
+            uint8_t *meta_data = NULL;
+            size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL;
+            size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len <= co_path_len + 1 ||
+                    memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/')
+                    continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+
+            if (!found_meta || !found_pixels) {
+                fprintf(stderr, "\033[31mERROR: PNG container '%.*s': missing %s%s%s\033[0m\n",
+                        (int)co_path_len, co_path,
+                        found_meta ? "" : "__meta__",
+                        (!found_meta && !found_pixels) ? " and " : "",
+                        found_pixels ? "" : "__pixels__.jxl");
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Decode JXL → raw pixels */
+            uint8_t *pixels = NULL;
+            size_t pixels_len = 0;
+            uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len,
+                    &pixels, &pixels_len, &width, &height,
+                    &num_channels, &bits_per_sample);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "\033[31mERROR: PNG container '%.*s': JXL decode failed\033[0m\n",
+                        (int)co_path_len, co_path);
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Re-encode pixels + metadata → PNG */
+            uint8_t *png_data = NULL;
+            size_t png_len = 0;
+            rc = blip_png_encode(pixels, pixels_len,
+                    width, height, num_channels, bits_per_sample,
+                    meta_data, meta_data_len,
+                    &png_data, &png_len);
+            blip_free(pixels, pixels_len);
+            blip_free_content(meta_data, meta_data_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "\033[31mERROR: PNG container '%.*s': PNG encode failed\033[0m\n",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            /* Write the reconstructed PNG */
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    blip_free(png_data, png_len);
+                    failed++;
+                    continue;
+                }
+            } else {
+                if (co_path_len >= sizeof(out_path)) {
+                    blip_free(png_data, png_len);
+                    failed++;
+                    continue;
+                }
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path)) {
+                fprintf(stderr, "\033[31mERROR: PNG container '%.*s': cannot create parent dir: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(png_data, png_len);
+                failed++;
+                continue;
+            }
+
+            if (!write_file(out_path, png_data, png_len)) {
+                fprintf(stderr, "\033[31mERROR: PNG container '%.*s': cannot write: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(png_data, png_len);
+                failed++;
+                continue;
+            }
+            blip_free(png_data, png_len);
+
+            /* Restore metadata */
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            /* Restore xattrs */
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress) progrez_update(progress, files_done, bytes_done);
+            continue;
+        }
+
+        /* ZIP container re-assembly — collect child entries */
         size_t child_cap = 32;
         size_t child_count = 0;
         blip_zip_write_entry *zip_entries = malloc(child_cap * sizeof(blip_zip_write_entry));
@@ -1872,6 +2641,22 @@ static int cmd_info(int argc, char **argv) {
                         &zc_method) == BLIP_OK && zc_method != 0xFFFF) {
                     printf(", \"zip_compression_method\": %u", (unsigned)zc_method);
                 }
+                uint64_t po_val = UINT64_MAX;
+                if (blip_archive_entry_pdf_offset(buf, buf_len, i,
+                        &po_val) == BLIP_OK && po_val != UINT64_MAX) {
+                    printf(", \"pdf_stream_offset\": %llu", (unsigned long long)po_val);
+                }
+                uint64_t pl_val = UINT64_MAX;
+                if (blip_archive_entry_pdf_length(buf, buf_len, i,
+                        &pl_val) == BLIP_OK && pl_val != UINT64_MAX) {
+                    printf(", \"pdf_stream_length\": %llu", (unsigned long long)pl_val);
+                }
+                const char *jx_fmt = NULL;
+                size_t jx_fmt_len = 0;
+                if (blip_archive_entry_jxl_source(buf, buf_len, i,
+                        &jx_fmt, &jx_fmt_len) == BLIP_OK && jx_fmt != NULL) {
+                    printf(", \"jxl_source_format\": \"%.*s\"", (int)jx_fmt_len, jx_fmt);
+                }
             }
 
             printf("}%s\n", (i + 1 < count) ? "," : "");
@@ -1915,7 +2700,12 @@ static int cmd_info(int argc, char **argv) {
             size_t co_type_len = 0;
             if (blip_archive_entry_container_type(buf, buf_len, i,
                     &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
-                type_char = 'z';
+                if (co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0)
+                    type_char = 'p';
+                else if (co_type_len == 3 && memcmp(co_type, "png", 3) == 0)
+                    type_char = 'n';
+                else
+                    type_char = 'z';
             }
         }
 

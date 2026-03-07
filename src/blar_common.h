@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -331,6 +332,9 @@ static void fill_entry_metadata(blip_archive_entry *entry, const struct stat *st
     entry->birthtime_ns = get_birthtime_ns(st);
     entry->uid = (uint32_t)st->st_uid;
     entry->gid = (uint32_t)st->st_gid;
+    entry->zip_compression_method = 0xFFFF;
+    entry->pdf_stream_offset = UINT64_MAX;
+    entry->pdf_stream_length = UINT64_MAX;
 
     const char *owner = get_owner_name(st->st_uid);
     if (owner) {

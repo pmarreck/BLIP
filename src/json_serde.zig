@@ -264,6 +264,18 @@ pub fn archiveToJson(allocator: Allocator, buf: []const u8) JsonSerdeError![]u8 
                     try out.appendSlice(allocator, ",\n      \"compression_method\": ");
                     try writeJsonInt(allocator, &out, u16, zc);
                 }
+                if (f.pdf_stream_offset) |po| {
+                    try out.appendSlice(allocator, ",\n      \"pdf_stream_offset\": ");
+                    try writeJsonInt(allocator, &out, u64, po);
+                }
+                if (f.pdf_stream_length) |pl| {
+                    try out.appendSlice(allocator, ",\n      \"pdf_stream_length\": ");
+                    try writeJsonInt(allocator, &out, u64, pl);
+                }
+                if (f.jxl_source_format.len > 0) {
+                    try out.appendSlice(allocator, ",\n      \"jxl_source_format\": ");
+                    try writeJsonString(allocator, &out, f.jxl_source_format);
+                }
             },
             .dir => |d| {
                 try out.appendSlice(allocator, "\n      \"type\": \"dir\"");
@@ -429,6 +441,22 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                 break :blk if (cm > 0) @intCast(cm) else null;
             };
 
+            // Parse PDF/JXL metadata (optional)
+            const pdf_stream_offset: ?u64 = blk: {
+                const v = getJsonU64(obj, "pdf_stream_offset");
+                break :blk if (v > 0) v else null;
+            };
+            const pdf_stream_length: ?u64 = blk: {
+                const v = getJsonU64(obj, "pdf_stream_length");
+                break :blk if (v > 0) v else null;
+            };
+            const jxl_source_format_str = getJsonString(obj, "jxl_source_format") orelse "";
+            const jxl_source_format: []const u8 = if (jxl_source_format_str.len > 0) blk: {
+                const jsf = allocator.dupe(u8, jxl_source_format_str) catch return error.OutOfMemory;
+                allocated_strings.append(allocator, jsf) catch return error.OutOfMemory;
+                break :blk jsf;
+            } else &.{};
+
             archive_entries[i] = .{
                 .file = .{
                     .path = path,
@@ -444,6 +472,9 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                     .xattrs = xattrs,
                     .resource_fork = resource_fork,
                     .zip_compression_method = compression_method,
+                    .pdf_stream_offset = pdf_stream_offset,
+                    .pdf_stream_length = pdf_stream_length,
+                    .jxl_source_format = jxl_source_format,
                 },
             };
         } else if (std.mem.eql(u8, type_str, "dir")) {
@@ -499,6 +530,15 @@ fn getJsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
     if (val == .integer) {
         const i = val.integer;
         if (i >= 0 and i <= std.math.maxInt(u32)) return @intCast(i);
+    }
+    return 0;
+}
+
+fn getJsonU64(obj: std.json.ObjectMap, key: []const u8) u64 {
+    const val = obj.get(key) orelse return 0;
+    if (val == .integer) {
+        const i = val.integer;
+        if (i >= 0) return @intCast(i);
     }
     return 0;
 }

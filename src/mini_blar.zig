@@ -30,6 +30,9 @@ pub const FileEntry = struct {
     xattrs: []const XattrEntry = &.{}, // extended attributes
     resource_fork: []const u8 = &.{}, // resource fork data (macOS)
     zip_compression_method: ?u16 = null, // original zip method for re-zipping (0=store, 8=deflate)
+    pdf_stream_offset: ?u64 = null, // "po" — byte offset of JPEG stream in PDF body
+    pdf_stream_length: ?u64 = null, // "pl" — original JPEG stream data length
+    jxl_source_format: []const u8 = &.{}, // "jx" — source format (e.g. "jpeg")
 };
 
 /// An xattr key-value pair.
@@ -109,7 +112,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
     // --- Element 0: metadata DICT ---
     // Build metadata key-value pairs with 2-char keys in canonical order:
     // bt < ct < gi < gn < md < mt < pa < ui < un < zc
-    var meta_pairs_buf: [10]dict_mod.KeyValue = undefined;
+    var meta_pairs_buf: [13]dict_mod.KeyValue = undefined;
     var meta_count: usize = 0;
 
     // bt (birthtime)
@@ -158,6 +161,16 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         meta_count += 1;
     }
 
+    // jx (jxl source format)
+    if (file.jxl_source_format.len > 0) {
+        const key = try leaf.serializeUtf8(allocator, "jx");
+        try to_free.append(allocator, key);
+        const val = try leaf.serializeUtf8(allocator, file.jxl_source_format);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
     // md (mode) — required
     {
         const key = try leaf.serializeUtf8(allocator, "md");
@@ -187,6 +200,30 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
         const key = try leaf.serializeUtf8(allocator, "pa");
         try to_free.append(allocator, key);
         const val = try leaf.serializeUtf8(allocator, file.path);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // pl (pdf stream length)
+    if (file.pdf_stream_length) |pl| {
+        const key = try leaf.serializeUtf8(allocator, "pl");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, pl, .little);
+        const val = try leaf.serializeData(allocator, &bytes);
+        try to_free.append(allocator, val);
+        meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
+        meta_count += 1;
+    }
+
+    // po (pdf stream offset)
+    if (file.pdf_stream_offset) |po| {
+        const key = try leaf.serializeUtf8(allocator, "po");
+        try to_free.append(allocator, key);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, po, .little);
+        const val = try leaf.serializeData(allocator, &bytes);
         try to_free.append(allocator, val);
         meta_pairs_buf[meta_count] = .{ .key = key, .value = val };
         meta_count += 1;

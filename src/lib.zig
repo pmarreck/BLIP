@@ -212,6 +212,10 @@ const CArchiveEntry = extern struct {
     container_type: ?[*]const u8, // "zip" etc., NULL = normal dir
     container_type_len: usize, // 0 = not a container
     zip_compression_method: u16, // original zip method (0=store, 8=deflate), 0xFFFF = not set
+    pdf_stream_offset: u64, // byte offset of JPEG stream in PDF body, 0xFFFFFFFFFFFFFFFF = not set
+    pdf_stream_length: u64, // original JPEG stream data length, 0xFFFFFFFFFFFFFFFF = not set
+    jxl_source_format: ?[*]const u8, // source format (e.g. "jpeg"), NULL = not set
+    jxl_source_format_len: usize, // 0 = not set
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -337,12 +341,14 @@ export fn blip_archive_create_full(
                     .xattrs = xattr_slice,
                     .resource_fork = rfork,
                     .zip_compression_method = if (e.zip_compression_method == 0xFFFF) null else e.zip_compression_method,
+                    .pdf_stream_offset = if (e.pdf_stream_offset == 0xFFFFFFFFFFFFFFFF) null else e.pdf_stream_offset,
+                    .pdf_stream_length = if (e.pdf_stream_length == 0xFFFFFFFFFFFFFFFF) null else e.pdf_stream_length,
+                    .jxl_source_format = if (e.jxl_source_format) |p| p[0..e.jxl_source_format_len] else &.{},
                 },
             };
         }
     }
 
-    // Convert per_file_comp_algo: 0=none, 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
     // Convert per_file_comp_algo: 0=none, 1=lzma2, 2=bzip2, 3=lz4, 4=zstd
     const CompressionId_ = mini_blar.container_mod.CompressionId;
     const comp_id: ?CompressionId_ = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompressionId_, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
@@ -1440,6 +1446,324 @@ export fn blip_archive_entry_zip_comp(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// PDF container FFI exports
+// ---------------------------------------------------------------------------
+
+const pdf_mod = blip.pdf_mod;
+const jxl_mod = blip.jxl_mod;
+const png_mod = blip.png_mod;
+
+/// Check if buffer starts with PDF magic bytes (%PDF-).
+export fn blip_is_pdf(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return pdf_mod.isPdfMagic(buf[0..buf_len]);
+}
+
+/// Count JPEG streams in a PDF buffer.
+export fn blip_pdf_jpeg_count(buf: [*]const u8, buf_len: usize, out_count: *u64) callconv(.c) i32 {
+    const streams = pdf_mod.findJpegStreams(page_allocator, buf[0..buf_len]) catch return -37;
+    defer page_allocator.free(streams);
+    out_count.* = streams.len;
+    return 0;
+}
+
+/// Get info about a specific JPEG stream in a PDF by index.
+export fn blip_pdf_jpeg_info(
+    buf: [*]const u8,
+    buf_len: usize,
+    idx: u64,
+    out_offset: *u64,
+    out_length: *u64,
+    out_obj_num: *u32,
+    out_gen_num: *u32,
+) callconv(.c) i32 {
+    const streams = pdf_mod.findJpegStreams(page_allocator, buf[0..buf_len]) catch return -37;
+    defer page_allocator.free(streams);
+    if (idx >= streams.len) return -8;
+    const s = streams[@intCast(idx)];
+    out_offset.* = s.stream_start;
+    out_length.* = s.len();
+    out_obj_num.* = s.object_num;
+    out_gen_num.* = s.gen_num;
+    return 0;
+}
+
+/// Create a PDF shell by zeroing JPEG stream regions.
+export fn blip_pdf_create_shell(
+    buf: [*]const u8,
+    buf_len: usize,
+    offsets: [*]const u64,
+    lengths: [*]const u64,
+    stream_count: usize,
+    out_shell: *[*]u8,
+    out_shell_len: *usize,
+) callconv(.c) i32 {
+    // Build PdfJpegStream array from offsets/lengths
+    const streams = page_allocator.alloc(pdf_mod.PdfJpegStream, stream_count) catch return -13;
+    defer page_allocator.free(streams);
+    for (0..stream_count) |i| {
+        streams[i] = .{
+            .stream_start = @intCast(offsets[i]),
+            .stream_end = @intCast(offsets[i] + lengths[i]),
+            .object_num = 0,
+            .gen_num = 0,
+        };
+    }
+
+    const shell = pdf_mod.createPdfShell(page_allocator, buf[0..buf_len], streams) catch return -13;
+    out_shell.* = shell.ptr;
+    out_shell_len.* = shell.len;
+    return 0;
+}
+
+/// Losslessly transcode JPEG to JPEG XL.
+export fn blip_jxl_from_jpeg(
+    jpeg: [*]const u8,
+    jpeg_len: usize,
+    out_jxl: *[*]u8,
+    out_jxl_len: *usize,
+) callconv(.c) i32 {
+    const jxl_data = jxl_mod.jpegToJxl(page_allocator, jpeg[0..jpeg_len]) catch return -38;
+    out_jxl.* = jxl_data.ptr;
+    out_jxl_len.* = jxl_data.len;
+    return 0;
+}
+
+/// Losslessly transcode JPEG XL back to JPEG.
+export fn blip_jxl_to_jpeg(
+    jxl: [*]const u8,
+    jxl_len: usize,
+    out_jpeg: *[*]u8,
+    out_jpeg_len: *usize,
+) callconv(.c) i32 {
+    const jpeg_data = jxl_mod.jxlToJpeg(page_allocator, jxl[0..jxl_len]) catch return -39;
+    out_jpeg.* = jpeg_data.ptr;
+    out_jpeg_len.* = jpeg_data.len;
+    return 0;
+}
+
+/// Encode raw pixels to JXL lossless.
+export fn blip_jxl_from_pixels(
+    pixels: [*]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    num_channels: u32,
+    bits_per_sample: u32,
+    out_jxl: *[*]u8,
+    out_jxl_len: *usize,
+) callconv(.c) i32 {
+    const fmt = jxl_mod.PixelFormat{
+        .width = width,
+        .height = height,
+        .num_channels = num_channels,
+        .bits_per_sample = bits_per_sample,
+    };
+    const jxl_data = jxl_mod.pixelsToJxl(page_allocator, pixels[0..pixels_len], fmt) catch return -38;
+    out_jxl.* = jxl_data.ptr;
+    out_jxl_len.* = jxl_data.len;
+    return 0;
+}
+
+/// Decode JXL to raw pixels.
+export fn blip_jxl_to_pixels(
+    jxl: [*]const u8,
+    jxl_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+) callconv(.c) i32 {
+    var fmt: jxl_mod.PixelFormat = undefined;
+    const pixel_data = jxl_mod.jxlToPixels(page_allocator, jxl[0..jxl_len], &fmt) catch return -39;
+    out_pixels.* = pixel_data.ptr;
+    out_pixels_len.* = pixel_data.len;
+    out_width.* = fmt.width;
+    out_height.* = fmt.height;
+    out_num_channels.* = fmt.num_channels;
+    out_bits_per_sample.* = fmt.bits_per_sample;
+    return 0;
+}
+
+// --- PNG ---
+
+/// Check if buffer starts with PNG signature.
+export fn blip_is_png(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return png_mod.isPngMagic(buf[0..buf_len]);
+}
+
+/// Parse a PNG into raw pixels + metadata.
+/// meta = [u32_be head_len][pre_idat_bytes][post_idat_bytes]
+export fn blip_png_parse(
+    png: [*]const u8,
+    png_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    var parsed = png_mod.parsePng(page_allocator, png[0..png_len]) catch return -40;
+
+    // Build meta: [u32_be pre_idat.len][pre_idat][post_idat]
+    const meta_len = 4 + parsed.pre_idat.len + parsed.post_idat.len;
+    const meta = page_allocator.alloc(u8, meta_len) catch {
+        parsed.deinit();
+        return -13;
+    };
+    std.mem.writeInt(u32, meta[0..4], @intCast(parsed.pre_idat.len), .big);
+    @memcpy(meta[4..][0..parsed.pre_idat.len], parsed.pre_idat);
+    @memcpy(meta[4 + parsed.pre_idat.len ..][0..parsed.post_idat.len], parsed.post_idat);
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.info.width;
+    out_height.* = parsed.info.height;
+    out_num_channels.* = parsed.info.channels;
+    out_bits_per_sample.* = @as(u32, parsed.info.bit_depth);
+    out_meta.* = meta.ptr;
+    out_meta_len.* = meta.len;
+
+    // Free pre/post_idat (pixels ownership transfers to caller)
+    page_allocator.free(parsed.pre_idat);
+    page_allocator.free(parsed.post_idat);
+
+    return 0;
+}
+
+/// Encode raw pixels + metadata back to PNG.
+export fn blip_png_encode(
+    pixels: [*]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    num_channels: u32,
+    bits_per_sample: u32,
+    meta: [*]const u8,
+    meta_len: usize,
+    out_png: *[*]u8,
+    out_png_len: *usize,
+) callconv(.c) i32 {
+    if (meta_len < 4) return -40;
+    const meta_buf = meta[0..meta_len];
+    const head_len = std.mem.readInt(u32, meta_buf[0..4], .big);
+    if (4 + head_len > meta_len) return -40;
+    const pre_idat = meta_buf[4..][0..head_len];
+    const post_idat = meta_buf[4 + head_len ..];
+
+    const color_type: png_mod.PngColorType = switch (num_channels) {
+        1 => .grayscale,
+        2 => .grayscale_alpha,
+        3 => .rgb,
+        4 => .rgba,
+        else => return -40,
+    };
+
+    const info = png_mod.PngInfo{
+        .width = width,
+        .height = height,
+        .bit_depth = @intCast(bits_per_sample),
+        .color_type = color_type,
+        .channels = @intCast(num_channels),
+        .bytes_per_sample = if (bits_per_sample == 16) 2 else 1,
+        .interlace_method = 0,
+    };
+
+    const png_data = png_mod.encodePng(page_allocator, pixels[0..pixels_len], info, pre_idat, post_idat) catch return -40;
+    out_png.* = png_data.ptr;
+    out_png_len.* = png_data.len;
+    return 0;
+}
+
+/// Read pdf_stream_offset from a FILE entry in a BLIP archive.
+export fn blip_archive_entry_pdf_offset(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out: *u64,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const entry_type = reader.entryTypeAt(index) catch return -8;
+    if (entry_type != .file) {
+        out.* = 0xFFFFFFFFFFFFFFFF;
+        return 0;
+    }
+    const file_array = reader.fileArrayAt(index) catch return -1;
+    const meta_view = file_array.elementAt(0) catch return -1;
+    const meta_dict = dict_mod.DictReader.init(meta_view.buf[0..@intCast(meta_view.total_length)]) catch return -1;
+    const po_idx = (meta_dict.findKey("po") catch return -1) orelse {
+        out.* = 0xFFFFFFFFFFFFFFFF;
+        return 0;
+    };
+    const po_container = meta_dict.valueAt(po_idx) catch return -1;
+    const po_bytes = mini_blar.leaf.readData(po_container) catch return -1;
+    if (po_bytes.len != 8) return -1;
+    out.* = std.mem.readInt(u64, po_bytes[0..8], .little);
+    return 0;
+}
+
+/// Read pdf_stream_length from a FILE entry in a BLIP archive.
+export fn blip_archive_entry_pdf_length(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out: *u64,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const entry_type = reader.entryTypeAt(index) catch return -8;
+    if (entry_type != .file) {
+        out.* = 0xFFFFFFFFFFFFFFFF;
+        return 0;
+    }
+    const file_array = reader.fileArrayAt(index) catch return -1;
+    const meta_view = file_array.elementAt(0) catch return -1;
+    const meta_dict = dict_mod.DictReader.init(meta_view.buf[0..@intCast(meta_view.total_length)]) catch return -1;
+    const pl_idx = (meta_dict.findKey("pl") catch return -1) orelse {
+        out.* = 0xFFFFFFFFFFFFFFFF;
+        return 0;
+    };
+    const pl_container = meta_dict.valueAt(pl_idx) catch return -1;
+    const pl_bytes = mini_blar.leaf.readData(pl_container) catch return -1;
+    if (pl_bytes.len != 8) return -1;
+    out.* = std.mem.readInt(u64, pl_bytes[0..8], .little);
+    return 0;
+}
+
+/// Read jxl_source_format from a FILE entry in a BLIP archive.
+export fn blip_archive_entry_jxl_source(
+    buf: [*]const u8,
+    buf_len: usize,
+    index: u64,
+    out_fmt: *?[*]const u8,
+    out_fmt_len: *usize,
+) callconv(.c) i32 {
+    const reader = mini_blar.ArchiveReader.init(buf[0..buf_len]) catch return -1;
+    const entry_type = reader.entryTypeAt(index) catch return -8;
+    if (entry_type != .file) {
+        out_fmt.* = null;
+        out_fmt_len.* = 0;
+        return 0;
+    }
+    const file_array = reader.fileArrayAt(index) catch return -1;
+    const meta_view = file_array.elementAt(0) catch return -1;
+    const meta_dict = dict_mod.DictReader.init(meta_view.buf[0..@intCast(meta_view.total_length)]) catch return -1;
+    const jx_idx = (meta_dict.findKey("jx") catch return -1) orelse {
+        out_fmt.* = null;
+        out_fmt_len.* = 0;
+        return 0;
+    };
+    const jx_container = meta_dict.valueAt(jx_idx) catch return -1;
+    const jx_val = mini_blar.leaf.readUtf8(jx_container) catch return -1;
+    out_fmt.* = jx_val.ptr;
+    out_fmt_len.* = jx_val.len;
+    return 0;
+}
+
 fn zipErrorCode(err: anytype) i32 {
     return switch (err) {
         error.InvalidZip => -33,
@@ -1715,6 +2039,10 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .resource_fork = null, .resource_fork_len = 0,
             .container_type = null, .container_type_len = 0,
             .zip_compression_method = 0xFFFF,
+            .pdf_stream_offset = 0xFFFFFFFFFFFFFFFF,
+            .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
+            .jxl_source_format = null,
+            .jxl_source_format_len = 0,
         },
         .{
             .path = "mydir/file.txt", .path_len = 14,
@@ -1729,6 +2057,10 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .resource_fork = null, .resource_fork_len = 0,
             .container_type = null, .container_type_len = 0,
             .zip_compression_method = 0xFFFF,
+            .pdf_stream_offset = 0xFFFFFFFFFFFFFFFF,
+            .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
+            .jxl_source_format = null,
+            .jxl_source_format_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -1758,6 +2090,10 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .resource_fork = null, .resource_fork_len = 0,
             .container_type = null, .container_type_len = 0,
             .zip_compression_method = 0xFFFF,
+            .pdf_stream_offset = 0xFFFFFFFFFFFFFFFF,
+            .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
+            .jxl_source_format = null,
+            .jxl_source_format_len = 0,
         },
         .{
             .path = "bfile.txt", .path_len = 9,
@@ -1772,6 +2108,10 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .resource_fork = null, .resource_fork_len = 0,
             .container_type = null, .container_type_len = 0,
             .zip_compression_method = 0xFFFF,
+            .pdf_stream_offset = 0xFFFFFFFFFFFFFFFF,
+            .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
+            .jxl_source_format = null,
+            .jxl_source_format_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -1801,6 +2141,10 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
             .resource_fork = null, .resource_fork_len = 0,
             .container_type = null, .container_type_len = 0,
             .zip_compression_method = 0xFFFF,
+            .pdf_stream_offset = 0xFFFFFFFFFFFFFFFF,
+            .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
+            .jxl_source_format = null,
+            .jxl_source_format_len = 0,
         },
     };
     var out_buf: [*]u8 = undefined;

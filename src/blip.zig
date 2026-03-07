@@ -643,6 +643,9 @@ pub const lzma2_mod = @import("lzma2.zig");
 pub const compression_mod = @import("compression.zig");
 pub const encryption = @import("encryption.zig");
 pub const zip_mod = @import("zip.zig");
+pub const jxl_mod = @import("jxl.zig");
+pub const pdf_mod = @import("pdf.zig");
+pub const png_mod = @import("png.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -671,4 +674,7 @@ test {
     _ = @import("encryption.zig");
     _ = @import("checksum.zig");
     _ = @import("zip.zig");
+    _ = @import("jxl.zig");
+    _ = @import("pdf.zig");
+    _ = @import("png.zig");
 }

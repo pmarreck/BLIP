@@ -147,6 +147,10 @@ typedef struct {
     const char *container_type;       /* "zip" etc., NULL = normal dir */
     size_t container_type_len;        /* 0 = not a container */
     uint16_t zip_compression_method;  /* original zip method (0=store, 8=deflate), 0xFFFF = not set */
+    uint64_t pdf_stream_offset;       /* byte offset of JPEG stream in PDF body, UINT64_MAX = not set */
+    uint64_t pdf_stream_length;       /* original JPEG stream data length, UINT64_MAX = not set */
+    const char *jxl_source_format;    /* source format (e.g. "jpeg"), NULL = not set */
+    size_t jxl_source_format_len;     /* 0 = not set */
 } blip_archive_entry;
 
 /* Progress callback for archive creation.
@@ -320,6 +324,11 @@ int32_t blip_from_json(const uint8_t *json_buf, size_t json_len,
 #define BLIP_ERR_ZIP64             -35
 #define BLIP_ERR_ZIP_UNSUPPORTED   -36
 
+/* PDF/JXL errors */
+#define BLIP_ERR_INVALID_PDF       -37
+#define BLIP_ERR_JXL_ENCODE        -38
+#define BLIP_ERR_JXL_DECODE        -39
+
 /* Check if a buffer is a compressed LP container (has COMP attribute). */
 bool blip_is_compressed(const uint8_t *buf, size_t buf_len);
 
@@ -434,6 +443,88 @@ int32_t blip_archive_entry_container_type(const uint8_t *buf, size_t buf_len,
  * Sets out_method to 0xFFFF if not set. */
 int32_t blip_archive_entry_zip_comp(const uint8_t *buf, size_t buf_len,
     uint64_t index, uint16_t *out_method);
+
+/* --- PDF container operations --- */
+
+/* Check if buffer starts with PDF magic bytes (%PDF-). */
+bool blip_is_pdf(const uint8_t *buf, size_t buf_len);
+
+/* Count JPEG streams in a PDF buffer. */
+int32_t blip_pdf_jpeg_count(const uint8_t *buf, size_t buf_len, uint64_t *out_count);
+
+/* Get info about a specific JPEG stream in a PDF by index. */
+int32_t blip_pdf_jpeg_info(const uint8_t *buf, size_t buf_len, uint64_t idx,
+    uint64_t *out_offset, uint64_t *out_length, uint32_t *out_obj_num, uint32_t *out_gen_num);
+
+/* Create a PDF shell by zeroing JPEG stream regions.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_pdf_create_shell(const uint8_t *buf, size_t buf_len,
+    const uint64_t *offsets, const uint64_t *lengths, size_t stream_count,
+    uint8_t **out_shell, size_t *out_shell_len);
+
+/* --- JPEG XL operations --- */
+
+/* Losslessly transcode JPEG to JPEG XL.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_jxl_from_jpeg(const uint8_t *jpeg, size_t jpeg_len,
+    uint8_t **out_jxl, size_t *out_jxl_len);
+
+/* Losslessly transcode JPEG XL back to JPEG.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_jxl_to_jpeg(const uint8_t *jxl, size_t jxl_len,
+    uint8_t **out_jpeg, size_t *out_jpeg_len);
+
+/* Encode raw pixels to JXL lossless.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_jxl_from_pixels(const uint8_t *pixels, size_t pixels_len,
+    uint32_t width, uint32_t height, uint32_t num_channels, uint32_t bits_per_sample,
+    uint8_t **out_jxl, size_t *out_jxl_len);
+
+/* Decode JXL to raw pixels.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_jxl_to_pixels(const uint8_t *jxl, size_t jxl_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample);
+
+/* --- PNG operations --- */
+
+/* Check if buffer starts with PNG signature. */
+bool blip_is_png(const uint8_t *buf, size_t buf_len);
+
+/* Parse a PNG into raw pixels and metadata (pre/post IDAT chunks).
+ * Metadata format: [u32_be head_len][pre-IDAT bytes][post-IDAT bytes]
+ * Caller must free out_pixels and out_meta with blip_free(). */
+int32_t blip_png_parse(const uint8_t *png, size_t png_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* Encode raw pixels + metadata back to a PNG.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_png_encode(
+    const uint8_t *pixels, size_t pixels_len,
+    uint32_t width, uint32_t height, uint32_t num_channels, uint32_t bits_per_sample,
+    const uint8_t *meta, size_t meta_len,
+    uint8_t **out_png, size_t *out_png_len);
+
+#define BLIP_ERR_INVALID_PNG -40
+
+/* Read pdf_stream_offset from a FILE entry.
+ * Sets out to UINT64_MAX if not set. */
+int32_t blip_archive_entry_pdf_offset(const uint8_t *buf, size_t buf_len,
+    uint64_t index, uint64_t *out);
+
+/* Read pdf_stream_length from a FILE entry.
+ * Sets out to UINT64_MAX if not set. */
+int32_t blip_archive_entry_pdf_length(const uint8_t *buf, size_t buf_len,
+    uint64_t index, uint64_t *out);
+
+/* Read jxl_source_format from a FILE entry.
+ * Sets out_fmt to NULL if not set. */
+int32_t blip_archive_entry_jxl_source(const uint8_t *buf, size_t buf_len,
+    uint64_t index, const char **out_fmt, size_t *out_fmt_len);
 
 #ifdef __cplusplus
 }

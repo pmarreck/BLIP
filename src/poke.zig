@@ -199,6 +199,31 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
         }
     }
 
+    // Read jxl source format (jx)
+    if (try meta_reader.findKey("jx")) |jx_idx| {
+        const jx_container = try meta_reader.valueAt(jx_idx);
+        const jx_val = try leaf.readUtf8(jx_container);
+        entry.jxl_source_format = try allocator.dupe(u8, jx_val);
+    }
+
+    // Read pdf stream length (pl)
+    if (try meta_reader.findKey("pl")) |pl_idx| {
+        const pl_container = try meta_reader.valueAt(pl_idx);
+        const pl_val = try leaf.readData(pl_container);
+        if (pl_val.len >= 8) {
+            entry.pdf_stream_length = std.mem.readInt(u64, pl_val[0..8], .little);
+        }
+    }
+
+    // Read pdf stream offset (po)
+    if (try meta_reader.findKey("po")) |po_idx| {
+        const po_container = try meta_reader.valueAt(po_idx);
+        const po_val = try leaf.readData(po_container);
+        if (po_val.len >= 8) {
+            entry.pdf_stream_offset = std.mem.readInt(u64, po_val[0..8], .little);
+        }
+    }
+
     // Read xattrs and resource fork from forks dict (element 2 if present)
     const elem_count = arr.elementCount();
     if (elem_count >= 3) {
@@ -546,6 +571,17 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
                     } else if (std.mem.eql(u8, key, "zc")) {
                         if (new_value.len >= 2) {
                             f.zip_compression_method = std.mem.readInt(u16, new_value[0..2], .little);
+                        }
+                    } else if (std.mem.eql(u8, key, "jx")) {
+                        if (f.jxl_source_format.len > 0) allocator.free(f.jxl_source_format);
+                        f.jxl_source_format = allocator.dupe(u8, new_value) catch return PokeError.OutOfMemory;
+                    } else if (std.mem.eql(u8, key, "pl")) {
+                        if (new_value.len >= 8) {
+                            f.pdf_stream_length = std.mem.readInt(u64, new_value[0..8], .little);
+                        }
+                    } else if (std.mem.eql(u8, key, "po")) {
+                        if (new_value.len >= 8) {
+                            f.pdf_stream_offset = std.mem.readInt(u64, new_value[0..8], .little);
                         }
                     } else {
                         return PokeError.IndexOutOfBounds; // unknown key

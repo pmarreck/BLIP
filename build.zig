@@ -51,6 +51,11 @@ pub fn build(b: *std.Build) void {
     });
     const progrez_lib = progrez_dep.artifact("progrez");
 
+    // libjxl system library — provides JPEG XL lossless recompression for PDF container expansion.
+    // Paths provided via -D options (set by flake.nix) or discovered via pkg-config.
+    const jxl_include_path = b.option([]const u8, "jxl-include-path", "Path to libjxl headers");
+    const jxl_lib_path = b.option([]const u8, "jxl-lib-path", "Path to libjxl libraries");
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -64,6 +69,11 @@ pub fn build(b: *std.Build) void {
     });
     blip_module.linkLibrary(lz4_lib);
     blip_module.linkLibrary(zstdz_lib);
+    // libjxl: add include/lib paths and link
+    if (jxl_include_path) |inc| blip_module.addSystemIncludePath(.{ .cwd_relative = inc });
+    if (jxl_lib_path) |lib| blip_module.addLibraryPath(.{ .cwd_relative = lib });
+    blip_module.linkSystemLibrary("jxl", .{});
+    blip_module.linkSystemLibrary("jxl_threads", .{});
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
@@ -80,6 +90,10 @@ pub fn build(b: *std.Build) void {
     });
     exposed_blip.linkLibrary(lz4_lib);
     exposed_blip.linkLibrary(zstdz_lib);
+    if (jxl_include_path) |inc| exposed_blip.addSystemIncludePath(.{ .cwd_relative = inc });
+    if (jxl_lib_path) |lib| exposed_blip.addLibraryPath(.{ .cwd_relative = lib });
+    exposed_blip.linkSystemLibrary("jxl", .{});
+    exposed_blip.linkSystemLibrary("jxl_threads", .{});
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
@@ -93,6 +107,10 @@ pub fn build(b: *std.Build) void {
     });
     exposed_mini_blar.linkLibrary(lz4_lib);
     exposed_mini_blar.linkLibrary(zstdz_lib);
+    if (jxl_include_path) |inc| exposed_mini_blar.addSystemIncludePath(.{ .cwd_relative = inc });
+    if (jxl_lib_path) |lib| exposed_mini_blar.addLibraryPath(.{ .cwd_relative = lib });
+    exposed_mini_blar.linkSystemLibrary("jxl", .{});
+    exposed_mini_blar.linkSystemLibrary("jxl_threads", .{});
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -108,6 +126,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // libjxl: executables linking this static lib need the library search path
+    if (jxl_lib_path) |lib| static_lib.root_module.addLibraryPath(.{ .cwd_relative = lib });
+    static_lib.root_module.linkSystemLibrary("jxl", .{});
+    static_lib.root_module.linkSystemLibrary("jxl_threads", .{});
     b.installArtifact(static_lib);
 
     // CLI executable — calls through C FFI (links static lib)
@@ -120,6 +142,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.linkLibrary(static_lib);
+    if (jxl_lib_path) |lib| exe.root_module.addLibraryPath(.{ .cwd_relative = lib });
     b.installArtifact(exe);
 
     // Run step
@@ -157,6 +180,7 @@ pub fn build(b: *std.Build) void {
     blar.linkLibrary(magic_lib);
     blar.root_module.addIncludePath(b.path("src"));
     blar.root_module.addIncludePath(progrez_dep.path("include"));
+    if (jxl_lib_path) |lib| blar.root_module.addLibraryPath(.{ .cwd_relative = lib });
     b.installArtifact(blar);
 
     const blar_run_cmd = b.addRunArtifact(blar);
@@ -185,6 +209,7 @@ pub fn build(b: *std.Build) void {
     miniblar.linkLibrary(progrez_lib);
     miniblar.root_module.addIncludePath(b.path("src"));
     miniblar.root_module.addIncludePath(progrez_dep.path("include"));
+    if (jxl_lib_path) |lib| miniblar.root_module.addLibraryPath(.{ .cwd_relative = lib });
     b.installArtifact(miniblar);
 
     const miniblar_run_cmd = b.addRunArtifact(miniblar);
@@ -222,6 +247,10 @@ pub fn build(b: *std.Build) void {
     });
     unit_test_module.linkLibrary(lz4_lib);
     unit_test_module.linkLibrary(zstdz_lib);
+    if (jxl_include_path) |inc| unit_test_module.addSystemIncludePath(.{ .cwd_relative = inc });
+    if (jxl_lib_path) |lib| unit_test_module.addLibraryPath(.{ .cwd_relative = lib });
+    unit_test_module.linkSystemLibrary("jxl", .{});
+    unit_test_module.linkSystemLibrary("jxl_threads", .{});
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -241,6 +270,10 @@ pub fn build(b: *std.Build) void {
     });
     ffi_test_module.linkLibrary(lz4_lib);
     ffi_test_module.linkLibrary(zstdz_lib);
+    if (jxl_include_path) |inc| ffi_test_module.addSystemIncludePath(.{ .cwd_relative = inc });
+    if (jxl_lib_path) |lib| ffi_test_module.addLibraryPath(.{ .cwd_relative = lib });
+    ffi_test_module.linkSystemLibrary("jxl", .{});
+    ffi_test_module.linkSystemLibrary("jxl_threads", .{});
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,
     });
