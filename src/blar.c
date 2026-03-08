@@ -858,8 +858,9 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
  * Expanded entries replace the original at its index (DIR entry) and
  * append child entries at the end of the list. */
 static bool expand_containers_pass(entry_list_t *el) {
-    /* Count expandable files for progress */
+    /* Count expandable files and their total bytes for progress */
     size_t expandable = 0;
+    uint64_t total_expandable_bytes = 0;
     for (size_t i = 0; i < el->count; i++) {
         if (el->entries[i].is_dir) continue;
         const uint8_t *content = el->entries[i].content;
@@ -867,10 +868,13 @@ static bool expand_containers_pass(entry_list_t *el) {
         if (content_len >= 4 && blip_is_zip(content, content_len) &&
             (el->expand_all_zips || !is_archive_extension(el->entries[i].path))) {
             expandable++;
+            total_expandable_bytes += content_len;
         } else if (content_len >= 5 && blip_is_pdf(content, content_len)) {
             expandable++;
+            total_expandable_bytes += content_len;
         } else if (content_len >= 8 && blip_is_png(content, content_len)) {
             expandable++;
+            total_expandable_bytes += content_len;
         }
     }
     if (expandable == 0) return true;
@@ -878,7 +882,7 @@ static bool expand_containers_pass(entry_list_t *el) {
     /* Set up progress for expansion phase */
     if (el->progress) {
         progrez_set_label(el->progress, "Expanding");
-        progrez_set_determinate(el->progress, expandable, 0);
+        progrez_set_determinate(el->progress, expandable, total_expandable_bytes);
         progrez_update(el->progress, 0, 0);
     }
 
