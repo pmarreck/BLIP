@@ -407,7 +407,7 @@ The 16-byte AEAD authentication tag is appended to the ciphertext within the VAL
 | **Specification** | Single spec, one canonical encoding | Multiple incompatible specs (v7, ustar, pax, GNU, BSD); real-world archives mix formats |
 | **Empty directories** | Explicit DIR container type with its own metadata and Merkle hash | Representable but inconsistently handled across implementations |
 | **Encryption** | Built-in AEAD encryption (AES-256-GCM / ChaCha20-Poly1305) with password-based key derivation (Argon2id / PBKDF2); ~48 bytes overhead | None built-in; users layer external encryption (`gpg`, `age`) after the fact |
-| **Compression** | Built-in LZMA2 via LP attribute; per-container granularity | External only (`tar.gz`, `tar.zst`); whole-archive granularity |
+| **Compression** | Built-in LZMA2 via LP attribute; per-container granularity; transparent container expansion decomposes PDFs, PNGs, ZIPs for dramatically better compression with byte-identical reconstruction | External only (`tar.gz`, `tar.zst`); whole-archive granularity; no format-aware optimization |
 | **Introspection** | `peek` navigates internal structure with path expressions; every container, metadata key, and hash is addressable | `tar tf` lists files; no structural inspection of headers or checksums |
 | **JSON interop** | `to-json` / `from-json` round-trip with full `jq` manipulation; binary content encoded via printable-binary | No equivalent; external tools (`tar2json`) exist but don't round-trip |
 | **Text-safe representation** | Entire archives representable as printable text via printable-binary encoding — copy-pasteable through any text channel | Binary-only; requires base64 or similar encoding for text transport |
@@ -436,6 +436,51 @@ ARRAY (archive)
 ```
 
 This falls out naturally from recursive typed containers with per-container attributes — no special "solid block" feature is needed. The specific grouping semantics (key naming, content-type detection, etc.) are application-defined; interoperating tools would need to agree on a convention.
+
+### Transparent container expansion
+
+`blar` automatically detects and decomposes known file formats during archiving, storing their components in a way that LZMA2 can compress far more effectively. Extraction reconstructs the original file byte-identically. This is transparent — you archive a PDF, you extract a PDF. The internal representation is an implementation detail.
+
+**PDF container expansion:**
+
+PDFs are internally a mix of JPEG images, zlib-compressed content streams, and structural metadata. Without expansion, LZMA2 treats the whole PDF as an opaque blob and can't improve on the already-compressed regions.
+
+With expansion, `blar` decomposes a PDF into:
+- **JPEG images → JPEG XL** (lossless transcoding, ~20-40% smaller, bit-exact reconstruction)
+- **FlateDecode images → JPEG XL** (PNG-style pixel data transcoded to lossless JXL)
+- **Content streams → decompressed** (zlib-compressed page operators stored as raw text, which LZMA2 compresses dramatically better)
+- **PDF shell** (the structural skeleton with image regions zeroed out)
+
+Real-world results:
+
+| PDF | Original | blar (no expansion) | blar (expansion) | Savings |
+|-----|----------|-------------------|-----------------|---------|
+| Far Side Vol I (673 JPEGs) | 158 MB | ~155 MB | 121 MB | 23% smaller |
+| Slaughterhouse-Five (text-only) | 876 KB | ~840 KB | 780 KB | 16% smaller |
+| Beginning Lua Programming | 8.6 MB | ~8.2 MB | 2.5 MB | 70% smaller |
+
+All extracted PDFs are byte-identical to the originals.
+
+**PNG container expansion:**
+
+PNGs use zlib compression internally, which LZMA2 can't improve on. `blar` decomposes PNGs into raw pixel data encoded as lossless JPEG XL (~50% smaller than PNG) plus preserved metadata chunks (tEXt, iCCP, pHYs, etc.). Extracted PNGs are pixel-identical with all metadata preserved.
+
+**ZIP container expansion:**
+
+ZIP files contain individually deflate-compressed entries that LZMA2 can't shrink further. `blar` decompresses ZIP entries and stores them as a directory tree, letting LZMA2 compress the raw content. The ZIP structure is preserved for byte-identical reconstruction.
+
+**Controlling expansion:**
+
+```bash
+# Default: expand all recognized containers
+blar create -z -o archive.blar documents/
+
+# Disable expansion (store files as opaque blobs)
+blar create -z --no-expand-containers -o archive.blar documents/
+
+# List shows container types: p=PDF, n=PNG, z=ZIP, d=dir, -=file
+blar list archive.blar
+```
 
 ## miniblar: Minimal BLIP Archive Tool
 
