@@ -619,6 +619,22 @@ pub fn pokeArchive(allocator: Allocator, buf: []const u8, path_str: []const u8, 
                         if (new_value.len >= 8) {
                             f.pdf_stream_offset = std.mem.readInt(u64, new_value[0..8], .little);
                         }
+                    } else if (std.mem.eql(u8, key, "fp")) {
+                        if (new_value.len >= 2) {
+                            f.flate_predictor = std.mem.readInt(u16, new_value[0..2], .little);
+                        }
+                    } else if (std.mem.eql(u8, key, "fc")) {
+                        if (new_value.len >= 4) {
+                            f.flate_columns = std.mem.readInt(u32, new_value[0..4], .little);
+                        }
+                    } else if (std.mem.eql(u8, key, "fl")) {
+                        if (new_value.len >= 1) {
+                            f.flate_colors = new_value[0];
+                        }
+                    } else if (std.mem.eql(u8, key, "fb")) {
+                        if (new_value.len >= 1) {
+                            f.flate_bpc = new_value[0];
+                        }
                     } else {
                         return PokeError.IndexOutOfBounds; // unknown key
                     }

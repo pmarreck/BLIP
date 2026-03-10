@@ -40,6 +40,7 @@
             zig
             hyperfine
             libjxl
+            zlib
           ];
           shellHook = ''
             export JXL_INCLUDE_PATH="${pkgs.libjxl.dev}/include"
@@ -55,7 +56,7 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
-          buildInputs = [ pkgs.libjxl ];
+          buildInputs = [ pkgs.libjxl pkgs.zlib ];
           dontConfigure = true;
           dontInstall = true;
           dontFixup = true;
@@ -80,7 +81,7 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
-          buildInputs = [ pkgs.libjxl ];
+          buildInputs = [ pkgs.libjxl pkgs.zlib ];
           dontConfigure = true;
           dontFixup = true;
           buildPhase = ''

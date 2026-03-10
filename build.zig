@@ -74,6 +74,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| blip_module.addLibraryPath(.{ .cwd_relative = lib });
     blip_module.linkSystemLibrary("jxl", .{});
     blip_module.linkSystemLibrary("jxl_threads", .{});
+    blip_module.linkSystemLibrary("z", .{});
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| exposed_blip.addLibraryPath(.{ .cwd_relative = lib });
     exposed_blip.linkSystemLibrary("jxl", .{});
     exposed_blip.linkSystemLibrary("jxl_threads", .{});
+    exposed_blip.linkSystemLibrary("z", .{});
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
@@ -111,6 +113,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| exposed_mini_blar.addLibraryPath(.{ .cwd_relative = lib });
     exposed_mini_blar.linkSystemLibrary("jxl", .{});
     exposed_mini_blar.linkSystemLibrary("jxl_threads", .{});
+    exposed_mini_blar.linkSystemLibrary("z", .{});
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -130,6 +133,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| static_lib.root_module.addLibraryPath(.{ .cwd_relative = lib });
     static_lib.root_module.linkSystemLibrary("jxl", .{});
     static_lib.root_module.linkSystemLibrary("jxl_threads", .{});
+    static_lib.root_module.linkSystemLibrary("z", .{});
     b.installArtifact(static_lib);
 
     // CLI executable — calls through C FFI (links static lib)
@@ -251,6 +255,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| unit_test_module.addLibraryPath(.{ .cwd_relative = lib });
     unit_test_module.linkSystemLibrary("jxl", .{});
     unit_test_module.linkSystemLibrary("jxl_threads", .{});
+    unit_test_module.linkSystemLibrary("z", .{});
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -274,6 +279,7 @@ pub fn build(b: *std.Build) void {
     if (jxl_lib_path) |lib| ffi_test_module.addLibraryPath(.{ .cwd_relative = lib });
     ffi_test_module.linkSystemLibrary("jxl", .{});
     ffi_test_module.linkSystemLibrary("jxl_threads", .{});
+    ffi_test_module.linkSystemLibrary("z", .{});
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,
     });

@@ -882,49 +882,31 @@ pub fn zlibDecompress(allocator: Allocator, compressed: []const u8) ![]u8 {
         return error.InvalidData;
 }
 
-/// Zlib-compress data using stored deflate blocks + Adler-32.
-/// Note: This uses uncompressed stored blocks, producing output larger than real
-/// deflate compression. This is acceptable for PDF extraction because:
-/// 1. The extracted PDF is pixel-identical (lossless)
-/// 2. The PDF is larger than the original but fully valid
-/// 3. The Zig 0.15 flate compressor is not yet complete
+const c_zlib = @cImport(@cInclude("zlib.h"));
+
+/// Zlib-compress data using C zlib (real deflate compression).
 pub fn zlibCompress(allocator: Allocator, data: []const u8) ![]u8 {
-    var output: std.ArrayListUnmanaged(u8) = .{};
-    errdefer output.deinit(allocator);
+    // compressBound gives upper bound for compressed output size
+    const bound = c_zlib.compressBound(@intCast(data.len));
+    const buf = try allocator.alloc(u8, bound);
+    errdefer allocator.free(buf);
 
-    // Zlib header: CMF=0x78, FLG=0x01
-    try output.appendSlice(allocator, &[_]u8{ 0x78, 0x01 });
+    var dest_len: c_zlib.uLongf = bound;
+    const rc = c_zlib.compress2(
+        buf.ptr,
+        &dest_len,
+        data.ptr,
+        @intCast(data.len),
+        c_zlib.Z_DEFAULT_COMPRESSION,
+    );
+    if (rc != c_zlib.Z_OK) return error.InvalidData;
 
-    // Raw deflate stored blocks
-    const max_block: usize = 65535;
-    const num_blocks: usize = if (data.len == 0) 1 else (data.len + max_block - 1) / max_block;
-
-    var pos: usize = 0;
-    var block_idx: usize = 0;
-    while (block_idx < num_blocks) : (block_idx += 1) {
-        const remaining = data.len - pos;
-        const block_len: u16 = @intCast(@min(remaining, max_block));
-        const is_final: u8 = if (block_idx == num_blocks - 1) 1 else 0;
-
-        try output.append(allocator, is_final);
-        var len_bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &len_bytes, block_len, .little);
-        try output.appendSlice(allocator, &len_bytes);
-        std.mem.writeInt(u16, &len_bytes, ~block_len, .little);
-        try output.appendSlice(allocator, &len_bytes);
-        if (block_len > 0) {
-            try output.appendSlice(allocator, data[pos..][0..block_len]);
-        }
-        pos += block_len;
+    const result_len: usize = @intCast(dest_len);
+    // Shrink allocation to actual size
+    if (result_len < buf.len) {
+        return allocator.realloc(buf, result_len) catch buf[0..result_len];
     }
-
-    // Adler-32 checksum (big-endian)
-    const adler = std.hash.Adler32.hash(data);
-    var adler_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &adler_bytes, adler, .big);
-    try output.appendSlice(allocator, &adler_bytes);
-
-    return output.toOwnedSlice(allocator);
+    return buf[0..result_len];
 }
 
 fn paethPredictor(a: i16, b: i16, c: i16) u8 {
