@@ -84,6 +84,217 @@ pub const SpliceError = error{
     ImageSizeMismatch,
 };
 
+/// Describes a stream replacement for PDF rewriting.
+/// Used when FlateDecode stream data changes size during round-trip.
+pub const StreamReplacement = struct {
+    stream_start: usize, // offset of stream data in the original shell
+    original_length: usize, // original /Length value (stream data bytes)
+    new_data: []const u8, // replacement stream bytes
+};
+
+/// A delta point records the cumulative byte shift at a position in the original file.
+const DeltaPoint = struct {
+    original_pos: usize, // position in original file where delta takes effect
+    cumulative_delta: i64, // total byte shift at this point
+};
+
+/// Rewrite a PDF shell by replacing stream data regions that may differ in size.
+/// Updates /Length values in object dicts and rebuilds the xref table.
+/// JPEG streams (same-size) should be spliced with splicePdfImages first.
+/// This handles FlateDecode streams whose recompressed size differs.
+///
+/// The shell must have a traditional xref table (not xref streams).
+/// Returns null if the PDF uses xref streams (caller should fall back).
+/// Caller owns the returned buffer.
+pub fn rewritePdfWithStreams(allocator: Allocator, shell: []const u8, replacements: []const StreamReplacement) !?[]u8 {
+    if (replacements.len == 0) return try allocator.dupe(u8, shell);
+
+    // Find the original xref location
+    const orig_xref_start = findStartxref(shell) orelse return error.InvalidData;
+    if (orig_xref_start >= shell.len) return error.InvalidData;
+
+    // Check for traditional xref (skip xref streams)
+    const xref_pos = skipWhitespace(shell, orig_xref_start);
+    if (xref_pos + 4 > shell.len or !std.mem.eql(u8, shell[xref_pos..][0..4], "xref")) {
+        return null; // xref stream — caller should skip FlateDecode rewrite
+    }
+
+    // Parse the original xref to get object offsets
+    var xref_entries = std.AutoHashMap(u32, XrefEntry).init(allocator);
+    defer xref_entries.deinit();
+    try parseXrefAt(allocator, shell, orig_xref_start, &xref_entries);
+
+    // Sort replacements by stream_start ascending
+    const sorted = try allocator.alloc(StreamReplacement, replacements.len);
+    defer allocator.free(sorted);
+    @memcpy(sorted, replacements);
+    std.mem.sort(StreamReplacement, sorted, {}, struct {
+        fn cmp(_: void, a: StreamReplacement, b: StreamReplacement) bool {
+            return a.stream_start < b.stream_start;
+        }
+    }.cmp);
+
+    // Build the rewritten PDF body (everything up to xref)
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    // Track delta points for xref offset adjustment
+    var delta_points: std.ArrayListUnmanaged(DeltaPoint) = .{};
+    defer delta_points.deinit(allocator);
+
+    var shell_pos: usize = 0;
+    var cumulative_delta: i64 = 0;
+
+    for (sorted) |rep| {
+        const length_info = findLengthField(shell, rep.stream_start) orelse continue;
+
+        // Copy shell from current position up to /Length value
+        if (length_info.value_start > shell_pos) {
+            try out.appendSlice(allocator, shell[shell_pos..length_info.value_start]);
+        }
+
+        // Record delta at the /Length position (before changing it)
+        try delta_points.append(allocator, .{
+            .original_pos = length_info.value_start,
+            .cumulative_delta = cumulative_delta,
+        });
+
+        // Write new /Length value
+        var len_buf: [20]u8 = undefined;
+        const new_len_str = std.fmt.bufPrint(&len_buf, "{d}", .{rep.new_data.len}) catch unreachable;
+        try out.appendSlice(allocator, new_len_str);
+
+        const old_len_digits = length_info.value_end - length_info.value_start;
+        cumulative_delta += @as(i64, @intCast(new_len_str.len)) - @as(i64, @intCast(old_len_digits));
+
+        // Copy from after old /Length value to stream data start
+        if (rep.stream_start > length_info.value_end) {
+            try out.appendSlice(allocator, shell[length_info.value_end..rep.stream_start]);
+        }
+
+        // Record delta at stream data position
+        try delta_points.append(allocator, .{
+            .original_pos = rep.stream_start,
+            .cumulative_delta = cumulative_delta,
+        });
+
+        // Write new stream data
+        try out.appendSlice(allocator, rep.new_data);
+        cumulative_delta += @as(i64, @intCast(rep.new_data.len)) - @as(i64, @intCast(rep.original_length));
+
+        // Record delta after stream data
+        try delta_points.append(allocator, .{
+            .original_pos = rep.stream_start + rep.original_length,
+            .cumulative_delta = cumulative_delta,
+        });
+
+        shell_pos = rep.stream_start + rep.original_length;
+    }
+
+    // Copy remaining shell content up to the xref table
+    if (orig_xref_start > shell_pos) {
+        try out.appendSlice(allocator, shell[shell_pos..orig_xref_start]);
+    }
+
+    // Rebuild xref table
+    var max_obj_num: u32 = 0;
+    var iter = xref_entries.iterator();
+    while (iter.next()) |entry| {
+        if (entry.key_ptr.* > max_obj_num) max_obj_num = entry.key_ptr.*;
+    }
+
+    const new_xref_offset = out.items.len;
+    try out.appendSlice(allocator, "xref\n");
+    var buf20: [20]u8 = undefined;
+    const size_str = std.fmt.bufPrint(&buf20, "0 {d}\n", .{max_obj_num + 1}) catch unreachable;
+    try out.appendSlice(allocator, size_str);
+    try out.appendSlice(allocator, "0000000000 65535 f \n");
+
+    var obj_num: u32 = 1;
+    while (obj_num <= max_obj_num) : (obj_num += 1) {
+        if (xref_entries.get(obj_num)) |entry| {
+            if (entry.in_use) {
+                const adjusted = applyDelta(entry.offset, delta_points.items);
+                const off_str = std.fmt.bufPrint(&buf20, "{d:0>10} {d:0>5} n \n", .{ adjusted, entry.gen }) catch unreachable;
+                try out.appendSlice(allocator, off_str);
+            } else {
+                try out.appendSlice(allocator, "0000000000 65535 f \n");
+            }
+        } else {
+            try out.appendSlice(allocator, "0000000000 65535 f \n");
+        }
+    }
+
+    // Copy trailer from original (between "trailer" and "startxref")
+    if (findTrailerDict(shell, orig_xref_start)) |ts| {
+        if (std.mem.indexOf(u8, shell[ts..], "startxref")) |sx| {
+            try out.appendSlice(allocator, shell[ts .. ts + sx]);
+        }
+    } else {
+        try out.appendSlice(allocator, "trailer\n<< /Size ");
+        const ts = std.fmt.bufPrint(&buf20, "{d}", .{max_obj_num + 1}) catch unreachable;
+        try out.appendSlice(allocator, ts);
+        try out.appendSlice(allocator, " >>\n");
+    }
+
+    try out.appendSlice(allocator, "startxref\n");
+    const xref_str = std.fmt.bufPrint(&buf20, "{d}", .{new_xref_offset}) catch unreachable;
+    try out.appendSlice(allocator, xref_str);
+    try out.appendSlice(allocator, "\n%%EOF\n");
+
+    const slice = try out.toOwnedSlice(allocator);
+    return @as(?[]u8, slice);
+}
+
+/// Apply cumulative delta to an original file offset.
+/// Finds the last delta point at or before the given position.
+fn applyDelta(original_offset: usize, delta_points: []const DeltaPoint) usize {
+    // Delta points are in order of original_pos. Find the last one <= original_offset.
+    var delta: i64 = 0;
+    for (delta_points) |dp| {
+        if (dp.original_pos > original_offset) break;
+        delta = dp.cumulative_delta;
+    }
+    if (delta >= 0) {
+        return original_offset +| @as(usize, @intCast(delta));
+    } else {
+        return original_offset -| @as(usize, @intCast(-delta));
+    }
+}
+
+/// Find the /Length field in an object dict, searching backwards from stream_start.
+/// Returns the byte range of the integer value (not the key).
+fn findLengthField(data: []const u8, stream_start: usize) ?struct { value_start: usize, value_end: usize } {
+    const search_start = if (stream_start > 1024) stream_start - 1024 else 0;
+    const region = data[search_start..stream_start];
+
+    // Find last occurrence of "/Length" before stream
+    var best: ?usize = null;
+    var idx: usize = 0;
+    while (idx + 7 <= region.len) {
+        if (std.mem.eql(u8, region[idx..][0..7], "/Length")) {
+            best = search_start + idx;
+        }
+        idx += 1;
+    }
+
+    const length_key_pos = best orelse return null;
+    var pos = length_key_pos + 7;
+    pos = skipWhitespace(data, pos);
+
+    const int_result = parseDirectInt(data, pos) orelse return null;
+    if (int_result.value < 0) return null;
+
+    return .{ .value_start = pos, .value_end = int_result.end };
+}
+
+/// Find the trailer dict start, searching after the xref.
+fn findTrailerDict(data: []const u8, xref_start: usize) ?usize {
+    const search = data[xref_start..];
+    const idx = std.mem.indexOf(u8, search, "trailer") orelse return null;
+    return xref_start + idx;
+}
+
 // =============================================================================
 // Internal: PDF parsing primitives
 // =============================================================================
@@ -1538,4 +1749,141 @@ test "findJpegStreams still ignores FlateDecode images" {
     const streams = try findJpegStreams(testing.allocator, pdf);
     defer testing.allocator.free(streams);
     try testing.expectEqual(@as(usize, 0), streams.len);
+}
+
+// =============================================================================
+// PDF rewrite tests
+// =============================================================================
+
+test "rewritePdfWithStreams: no replacements returns copy" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const result = try rewritePdfWithStreams(testing.allocator, pdf, &.{});
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expect(result != null);
+    try testing.expectEqualSlices(u8, pdf, result.?);
+}
+
+test "rewritePdfWithStreams: same-size replacement preserves structure" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const flate_streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(flate_streams);
+    try testing.expectEqual(@as(usize, 1), flate_streams.len);
+
+    // Replace stream with same-length data
+    const original_data = pdf[flate_streams[0].stream_start..flate_streams[0].stream_end];
+    const same_data = try testing.allocator.dupe(u8, original_data);
+    defer testing.allocator.free(same_data);
+
+    const reps = [_]StreamReplacement{.{
+        .stream_start = flate_streams[0].stream_start,
+        .original_length = flate_streams[0].len(),
+        .new_data = same_data,
+    }};
+
+    const result = try rewritePdfWithStreams(testing.allocator, pdf, &reps);
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expect(result != null);
+
+    // The rewritten PDF should be a valid PDF with correct structure
+    const rewritten = result.?;
+    try testing.expect(isPdfMagic(rewritten));
+
+    // Should still have the same FlateDecode stream
+    const re_streams = try findFlateImageStreams(testing.allocator, rewritten);
+    defer testing.allocator.free(re_streams);
+    try testing.expectEqual(@as(usize, 1), re_streams.len);
+
+    // Stream data should match
+    try testing.expectEqualSlices(
+        u8,
+        same_data,
+        rewritten[re_streams[0].stream_start..re_streams[0].stream_end],
+    );
+}
+
+test "rewritePdfWithStreams: larger replacement adjusts Length and xref" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const flate_streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(flate_streams);
+    try testing.expectEqual(@as(usize, 1), flate_streams.len);
+
+    // Create replacement data that's LARGER than original
+    const orig_len = flate_streams[0].len();
+    const bigger_data = try testing.allocator.alloc(u8, orig_len + 20);
+    defer testing.allocator.free(bigger_data);
+    @memset(bigger_data, 0xAB);
+
+    const reps = [_]StreamReplacement{.{
+        .stream_start = flate_streams[0].stream_start,
+        .original_length = orig_len,
+        .new_data = bigger_data,
+    }};
+
+    const result = try rewritePdfWithStreams(testing.allocator, pdf, &reps);
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expect(result != null);
+
+    const rewritten = result.?;
+    try testing.expect(isPdfMagic(rewritten));
+
+    // Verify /Length was updated
+    const length_info = findLengthField(rewritten, std.mem.indexOf(u8, rewritten, "stream\n").? + 7);
+    try testing.expect(length_info != null);
+    const len_val = parseInt(rewritten, length_info.?.value_start);
+    try testing.expect(len_val != null);
+    try testing.expectEqual(@as(i64, @intCast(bigger_data.len)), len_val.?.value);
+
+    // Verify the stream data is at the right place
+    const stream_marker = std.mem.indexOf(u8, rewritten, "stream\n").? + 7;
+    try testing.expectEqualSlices(
+        u8,
+        bigger_data,
+        rewritten[stream_marker..][0..bigger_data.len],
+    );
+
+    // Verify xref is valid: startxref points to "xref"
+    const startxref = findStartxref(rewritten);
+    try testing.expect(startxref != null);
+    const xref_at = skipWhitespace(rewritten, startxref.?);
+    try testing.expect(std.mem.eql(u8, rewritten[xref_at..][0..4], "xref"));
+}
+
+test "rewritePdfWithStreams: smaller replacement adjusts Length and xref" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const flate_streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(flate_streams);
+    try testing.expectEqual(@as(usize, 1), flate_streams.len);
+
+    // Create replacement data that's SMALLER than original
+    const smaller_data = [_]u8{ 0x78, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x01, 0x00, 0x01 };
+
+    const reps = [_]StreamReplacement{.{
+        .stream_start = flate_streams[0].stream_start,
+        .original_length = flate_streams[0].len(),
+        .new_data = &smaller_data,
+    }};
+
+    const result = try rewritePdfWithStreams(testing.allocator, pdf, &reps);
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expect(result != null);
+
+    const rewritten = result.?;
+    try testing.expect(isPdfMagic(rewritten));
+
+    // Rewritten should be shorter than original
+    try testing.expect(rewritten.len < pdf.len);
+
+    // Verify startxref points to valid xref
+    const startxref = findStartxref(rewritten);
+    try testing.expect(startxref != null);
+    const xref_at = skipWhitespace(rewritten, startxref.?);
+    try testing.expect(std.mem.eql(u8, rewritten[xref_at..][0..4], "xref"));
 }

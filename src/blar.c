@@ -2120,9 +2120,16 @@ static int cmd_extract(int argc, char **argv) {
 
             /* For each __img_*.jxl child: decode and splice back into shell */
             bool pdf_ok = true;
-            bool has_flate_resized = false; /* track if any FlateDecode streams changed size */
 
-            /* First pass: handle JPEG images (same-size splice) */
+            /* Collect FlateDecode replacements for potential PDF rewrite */
+            size_t flate_cap = 8;
+            size_t flate_n = 0;
+            uint64_t *fl_starts = calloc(flate_cap, sizeof(uint64_t));
+            uint64_t *fl_orig_lens = calloc(flate_cap, sizeof(uint64_t));
+            uint8_t **fl_new_datas = calloc(flate_cap, sizeof(uint8_t *));
+            size_t *fl_new_lens = calloc(flate_cap, sizeof(size_t));
+            bool need_rewrite = false;
+
             for (uint64_t j = 0; j < count && pdf_ok; j++) {
                 if (j == co_idx) continue;
                 const char *j_path = NULL;
@@ -2184,17 +2191,11 @@ static int cmd_extract(int argc, char **argv) {
                         break;
                     }
 
-                    /* Read flate metadata — we need predictor, columns, colors, bpc */
-                    /* These are stored as metadata on the entry; read via poke */
-                    /* For now, use px_w as columns, px_ch as colors, px_bps as bpc,
-                       and default to predictor 15 (per-row filter byte) */
+                    /* Read flate metadata from archive entry */
                     uint16_t predictor = 15; /* default: per-row filter byte */
                     uint32_t columns = px_w;
                     uint8_t colors = (uint8_t)px_ch;
                     uint8_t bpc = (uint8_t)px_bps;
-
-                    /* TODO: read actual flate metadata from archive entry
-                     * For now these defaults work for Predictor 15 */
 
                     /* Refilter pixels */
                     uint8_t *filtered = NULL;
@@ -2228,14 +2229,21 @@ static int cmd_extract(int argc, char **argv) {
                         }
                         blip_free(compressed, compressed_len);
                     } else {
-                        /* Different size — need PDF rewrite (Phase 6) */
-                        /* For now, we still splice (this will produce a corrupt PDF
-                         * if the length differs). Mark for rewrite. */
-                        has_flate_resized = true;
-                        /* TODO: implement PDF rewrite for length-changed FlateDecode streams.
-                         * For now, skip this stream (leave zeroed). The extracted PDF will
-                         * have blank images for FlateDecode but JPEG images will be correct. */
-                        blip_free(compressed, compressed_len);
+                        /* Different size — collect for PDF rewrite */
+                        need_rewrite = true;
+                        /* Grow arrays if needed */
+                        if (flate_n >= flate_cap) {
+                            flate_cap *= 2;
+                            fl_starts = realloc(fl_starts, flate_cap * sizeof(uint64_t));
+                            fl_orig_lens = realloc(fl_orig_lens, flate_cap * sizeof(uint64_t));
+                            fl_new_datas = realloc(fl_new_datas, flate_cap * sizeof(uint8_t *));
+                            fl_new_lens = realloc(fl_new_lens, flate_cap * sizeof(size_t));
+                        }
+                        fl_starts[flate_n] = po;
+                        fl_orig_lens[flate_n] = pl;
+                        fl_new_datas[flate_n] = compressed; /* ownership transferred */
+                        fl_new_lens[flate_n] = compressed_len;
+                        flate_n++;
                     }
                 } else {
                     /* JPEG: JXL → JPEG (bit-exact, same size) */
@@ -2272,11 +2280,39 @@ static int cmd_extract(int argc, char **argv) {
                 }
             }
 
-            if (has_flate_resized) {
-                fprintf(stderr, "WARNING: PDF '%.*s': FlateDecode images have changed size, "
-                        "some images may be blank in extracted PDF\n",
-                        (int)co_path_len, co_path);
+            /* If FlateDecode streams changed size, rewrite the PDF */
+            if (pdf_ok && need_rewrite && flate_n > 0) {
+                uint8_t *rewritten = NULL;
+                size_t rewritten_len = 0;
+                rc = blip_pdf_rewrite_streams(pdf_buf, shell_len, flate_n,
+                    fl_starts, fl_orig_lens,
+                    (const uint8_t *const *)fl_new_datas, fl_new_lens,
+                    &rewritten, &rewritten_len);
+                if (rc == BLIP_OK) {
+                    /* Replace pdf_buf with rewritten version */
+                    free(pdf_buf);
+                    pdf_buf = rewritten;
+                    shell_len = rewritten_len;
+                } else if (rc == BLIP_ERR_XREF_STREAM) {
+                    /* Xref stream PDF — can't rewrite, leave FlateDecode zeroed */
+                    fprintf(stderr, "WARNING: PDF '%.*s': xref stream PDF, "
+                            "FlateDecode images left as zeroed regions\n",
+                            (int)co_path_len, co_path);
+                } else {
+                    fprintf(stderr, "WARNING: PDF '%.*s': rewrite failed (rc=%d), "
+                            "FlateDecode images may be missing\n",
+                            (int)co_path_len, co_path, rc);
+                }
             }
+
+            /* Free FlateDecode replacement data */
+            for (size_t fi = 0; fi < flate_n; fi++) {
+                blip_free(fl_new_datas[fi], fl_new_lens[fi]);
+            }
+            free(fl_starts);
+            free(fl_orig_lens);
+            free(fl_new_datas);
+            free(fl_new_lens);
 
             if (!pdf_ok) {
                 free(pdf_buf);

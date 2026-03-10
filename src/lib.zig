@@ -1876,6 +1876,51 @@ export fn blip_pdf_refilter(
     return 0;
 }
 
+/// Rewrite a PDF shell, replacing stream data regions that may differ in size.
+/// Updates /Length values and rebuilds the xref table.
+/// Returns BLIP_OK on success, -42 if the PDF uses xref streams (caller should skip),
+/// or negative error code on failure.
+export fn blip_pdf_rewrite_streams(
+    shell: [*]const u8,
+    shell_len: usize,
+    count: usize,
+    stream_starts: [*]const u64,
+    original_lengths: [*]const u64,
+    new_datas: [*]const [*]const u8,
+    new_data_lens: [*]const usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    if (count == 0) {
+        // No replacements — return a copy of the shell
+        const copy = page_allocator.dupe(u8, shell[0..shell_len]) catch return -1;
+        out.* = copy.ptr;
+        out_len.* = copy.len;
+        return 0;
+    }
+
+    // Build StreamReplacement slice
+    const reps = page_allocator.alloc(pdf_mod.StreamReplacement, count) catch return -1;
+    defer page_allocator.free(reps);
+
+    for (0..count) |i| {
+        reps[i] = .{
+            .stream_start = @intCast(stream_starts[i]),
+            .original_length = @intCast(original_lengths[i]),
+            .new_data = new_datas[i][0..new_data_lens[i]],
+        };
+    }
+
+    const result = pdf_mod.rewritePdfWithStreams(page_allocator, shell[0..shell_len], reps) catch return -41;
+    if (result) |buf| {
+        out.* = buf.ptr;
+        out_len.* = buf.len;
+        return 0;
+    } else {
+        return -42; // xref stream PDF — caller should skip rewrite
+    }
+}
+
 /// Read pdf_stream_offset from a FILE entry in a BLIP archive.
 export fn blip_archive_entry_pdf_offset(
     buf: [*]const u8,

@@ -554,6 +554,17 @@ int32_t blip_pdf_refilter(const uint8_t *pixels, size_t pixels_len,
     uint32_t columns, uint8_t colors, uint8_t bpc, uint16_t predictor,
     uint8_t **out, size_t *out_len);
 
+/* Rewrite a PDF shell, replacing stream data regions that may differ in size.
+ * Updates /Length values and rebuilds the xref table.
+ * Returns 0 on success, -42 if xref streams (skip rewrite), negative on error.
+ * Caller must free output with blip_free(). */
+#define BLIP_ERR_XREF_STREAM -42
+int32_t blip_pdf_rewrite_streams(const uint8_t *shell, size_t shell_len,
+    size_t count,
+    const uint64_t *stream_starts, const uint64_t *original_lengths,
+    const uint8_t *const *new_datas, const size_t *new_data_lens,
+    uint8_t **out, size_t *out_len);
+
 #define BLIP_ERR_INVALID_PNG -40
 
 /* Read pdf_stream_offset from a FILE entry.
