@@ -354,7 +354,40 @@ fn parseXrefStream(allocator: Allocator, data: []const u8, start: usize, entries
                     if (dict_pos < data.len) dict_pos += 1;
                 }
             } else {
-                dict_pos += 1;
+                // Unrecognized key — skip its value
+                if (dict_pos + 1 < data.len and data[dict_pos] == '<' and data[dict_pos + 1] == '<') {
+                    // Value is a nested dict — skip it
+                    dict_pos += 2;
+                    var depth: u32 = 1;
+                    while (dict_pos + 1 < data.len and depth > 0) {
+                        if (data[dict_pos] == '<' and data[dict_pos + 1] == '<') {
+                            depth += 1;
+                            dict_pos += 2;
+                        } else if (data[dict_pos] == '>' and data[dict_pos + 1] == '>') {
+                            depth -= 1;
+                            dict_pos += 2;
+                        } else {
+                            dict_pos += 1;
+                        }
+                    }
+                } else {
+                    dict_pos += 1;
+                }
+            }
+        } else if (data[dict_pos] == '<' and dict_pos + 1 < data.len and data[dict_pos + 1] == '<') {
+            // Nested dict outside key context — skip it
+            dict_pos += 2;
+            var ndepth: u32 = 1;
+            while (dict_pos + 1 < data.len and ndepth > 0) {
+                if (data[dict_pos] == '<' and data[dict_pos + 1] == '<') {
+                    ndepth += 1;
+                    dict_pos += 2;
+                } else if (data[dict_pos] == '>' and data[dict_pos + 1] == '>') {
+                    ndepth -= 1;
+                    dict_pos += 2;
+                } else {
+                    dict_pos += 1;
+                }
             }
         } else {
             dict_pos += 1;
@@ -380,7 +413,6 @@ fn parseXrefStream(allocator: Allocator, data: []const u8, start: usize, entries
 
     // For now, we don't decompress xref streams (would need zlib).
     // Fall back to linear scan if xref is a stream.
-    // This is a simplification — most PDFs with JPEG images use traditional xref.
     _ = entries;
     return error.NoXref;
 }
