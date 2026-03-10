@@ -895,14 +895,17 @@ static bool expand_containers_pass(entry_list_t *el) {
         if (el->entries[i].is_dir) continue;
         const uint8_t *content = el->entries[i].content;
         size_t content_len = el->entries[i].content_len;
-        blip_archive_entry *entry = &el->entries[i];
+
+        /* Copy the entry by value — expand_*_container() calls entry_list_add()
+         * which may realloc el->entries, invalidating any pointer into it. */
+        blip_archive_entry entry_copy = el->entries[i];
 
         bool expanded = false;
 
         /* Update label with current filename */
         if (el->progress) {
-            const char *basename = strrchr(entry->path, '/');
-            basename = basename ? basename + 1 : entry->path;
+            const char *basename = strrchr(entry_copy.path, '/');
+            basename = basename ? basename + 1 : entry_copy.path;
             char label_buf[256];
             snprintf(label_buf, sizeof(label_buf), "Expanding: %s", basename);
             progrez_set_label(el->progress, label_buf);
@@ -911,8 +914,8 @@ static bool expand_containers_pass(entry_list_t *el) {
         /* Try ZIP */
         if (!expanded && content_len >= 4 &&
             blip_is_zip(content, content_len) &&
-            (el->expand_all_zips || !is_archive_extension(entry->path))) {
-            if (expand_zip_container(el, content, content_len, entry)) {
+            (el->expand_all_zips || !is_archive_extension(entry_copy.path))) {
+            if (expand_zip_container(el, content, content_len, &entry_copy)) {
                 expanded = true;
             }
         }
@@ -920,7 +923,7 @@ static bool expand_containers_pass(entry_list_t *el) {
         /* Try PDF */
         if (!expanded && content_len >= 5 &&
             blip_is_pdf(content, content_len)) {
-            if (expand_pdf_container(el, content, content_len, entry)) {
+            if (expand_pdf_container(el, content, content_len, &entry_copy)) {
                 expanded = true;
             }
         }
@@ -928,7 +931,7 @@ static bool expand_containers_pass(entry_list_t *el) {
         /* Try PNG */
         if (!expanded && content_len >= 8 &&
             blip_is_png(content, content_len)) {
-            if (expand_png_container(el, content, content_len, entry)) {
+            if (expand_png_container(el, content, content_len, &entry_copy)) {
                 expanded = true;
             }
         }
