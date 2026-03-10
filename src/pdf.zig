@@ -1309,8 +1309,12 @@ fn parseObjectForFlate(data: []const u8, offset: usize, obj_num: u32, gen_num: u
     // If /Columns not specified in DecodeParms, use /Width
     const final_columns = columns orelse w;
 
-    // Verify zlib header (first byte should be 0x78 for deflate)
-    if (se - ss < 2 or data[ss] != 0x78) return null;
+    // Verify zlib header: CM field (low nibble) must be 8 (deflate),
+    // and CMF*256+FLG must be divisible by 31 (RFC 1950 FCHECK).
+    // Common CMF values: 0x78 (32KB window), 0x68, 0x58, 0x48, etc.
+    if (se - ss < 2) return null;
+    if (data[ss] & 0x0F != 0x08) return null;
+    if ((@as(u16, data[ss]) * 256 + data[ss + 1]) % 31 != 0) return null;
 
     return PdfFlateStream{
         .stream_start = ss,
@@ -1380,6 +1384,196 @@ fn findFlateStreamsLinear(allocator: Allocator, data: []const u8) ![]PdfFlateStr
         };
 
         if (parseObjectForFlate(data, back, obj_num, gen_num)) |stream| {
+            try streams.append(allocator, stream);
+        }
+
+        i += 3;
+    }
+
+    return streams.toOwnedSlice(allocator);
+}
+
+// =============================================================================
+// FlateDecode content stream detection (non-image streams)
+// =============================================================================
+
+/// Describes a non-image FlateDecode stream (content stream, metadata, etc.)
+pub const PdfContentStream = struct {
+    stream_start: usize, // byte offset where compressed data begins
+    stream_end: usize, // byte offset past the last byte (exclusive)
+    object_num: u32,
+    gen_num: u32,
+
+    pub fn len(self: PdfContentStream) usize {
+        return self.stream_end - self.stream_start;
+    }
+};
+
+/// Find all non-image FlateDecode streams in a PDF.
+/// These are content streams, metadata streams, etc. — anything with
+/// /Filter /FlateDecode that is NOT an image (/Subtype /Image).
+/// Skips encrypted PDFs.
+pub fn findFlateContentStreams(allocator: Allocator, buf: []const u8) ![]PdfContentStream {
+    if (!isPdfMagic(buf)) return &.{};
+    if (isEncryptedPdf(buf)) return &.{};
+    return findFlateContentLinear(allocator, buf);
+}
+
+/// Parse a single PDF object, checking if it's a non-image FlateDecode stream.
+fn parseObjectForFlateContent(data: []const u8, offset: usize, obj_num: u32, gen_num: u32) ?PdfContentStream {
+    var pos = offset;
+
+    // Skip "N G obj" header
+    const obj_result = parseInt(data, pos) orelse return null;
+    if (obj_result.value != obj_num) return null;
+    pos = skipWhitespace(data, obj_result.end);
+    const gen_result = parseInt(data, pos) orelse return null;
+    pos = skipWhitespace(data, gen_result.end);
+    if (pos + 3 > data.len or !std.mem.eql(u8, data[pos..][0..3], "obj")) return null;
+    pos += 3;
+    pos = skipWhitespace(data, pos);
+
+    if (pos + 2 > data.len or data[pos] != '<' or data[pos + 1] != '<') return null;
+    pos += 2;
+
+    var is_image = false;
+    var is_flate = false;
+    var is_filter_array = false;
+    var stream_length: ?u32 = null;
+    var stream_start: ?usize = null;
+    var stream_end: ?usize = null;
+
+    while (pos < data.len) {
+        pos = skipWhitespace(data, pos);
+        if (pos >= data.len) break;
+
+        // Check for stream keyword
+        if (pos + 6 <= data.len and std.mem.eql(u8, data[pos..][0..6], "stream") and
+            (pos < 3 or !std.mem.eql(u8, data[pos -| 3 ..][0..3], "end")))
+        {
+            pos += 6;
+            if (pos < data.len and data[pos] == '\r') pos += 1;
+            if (pos < data.len and data[pos] == '\n') pos += 1;
+            stream_start = pos;
+
+            if (stream_length) |slen| {
+                stream_end = pos + slen;
+                if (stream_end.? > data.len) stream_end = data.len;
+            } else {
+                var j = pos;
+                while (j + 9 <= data.len) : (j += 1) {
+                    if (std.mem.eql(u8, data[j..][0..9], "endstream")) {
+                        stream_end = j;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        if (pos + 6 <= data.len and std.mem.eql(u8, data[pos..][0..6], "endobj")) break;
+
+        if (data[pos] == '/') {
+            const name = parseName(data, pos) orelse {
+                pos += 1;
+                continue;
+            };
+            pos = skipWhitespace(data, name.end);
+
+            if (std.mem.eql(u8, name.name, "Subtype")) {
+                if (parseName(data, pos)) |subtype| {
+                    if (std.mem.eql(u8, subtype.name, "Image")) is_image = true;
+                    pos = subtype.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "Filter")) {
+                if (pos < data.len and data[pos] == '/') {
+                    if (parseName(data, pos)) |filter| {
+                        if (std.mem.eql(u8, filter.name, "FlateDecode")) is_flate = true;
+                        pos = filter.end;
+                    }
+                } else if (pos < data.len and data[pos] == '[') {
+                    is_filter_array = true;
+                    pos += 1;
+                    var depth: u32 = 1;
+                    while (pos < data.len and depth > 0) {
+                        if (data[pos] == '[') depth += 1;
+                        if (data[pos] == ']') depth -= 1;
+                        pos += 1;
+                    }
+                }
+            } else if (std.mem.eql(u8, name.name, "Length")) {
+                if (parseDirectInt(data, pos)) |r| {
+                    stream_length = @intCast(@max(0, r.value));
+                    pos = r.end;
+                }
+            } else {
+                // Skip value: handle nested dicts
+                if (pos + 1 < data.len and data[pos] == '<' and data[pos + 1] == '<') {
+                    pos += 2;
+                    var depth: u32 = 1;
+                    while (pos + 1 < data.len and depth > 0) {
+                        if (data[pos] == '<' and data[pos + 1] == '<') { depth += 1; pos += 2; } else if (data[pos] == '>' and data[pos + 1] == '>') { depth -= 1; pos += 2; } else { pos += 1; }
+                    }
+                } else {
+                    pos = name.end;
+                }
+            }
+        } else if (data[pos] == '<' and pos + 1 < data.len and data[pos + 1] == '<') {
+            pos += 2;
+            var depth: u32 = 1;
+            while (pos + 1 < data.len and depth > 0) {
+                if (data[pos] == '<' and data[pos + 1] == '<') { depth += 1; pos += 2; } else if (data[pos] == '>' and data[pos + 1] == '>') { depth -= 1; pos += 2; } else { pos += 1; }
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Must be FlateDecode, NOT an image, NOT a filter array
+    if (!is_flate or is_image or is_filter_array) return null;
+    const ss = stream_start orelse return null;
+    const se = stream_end orelse return null;
+    if (se <= ss) return null;
+
+    // Skip tiny streams (not worth decompressing for LZMA2)
+    if (se - ss < 32) return null;
+
+    return PdfContentStream{
+        .stream_start = ss,
+        .stream_end = se,
+        .object_num = obj_num,
+        .gen_num = gen_num,
+    };
+}
+
+/// Find non-image FlateDecode streams by linear scan.
+fn findFlateContentLinear(allocator: Allocator, data: []const u8) ![]PdfContentStream {
+    var streams: std.ArrayListUnmanaged(PdfContentStream) = .{};
+    errdefer streams.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 3 < data.len) {
+        if (!std.mem.eql(u8, data[i..][0..3], "obj")) { i += 1; continue; }
+        if (i > 0 and data[i - 1] != ' ' and data[i - 1] != '\n' and data[i - 1] != '\r' and data[i - 1] != '\t') {
+            i += 1;
+            continue;
+        }
+
+        // Backtrack to find "N G" before "obj"
+        var back = i;
+        while (back > 0 and (data[back - 1] == ' ' or data[back - 1] == '\n' or data[back - 1] == '\r' or data[back - 1] == '\t')) back -= 1;
+        const gen_end = back;
+        while (back > 0 and data[back - 1] >= '0' and data[back - 1] <= '9') back -= 1;
+        if (back == gen_end) { i += 3; continue; }
+        const gen_num = std.fmt.parseInt(u32, data[back..gen_end], 10) catch { i += 3; continue; };
+
+        while (back > 0 and (data[back - 1] == ' ' or data[back - 1] == '\n' or data[back - 1] == '\r' or data[back - 1] == '\t')) back -= 1;
+        const obj_end = back;
+        while (back > 0 and data[back - 1] >= '0' and data[back - 1] <= '9') back -= 1;
+        if (back == obj_end) { i += 3; continue; }
+        const obj_num = std.fmt.parseInt(u32, data[back..obj_end], 10) catch { i += 3; continue; };
+
+        if (parseObjectForFlateContent(data, back, obj_num, gen_num)) |stream| {
             try streams.append(allocator, stream);
         }
 

@@ -18,6 +18,10 @@
 
 8. **Replaced stored-blocks zlibCompress with C zlib** — The Zig 0.15 flate compressor has `@panic("TODO")`, so replaced the workaround (stored deflate blocks, always larger than input) with real C zlib `compress2()`. This means FlateDecode extraction no longer always triggers the PDF rewrite path.
 
+9. **Fixed zlib header detection bug** — `parseObjectForFlate` only accepted `0x78` as a valid zlib CMF byte, but valid CMF includes `0x08`/`0x18`/`0x28`/`0x38`/`0x48`/`0x58`/`0x68`/`0x78` (any with CM=8). Slaughterhouse-Five uses `0x48` (4KB window). Fixed with proper check: `(data[ss] & 0x0F) == 0x08` plus FCHECK validation `(CMF*256+FLG) % 31 == 0`.
+
+10. **PDF content stream decompression for better LZMA2** — FlateDecode non-image streams (page content, text operators) are now decompressed during ingestion so LZMA2 can compress the raw text instead of zlib-compressed entropy. Architecture: expand content streams FIRST on original PDF, then re-scan for image offsets (eliminates delta tracking). On extraction, content streams are recompressed back to zlib. Slaughterhouse-Five: 876KB → 780KB (16% savings on text-only PDF). Far Side Vol I: 158MB → 121MB, byte-identical roundtrip.
+
 ## Active / Next Up
 
 ### Lower Priority / Future

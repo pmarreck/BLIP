@@ -567,6 +567,11 @@ int32_t blip_pdf_rewrite_streams(const uint8_t *shell, size_t shell_len,
 
 #define BLIP_ERR_INVALID_PNG -40
 
+/* Find all non-image FlateDecode content streams in a PDF.
+ * Returns parallel arrays of offsets and lengths. Caller frees with blip_free(). */
+int32_t blip_pdf_content_streams(const uint8_t *buf, size_t buf_len,
+    uint64_t *out_count, uint64_t **out_offsets, uint64_t **out_lengths);
+
 /* Read pdf_stream_offset from a FILE entry.
  * Sets out to UINT64_MAX if not set. */
 int32_t blip_archive_entry_pdf_offset(const uint8_t *buf, size_t buf_len,

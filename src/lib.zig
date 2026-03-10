@@ -1921,6 +1921,40 @@ export fn blip_pdf_rewrite_streams(
     }
 }
 
+/// Find all non-image FlateDecode content streams in a PDF.
+/// Returns parallel arrays of offsets and lengths for each stream.
+/// Caller must free the returned arrays with blip_free().
+export fn blip_pdf_content_streams(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_count: *u64,
+    out_offsets: *[*]u64,
+    out_lengths: *[*]u64,
+) callconv(.c) i32 {
+    const streams = pdf_mod.findFlateContentStreams(page_allocator, buf[0..buf_len]) catch return -1;
+    defer page_allocator.free(streams);
+
+    out_count.* = streams.len;
+    if (streams.len == 0) {
+        out_offsets.* = undefined;
+        out_lengths.* = undefined;
+        return 0;
+    }
+
+    const offsets = page_allocator.alloc(u64, streams.len) catch return -1;
+    errdefer page_allocator.free(offsets);
+    const lengths = page_allocator.alloc(u64, streams.len) catch return -1;
+
+    for (streams, 0..) |s, i| {
+        offsets[i] = s.stream_start;
+        lengths[i] = s.len();
+    }
+
+    out_offsets.* = offsets.ptr;
+    out_lengths.* = lengths.ptr;
+    return 0;
+}
+
 /// Read pdf_stream_offset from a FILE entry in a BLIP archive.
 export fn blip_archive_entry_pdf_offset(
     buf: [*]const u8,

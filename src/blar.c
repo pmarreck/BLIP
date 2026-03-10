@@ -343,24 +343,98 @@ static void *jxl_transcode_worker(void *arg) {
 static bool expand_pdf_container(entry_list_t *el,
                                   const uint8_t *content, size_t content_len,
                                   const blip_archive_entry *file_entry) {
-    /* ── Find all JPEG streams ── */
+    /* ── Phase 1: Expand content streams FIRST ──
+     * Decompresses FlateDecode non-image streams in the original PDF so LZMA2
+     * can compress the raw text/operators much better than zlib-compressed entropy.
+     * This MUST happen before image detection so that image offsets in the
+     * expanded PDF match the offsets that will be stored as 'po' metadata. */
+    uint8_t *working_pdf = NULL;
+    size_t working_len = 0;
+    bool owns_working = false;
+
+    {
+        uint64_t cs_count = 0;
+        uint64_t *cs_offsets = NULL, *cs_lengths = NULL;
+        if (blip_pdf_content_streams(content, content_len, &cs_count,
+                &cs_offsets, &cs_lengths) == BLIP_OK && cs_count > 0)
+        {
+            size_t rep_n = 0;
+            uint64_t *rep_starts = calloc(cs_count, sizeof(uint64_t));
+            uint64_t *rep_orig_lens = calloc(cs_count, sizeof(uint64_t));
+            uint8_t **rep_datas = calloc(cs_count, sizeof(uint8_t *));
+            size_t *rep_lens = calloc(cs_count, sizeof(size_t));
+
+            if (rep_starts && rep_orig_lens && rep_datas && rep_lens) {
+                for (uint64_t ci = 0; ci < cs_count; ci++) {
+                    uint8_t *decompressed = NULL;
+                    size_t decompressed_len = 0;
+                    if (blip_zlib_decompress(content + cs_offsets[ci],
+                            (size_t)cs_lengths[ci],
+                            &decompressed, &decompressed_len) == BLIP_OK)
+                    {
+                        rep_starts[rep_n] = cs_offsets[ci];
+                        rep_orig_lens[rep_n] = cs_lengths[ci];
+                        rep_datas[rep_n] = decompressed;
+                        rep_lens[rep_n] = decompressed_len;
+                        rep_n++;
+                    }
+                }
+
+                if (rep_n > 0) {
+                    uint8_t *expanded = NULL;
+                    size_t expanded_len = 0;
+                    int32_t rw_rc = blip_pdf_rewrite_streams(content, content_len,
+                        rep_n, rep_starts, rep_orig_lens,
+                        (const uint8_t *const *)rep_datas, rep_lens,
+                        &expanded, &expanded_len);
+                    if (rw_rc == BLIP_OK) {
+                        working_pdf = malloc(expanded_len);
+                        if (working_pdf) {
+                            memcpy(working_pdf, expanded, expanded_len);
+                            working_len = expanded_len;
+                            owns_working = true;
+                        }
+                        blip_free(expanded, expanded_len);
+                    }
+                }
+
+                for (size_t ci = 0; ci < rep_n; ci++)
+                    blip_free(rep_datas[ci], rep_lens[ci]);
+            }
+
+            free(rep_starts); free(rep_orig_lens);
+            free(rep_datas); free(rep_lens);
+            blip_free((uint8_t *)cs_offsets, cs_count * sizeof(*cs_offsets));
+            blip_free((uint8_t *)cs_lengths, cs_count * sizeof(*cs_lengths));
+        }
+    }
+
+    /* If no content stream expansion happened, work with original PDF */
+    if (!working_pdf) {
+        working_pdf = (uint8_t *)content; /* const-cast OK: not modified */
+        working_len = content_len;
+        owns_working = false;
+    }
+
+    /* ── Phase 2: Find image streams in (possibly expanded) PDF ──
+     * Offsets returned here are valid for working_pdf, which becomes the shell
+     * base. No delta adjustment needed. */
     uint64_t jpeg_count = 0;
     uint64_t *offsets = NULL;
     uint64_t *lengths = NULL;
     uint32_t *obj_nums = NULL;
     uint32_t *gen_nums = NULL;
-    if (blip_pdf_jpeg_streams(content, content_len, &jpeg_count,
+    if (blip_pdf_jpeg_streams(working_pdf, working_len, &jpeg_count,
             &offsets, &lengths, &obj_nums, &gen_nums) != BLIP_OK)
         jpeg_count = 0;
 
-    /* ── Find all FlateDecode image streams ── */
     uint64_t flate_count = 0;
     uint64_t *fl_offsets = NULL, *fl_lengths = NULL;
     uint32_t *fl_obj_nums = NULL, *fl_gen_nums = NULL;
     uint16_t *fl_predictors = NULL;
     uint32_t *fl_columns = NULL, *fl_widths = NULL, *fl_heights = NULL;
     uint8_t *fl_colors = NULL, *fl_bpcs = NULL;
-    if (blip_pdf_flate_streams(content, content_len, &flate_count,
+    if (blip_pdf_flate_streams(working_pdf, working_len, &flate_count,
             &fl_offsets, &fl_lengths, &fl_obj_nums, &fl_gen_nums,
             &fl_predictors, &fl_columns, &fl_colors, &fl_bpcs,
             &fl_widths, &fl_heights) != BLIP_OK)
@@ -371,10 +445,11 @@ static bool expand_pdf_container(entry_list_t *el,
             blip_free((uint8_t *)offsets, 0); blip_free((uint8_t *)lengths, 0);
             blip_free((uint8_t *)obj_nums, 0); blip_free((uint8_t *)gen_nums, 0);
         }
+        if (owns_working) free(working_pdf);
         return false;
     }
 
-    /* ── Transcode JPEGs to JXL ── */
+    /* ── Phase 3: Transcode JPEGs to JXL ── */
     uint8_t **jxl_bufs = calloc(jpeg_count ? jpeg_count : 1, sizeof(uint8_t *));
     size_t *jxl_lens = calloc(jpeg_count ? jpeg_count : 1, sizeof(size_t));
     if (!jxl_bufs || !jxl_lens) { free(jxl_bufs); free(jxl_lens); goto cleanup_arrays; }
@@ -389,7 +464,7 @@ static bool expand_pdf_container(entry_list_t *el,
 
         if (nthreads > 1 && jpeg_count > 1) {
             jxl_transcode_ctx_t ctx = {
-                .content = content, .offsets = offsets, .lengths = lengths,
+                .content = working_pdf, .offsets = offsets, .lengths = lengths,
                 .jpeg_count = jpeg_count, .jxl_bufs = jxl_bufs, .jxl_lens = jxl_lens,
                 .next_idx = 0,
             };
@@ -404,7 +479,7 @@ static bool expand_pdf_container(entry_list_t *el,
         } else {
             for (uint64_t i = 0; i < jpeg_count; i++) {
                 uint8_t *jxl_data = NULL; size_t jxl_len = 0;
-                if (blip_jxl_from_jpeg(content + offsets[i], (size_t)lengths[i],
+                if (blip_jxl_from_jpeg(working_pdf + offsets[i], (size_t)lengths[i],
                                        &jxl_data, &jxl_len) == BLIP_OK) {
                     jxl_bufs[i] = jxl_data; jxl_lens[i] = jxl_len;
                 }
@@ -420,7 +495,7 @@ static bool expand_pdf_container(entry_list_t *el,
     for (uint64_t i = 0; i < flate_count; i++) {
         /* Decompress zlib → filtered data */
         uint8_t *filtered = NULL; size_t filtered_len = 0;
-        if (blip_zlib_decompress(content + fl_offsets[i], (size_t)fl_lengths[i],
+        if (blip_zlib_decompress(working_pdf + fl_offsets[i], (size_t)fl_lengths[i],
                                  &filtered, &filtered_len) != BLIP_OK)
             continue;
 
@@ -457,7 +532,8 @@ static bool expand_pdf_container(entry_list_t *el,
         goto cleanup_jpeg;
     }
 
-    /* ── Build shell: zero out all successfully transcoded stream regions ── */
+    /* ── Phase 4: Build shell from working_pdf, zeroing image regions ──
+     * Offsets are already correct for working_pdf. */
     size_t total_zeroed = jpeg_success + flate_success;
     uint64_t *shell_offsets = calloc(total_zeroed, sizeof(uint64_t));
     uint64_t *shell_lengths = calloc(total_zeroed, sizeof(uint64_t));
@@ -477,7 +553,7 @@ static bool expand_pdf_container(entry_list_t *el,
     }
 
     uint8_t *shell = NULL; size_t shell_len = 0;
-    int32_t rc = blip_pdf_create_shell(content, content_len,
+    int32_t rc = blip_pdf_create_shell(working_pdf, working_len,
         shell_offsets, shell_lengths, total_zeroed, &shell, &shell_len);
     free(shell_offsets); free(shell_lengths);
 
@@ -487,6 +563,9 @@ static bool expand_pdf_container(entry_list_t *el,
         free(fl_jxl_bufs); free(fl_jxl_lens);
         goto cleanup_jpeg;
     }
+
+    /* working_pdf no longer needed — shell has the data we need */
+    if (owns_working) { free(working_pdf); working_pdf = NULL; owns_working = false; }
 
     uint8_t *shell_owned = malloc(shell_len);
     if (!shell_owned) {
@@ -507,7 +586,7 @@ static bool expand_pdf_container(entry_list_t *el,
         goto cleanup_jpeg;
     }
 
-    /* ── Create container DIR entry ── */
+    /* ── Phase 5: Create container DIR entry ── */
     blip_archive_entry dir_entry;
     memset(&dir_entry, 0, sizeof(dir_entry));
     dir_entry.path = file_entry->path;
@@ -558,7 +637,8 @@ static bool expand_pdf_container(entry_list_t *el,
         if (!entry_list_add(el, body_ent)) goto fail;
     }
 
-    /* ── Add JPEG JXL image FILE entries ── */
+    /* ── Add JPEG JXL image FILE entries ──
+     * po values come from Phase 2 scan of working_pdf — correct for the shell. */
     for (uint64_t i = 0; i < jpeg_count; i++) {
         if (!jxl_bufs[i]) continue;
         uint8_t *jxl_owned = malloc(jxl_lens[i]);
@@ -596,7 +676,8 @@ static bool expand_pdf_container(entry_list_t *el,
         el->bytes_seen += jxl_lens[i];
     }
 
-    /* ── Add FlateDecode JXL image FILE entries ── */
+    /* ── Add FlateDecode JXL image FILE entries ──
+     * po values come from Phase 2 scan — correct for the shell, no adjustment. */
     for (uint64_t i = 0; i < flate_count; i++) {
         if (!fl_jxl_bufs[i]) continue;
         uint8_t *jxl_owned = malloc(fl_jxl_lens[i]);
@@ -666,6 +747,7 @@ cleanup_jpeg:
         if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
     free(jxl_bufs); free(jxl_lens);
 cleanup_arrays:
+    if (owns_working) free(working_pdf);
     if (jpeg_count > 0) {
         blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets));
         blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths));
@@ -687,6 +769,7 @@ cleanup_arrays:
     return false;
 
 fail:
+    if (owns_working) free(working_pdf);
     for (uint64_t i = 0; i < jpeg_count; i++)
         if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
     for (uint64_t i = 0; i < flate_count; i++)
@@ -2289,10 +2372,20 @@ static int cmd_extract(int argc, char **argv) {
                     (const uint8_t *const *)fl_new_datas, fl_new_lens,
                     &rewritten, &rewritten_len);
                 if (rc == BLIP_OK) {
-                    /* Replace pdf_buf with rewritten version */
+                    /* Replace pdf_buf with rewritten version.
+                     * rewritePdfWithStreams returns Zig-allocated memory;
+                     * copy to malloc'd buffer so free() works later. */
                     free(pdf_buf);
-                    pdf_buf = rewritten;
+                    pdf_buf = malloc(rewritten_len);
+                    if (pdf_buf) {
+                        memcpy(pdf_buf, rewritten, rewritten_len);
+                    } else {
+                        /* OOM fallback: use Zig buffer directly (will crash on free) */
+                        pdf_buf = rewritten;
+                        rewritten = NULL;
+                    }
                     shell_len = rewritten_len;
+                    if (rewritten) blip_free(rewritten, rewritten_len);
                 } else if (rc == BLIP_ERR_XREF_STREAM) {
                     /* Xref stream PDF — can't rewrite, leave FlateDecode zeroed */
                     fprintf(stderr, "WARNING: PDF '%.*s': xref stream PDF, "
@@ -2318,6 +2411,76 @@ static int cmd_extract(int argc, char **argv) {
                 free(pdf_buf);
                 failed++;
                 continue;
+            }
+
+            /* ── Recompress content streams ──
+             * During ingestion, FlateDecode non-image streams were decompressed
+             * for better LZMA2 compression. Now we need to recompress them.
+             * The dict still says /Filter /FlateDecode but stream data is raw.
+             * Find these streams (they won't have a valid zlib header) and compress. */
+            {
+                uint64_t cs_count = 0;
+                uint64_t *cs_offs = NULL, *cs_lens = NULL;
+                if (blip_pdf_content_streams(pdf_buf, shell_len, &cs_count,
+                        &cs_offs, &cs_lens) == BLIP_OK && cs_count > 0)
+                {
+                    size_t cs_rep_n = 0;
+                    uint64_t *cs_starts = calloc(cs_count, sizeof(uint64_t));
+                    uint64_t *cs_orig = calloc(cs_count, sizeof(uint64_t));
+                    uint8_t **cs_datas = calloc(cs_count, sizeof(uint8_t *));
+                    size_t *cs_sizes = calloc(cs_count, sizeof(size_t));
+
+                    if (cs_starts && cs_orig && cs_datas && cs_sizes) {
+                        for (uint64_t ci = 0; ci < cs_count; ci++) {
+                            const uint8_t *sdata = pdf_buf + cs_offs[ci];
+                            size_t slen = (size_t)cs_lens[ci];
+                            /* Skip if already zlib-compressed (valid header) */
+                            if (slen >= 2 && (sdata[0] & 0x0F) == 0x08 &&
+                                ((uint16_t)sdata[0] * 256 + sdata[1]) % 31 == 0)
+                                continue;
+                            /* Compress raw data back to zlib */
+                            uint8_t *compressed = NULL;
+                            size_t compressed_len = 0;
+                            if (blip_zlib_compress(sdata, slen,
+                                    &compressed, &compressed_len) == BLIP_OK)
+                            {
+                                cs_starts[cs_rep_n] = cs_offs[ci];
+                                cs_orig[cs_rep_n] = cs_lens[ci];
+                                cs_datas[cs_rep_n] = compressed;
+                                cs_sizes[cs_rep_n] = compressed_len;
+                                cs_rep_n++;
+                            }
+                        }
+
+                        if (cs_rep_n > 0) {
+                            uint8_t *recomp = NULL;
+                            size_t recomp_len = 0;
+                            int32_t cs_rc = blip_pdf_rewrite_streams(pdf_buf, shell_len,
+                                cs_rep_n, cs_starts, cs_orig,
+                                (const uint8_t *const *)cs_datas, cs_sizes,
+                                &recomp, &recomp_len);
+                            if (cs_rc == BLIP_OK) {
+                                free(pdf_buf);
+                                pdf_buf = malloc(recomp_len);
+                                if (pdf_buf) {
+                                    memcpy(pdf_buf, recomp, recomp_len);
+                                } else {
+                                    pdf_buf = recomp;
+                                    recomp = NULL;
+                                }
+                                shell_len = recomp_len;
+                                if (recomp) blip_free(recomp, recomp_len);
+                            }
+                            for (size_t ci = 0; ci < cs_rep_n; ci++)
+                                blip_free(cs_datas[ci], cs_sizes[ci]);
+                        }
+                    }
+
+                    free(cs_starts); free(cs_orig);
+                    free(cs_datas); free(cs_sizes);
+                    blip_free((uint8_t *)cs_offs, cs_count * sizeof(*cs_offs));
+                    blip_free((uint8_t *)cs_lens, cs_count * sizeof(*cs_lens));
+                }
             }
 
             /* Write the reconstructed PDF */
