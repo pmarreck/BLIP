@@ -224,6 +224,42 @@ fn reconstructFileEntry(allocator: Allocator, reader: mini_blar.ArchiveReader, i
         }
     }
 
+    // Read flate BitsPerComponent (fb)
+    if (try meta_reader.findKey("fb")) |fb_idx| {
+        const fb_container = try meta_reader.valueAt(fb_idx);
+        const fb_val = try leaf.readData(fb_container);
+        if (fb_val.len >= 1) {
+            entry.flate_bpc = fb_val[0];
+        }
+    }
+
+    // Read flate columns (fc)
+    if (try meta_reader.findKey("fc")) |fc_idx| {
+        const fc_container = try meta_reader.valueAt(fc_idx);
+        const fc_val = try leaf.readData(fc_container);
+        if (fc_val.len >= 4) {
+            entry.flate_columns = std.mem.readInt(u32, fc_val[0..4], .little);
+        }
+    }
+
+    // Read flate colors (fl)
+    if (try meta_reader.findKey("fl")) |fl_idx| {
+        const fl_container = try meta_reader.valueAt(fl_idx);
+        const fl_val = try leaf.readData(fl_container);
+        if (fl_val.len >= 1) {
+            entry.flate_colors = fl_val[0];
+        }
+    }
+
+    // Read flate predictor (fp)
+    if (try meta_reader.findKey("fp")) |fp_idx| {
+        const fp_container = try meta_reader.valueAt(fp_idx);
+        const fp_val = try leaf.readData(fp_container);
+        if (fp_val.len >= 2) {
+            entry.flate_predictor = std.mem.readInt(u16, fp_val[0..2], .little);
+        }
+    }
+
     // Read xattrs and resource fork from forks dict (element 2 if present)
     const elem_count = arr.elementCount();
     if (elem_count >= 3) {

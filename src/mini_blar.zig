@@ -32,7 +32,11 @@ pub const FileEntry = struct {
     zip_compression_method: ?u16 = null, // original zip method for re-zipping (0=store, 8=deflate)
     pdf_stream_offset: ?u64 = null, // "po" — byte offset of JPEG stream in PDF body
     pdf_stream_length: ?u64 = null, // "pl" — original JPEG stream data length
-    jxl_source_format: []const u8 = &.{}, // "jx" — source format (e.g. "jpeg")
+    jxl_source_format: []const u8 = &.{}, // "jx" — source format (e.g. "jpeg", "flate")
+    flate_predictor: ?u16 = null, // "fp" — PDF /Predictor value (10-15 for PNG variants)
+    flate_columns: ?u32 = null, // "fc" — /Columns (image width in pixels)
+    flate_colors: ?u8 = null, // "fl" — /Colors (channel count)
+    flate_bpc: ?u8 = null, // "fb" — /BitsPerComponent
 };
 
 /// An xattr key-value pair.

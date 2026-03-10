@@ -334,6 +334,10 @@ static void fill_entry_metadata(blip_archive_entry *entry, const struct stat *st
     entry->zip_compression_method = 0xFFFF;
     entry->pdf_stream_offset = UINT64_MAX;
     entry->pdf_stream_length = UINT64_MAX;
+    entry->flate_predictor = 0;
+    entry->flate_columns = 0;
+    entry->flate_colors = 0;
+    entry->flate_bpc = 0;
 
     const char *owner = get_owner_name(st->st_uid);
     if (owner) {

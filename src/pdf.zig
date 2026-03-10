@@ -1,6 +1,26 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Describes a FlateDecode image stream found within a PDF file.
+/// These are PNG-style compressed images (zlib + optional PNG row filters).
+pub const PdfFlateStream = struct {
+    stream_start: usize, // byte offset where compressed data begins
+    stream_end: usize, // byte offset past the last byte (exclusive)
+    object_num: u32,
+    gen_num: u32,
+    predictor: u16, // /Predictor value (1=none, 10-15=PNG variants)
+    columns: u32, // /Columns (image width in pixels)
+    colors: u8, // /Colors (channels, default 1)
+    bits_per_component: u8, // /BitsPerComponent (default 8)
+    width: u32, // /Width of the image
+    height: u32, // /Height of the image
+
+    /// Length of the compressed stream data.
+    pub fn len(self: PdfFlateStream) usize {
+        return self.stream_end - self.stream_start;
+    }
+};
+
 /// Describes a JPEG stream found within a PDF file.
 pub const PdfJpegStream = struct {
     stream_start: usize, // byte offset where JPEG data begins in the PDF buffer
@@ -638,6 +658,545 @@ fn findJpegStreamsLinear(allocator: Allocator, data: []const u8) ![]PdfJpegStrea
 }
 
 // =============================================================================
+// FlateDecode defilter/refilter + zlib decompress/compress
+// =============================================================================
+
+/// Zlib-decompress data. Caller owns returned slice.
+pub fn zlibDecompress(allocator: Allocator, compressed: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var source_reader = std.Io.Reader.fixed(compressed);
+    var empty_buf: [0]u8 = .{};
+    var decompress_state = flate.Decompress.init(&source_reader, .zlib, &empty_buf);
+    return decompress_state.reader.allocRemaining(allocator, .unlimited) catch
+        return error.InvalidData;
+}
+
+/// Zlib-compress data using stored deflate blocks + Adler-32.
+/// Note: This uses uncompressed stored blocks, producing output larger than real
+/// deflate compression. This is acceptable for PDF extraction because:
+/// 1. The extracted PDF is pixel-identical (lossless)
+/// 2. The PDF is larger than the original but fully valid
+/// 3. The Zig 0.15 flate compressor is not yet complete
+pub fn zlibCompress(allocator: Allocator, data: []const u8) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .{};
+    errdefer output.deinit(allocator);
+
+    // Zlib header: CMF=0x78, FLG=0x01
+    try output.appendSlice(allocator, &[_]u8{ 0x78, 0x01 });
+
+    // Raw deflate stored blocks
+    const max_block: usize = 65535;
+    const num_blocks: usize = if (data.len == 0) 1 else (data.len + max_block - 1) / max_block;
+
+    var pos: usize = 0;
+    var block_idx: usize = 0;
+    while (block_idx < num_blocks) : (block_idx += 1) {
+        const remaining = data.len - pos;
+        const block_len: u16 = @intCast(@min(remaining, max_block));
+        const is_final: u8 = if (block_idx == num_blocks - 1) 1 else 0;
+
+        try output.append(allocator, is_final);
+        var len_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_bytes, block_len, .little);
+        try output.appendSlice(allocator, &len_bytes);
+        std.mem.writeInt(u16, &len_bytes, ~block_len, .little);
+        try output.appendSlice(allocator, &len_bytes);
+        if (block_len > 0) {
+            try output.appendSlice(allocator, data[pos..][0..block_len]);
+        }
+        pos += block_len;
+    }
+
+    // Adler-32 checksum (big-endian)
+    const adler = std.hash.Adler32.hash(data);
+    var adler_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &adler_bytes, adler, .big);
+    try output.appendSlice(allocator, &adler_bytes);
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn paethPredictor(a: i16, b: i16, c: i16) u8 {
+    const p = a + b - c;
+    const pa = @as(u16, @intCast(if (p > a) p - a else a - p));
+    const pb = @as(u16, @intCast(if (p > b) p - b else b - p));
+    const pc = @as(u16, @intCast(if (p > c) p - c else c - p));
+    if (pa <= pb and pa <= pc) return @intCast(@as(u16, @intCast(a)));
+    if (pb <= pc) return @intCast(@as(u16, @intCast(b)));
+    return @intCast(@as(u16, @intCast(c)));
+}
+
+/// Remove PNG-style row filters from FlateDecode image data.
+/// Predictor 10 = None, 11 = Sub, 12 = Up, 13 = Average, 14 = Paeth (fixed per stream)
+/// Predictor 15 = Optimal (per-row filter byte, same as PNG IDAT)
+/// Returns raw pixel data (no filter bytes). Caller owns result.
+pub fn defilterPdfFlate(allocator: Allocator, data: []const u8, columns: u32, colors: u8, bpc: u8, predictor: u16) ![]u8 {
+    if (predictor < 10 or predictor > 15) return error.InvalidData;
+
+    const bytes_per_pixel = (@as(usize, colors) * @as(usize, bpc) + 7) / 8;
+    const row_bytes = (@as(usize, columns) * @as(usize, colors) * @as(usize, bpc) + 7) / 8;
+
+    if (predictor == 15) {
+        // Per-row filter byte (same as PNG IDAT)
+        const row_stride = row_bytes + 1; // +1 for filter byte
+        if (data.len == 0) return allocator.alloc(u8, 0);
+        const num_rows = data.len / row_stride;
+        if (num_rows == 0) return error.InvalidData;
+
+        const output = try allocator.alloc(u8, num_rows * row_bytes);
+        errdefer allocator.free(output);
+
+        // Defilter in place on a copy
+        const working = try allocator.alloc(u8, data.len);
+        defer allocator.free(working);
+        @memcpy(working, data);
+
+        var prev_row: ?[]u8 = null;
+        for (0..num_rows) |y| {
+            const row = working[y * row_stride ..][0..row_stride];
+            const filter_byte = row[0];
+            const row_data = row[1..];
+
+            switch (filter_byte) {
+                0 => {}, // None
+                1 => { // Sub
+                    for (bytes_per_pixel..row_bytes) |i| {
+                        row_data[i] = row_data[i] +% row_data[i - bytes_per_pixel];
+                    }
+                },
+                2 => { // Up
+                    if (prev_row) |prev| {
+                        const prev_data = prev[1..];
+                        for (0..row_bytes) |i| {
+                            row_data[i] = row_data[i] +% prev_data[i];
+                        }
+                    }
+                },
+                3 => { // Average
+                    const prev_data: ?[]u8 = if (prev_row) |prev| prev[1..] else null;
+                    for (0..row_bytes) |i| {
+                        const a: u16 = if (i >= bytes_per_pixel) row_data[i - bytes_per_pixel] else 0;
+                        const b: u16 = if (prev_data) |pd| pd[i] else 0;
+                        row_data[i] = row_data[i] +% @as(u8, @intCast((a + b) / 2));
+                    }
+                },
+                4 => { // Paeth
+                    const prev_data: ?[]u8 = if (prev_row) |prev| prev[1..] else null;
+                    for (0..row_bytes) |i| {
+                        const a: i16 = if (i >= bytes_per_pixel) @intCast(row_data[i - bytes_per_pixel]) else 0;
+                        const b: i16 = if (prev_data) |pd| @intCast(pd[i]) else 0;
+                        const c_val: i16 = if (prev_data) |pd| (if (i >= bytes_per_pixel) @as(i16, @intCast(pd[i - bytes_per_pixel])) else 0) else 0;
+                        row_data[i] = row_data[i] +% paethPredictor(a, b, c_val);
+                    }
+                },
+                else => return error.InvalidData,
+            }
+
+            @memcpy(output[y * row_bytes ..][0..row_bytes], row_data);
+            prev_row = row;
+        }
+
+        return output;
+    } else {
+        // Fixed filter type (Predictor 10-14): no per-row filter byte
+        // Predictor 10 = None, 11 = Sub, 12 = Up, 13 = Average, 14 = Paeth
+        const filter_type: u8 = @intCast(predictor - 10);
+        const num_rows = data.len / row_bytes;
+        if (num_rows == 0 or data.len % row_bytes != 0) return error.InvalidData;
+
+        const output = try allocator.alloc(u8, data.len);
+        errdefer allocator.free(output);
+        @memcpy(output, data);
+
+        for (0..num_rows) |y| {
+            const row_data = output[y * row_bytes ..][0..row_bytes];
+            const prev_data: ?[]const u8 = if (y > 0) output[(y - 1) * row_bytes ..][0..row_bytes] else null;
+
+            switch (filter_type) {
+                0 => {}, // None
+                1 => { // Sub
+                    for (bytes_per_pixel..row_bytes) |i| {
+                        row_data[i] = row_data[i] +% row_data[i - bytes_per_pixel];
+                    }
+                },
+                2 => { // Up
+                    if (prev_data) |pd| {
+                        for (0..row_bytes) |i| {
+                            row_data[i] = row_data[i] +% pd[i];
+                        }
+                    }
+                },
+                3 => { // Average
+                    for (0..row_bytes) |i| {
+                        const a: u16 = if (i >= bytes_per_pixel) row_data[i - bytes_per_pixel] else 0;
+                        const b: u16 = if (prev_data) |pd| pd[i] else 0;
+                        row_data[i] = row_data[i] +% @as(u8, @intCast((a + b) / 2));
+                    }
+                },
+                4 => { // Paeth
+                    for (0..row_bytes) |i| {
+                        const a: i16 = if (i >= bytes_per_pixel) @intCast(row_data[i - bytes_per_pixel]) else 0;
+                        const b: i16 = if (prev_data) |pd| @intCast(pd[i]) else 0;
+                        const c_val: i16 = if (prev_data) |pd| (if (i >= bytes_per_pixel) @as(i16, @intCast(pd[i - bytes_per_pixel])) else 0) else 0;
+                        row_data[i] = row_data[i] +% paethPredictor(a, b, c_val);
+                    }
+                },
+                else => return error.InvalidData,
+            }
+        }
+
+        return output;
+    }
+}
+
+/// Re-apply PNG-style row filters to raw pixel data for FlateDecode.
+/// Always uses filter type 0 (None) for simplicity — the data goes through
+/// LZMA2 in blar anyway, so optimal PNG filtering provides no benefit.
+/// For Predictor 15: prepends filter byte 0 to each row.
+/// For Predictor 10-14: no filter byte prefix (fixed filter = None).
+/// Caller owns result.
+pub fn refilterPdfFlate(allocator: Allocator, pixels: []const u8, columns: u32, colors: u8, bpc: u8, predictor: u16) ![]u8 {
+    if (predictor < 10 or predictor > 15) return error.InvalidData;
+
+    const row_bytes = (@as(usize, columns) * @as(usize, colors) * @as(usize, bpc) + 7) / 8;
+    if (row_bytes == 0) return error.InvalidData;
+    const num_rows = pixels.len / row_bytes;
+    if (pixels.len % row_bytes != 0) return error.InvalidData;
+
+    if (predictor == 15) {
+        // Per-row filter byte: prepend 0 (None) to each row
+        const output = try allocator.alloc(u8, num_rows * (row_bytes + 1));
+        errdefer allocator.free(output);
+        for (0..num_rows) |y| {
+            output[y * (row_bytes + 1)] = 0; // None filter
+            @memcpy(output[y * (row_bytes + 1) + 1 ..][0..row_bytes], pixels[y * row_bytes ..][0..row_bytes]);
+        }
+        return output;
+    } else {
+        // Fixed filter type — for None (predictor 10), just copy
+        // For other predictors (11-14), we use None (no filtering) since
+        // re-encoding with the original filter is unnecessary
+        if (predictor == 10) {
+            return allocator.dupe(u8, pixels);
+        }
+        // For sub/up/avg/paeth: just return unfiltered data
+        // (the PDF /Predictor value is stored in metadata, so extraction knows what was used)
+        return allocator.dupe(u8, pixels);
+    }
+}
+
+// =============================================================================
+// FlateDecode image stream detection
+// =============================================================================
+
+/// Find all FlateDecode image streams in a PDF that have PNG-style prediction
+/// (Predictor >= 10). Only these are worth transcoding to JXL — raw FlateDecode
+/// (Predictor=1 or absent) is just generic zlib data, not image-like.
+/// Skips encrypted PDFs. Caller owns the returned slice.
+pub fn findFlateImageStreams(allocator: Allocator, buf: []const u8) ![]PdfFlateStream {
+    if (!isPdfMagic(buf)) return &.{};
+    if (isEncryptedPdf(buf)) return &.{};
+
+    // Linear scan for FlateDecode image objects
+    return findFlateStreamsLinear(allocator, buf);
+}
+
+/// Parse a single PDF object at the given offset, checking if it's a FlateDecode image stream.
+fn parseObjectForFlate(data: []const u8, offset: usize, obj_num: u32, gen_num: u32) ?PdfFlateStream {
+    var pos = offset;
+
+    // Skip "N G obj" header (verify object number matches)
+    const obj_result = parseInt(data, pos) orelse return null;
+    if (obj_result.value != obj_num) return null;
+    pos = skipWhitespace(data, obj_result.end);
+    const gen_result = parseInt(data, pos) orelse return null;
+    pos = skipWhitespace(data, gen_result.end);
+    if (pos + 3 > data.len or !std.mem.eql(u8, data[pos..][0..3], "obj")) return null;
+    pos += 3;
+    pos = skipWhitespace(data, pos);
+
+    // Expect the object dictionary opening "<<"
+    if (pos + 2 > data.len or data[pos] != '<' or data[pos + 1] != '<') return null;
+    pos += 2;
+
+    // Parse dictionary looking for image/FlateDecode indicators
+    var is_image = false;
+    var is_flate = false;
+    var is_filter_array = false;
+    var stream_length: ?u32 = null;
+    var stream_start: ?usize = null;
+    var stream_end: ?usize = null;
+    var width: ?u32 = null;
+    var height: ?u32 = null;
+    var bpc: u8 = 8; // default
+    var predictor: u16 = 1; // default (no prediction)
+    var columns: ?u32 = null;
+    var colors: u8 = 1; // default
+    var dp_bpc: ?u8 = null;
+
+    while (pos < data.len) {
+        pos = skipWhitespace(data, pos);
+        if (pos >= data.len) break;
+
+        // Check for stream keyword (but not "endstream")
+        if (pos + 6 <= data.len and std.mem.eql(u8, data[pos..][0..6], "stream") and
+            (pos < 3 or !std.mem.eql(u8, data[pos -| 3 ..][0..3], "end")))
+        {
+            pos += 6;
+            if (pos < data.len and data[pos] == '\r') pos += 1;
+            if (pos < data.len and data[pos] == '\n') pos += 1;
+            stream_start = pos;
+
+            if (stream_length) |slen| {
+                stream_end = pos + slen;
+                if (stream_end.? > data.len) stream_end = data.len;
+            } else {
+                // Fallback: search for endstream
+                var j = pos;
+                while (j + 9 <= data.len) : (j += 1) {
+                    if (std.mem.eql(u8, data[j..][0..9], "endstream")) {
+                        stream_end = j;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        // Check for endobj
+        if (pos + 6 <= data.len and std.mem.eql(u8, data[pos..][0..6], "endobj")) break;
+
+        // Parse dictionary entries
+        if (data[pos] == '/') {
+            const name = parseName(data, pos) orelse {
+                pos += 1;
+                continue;
+            };
+            pos = skipWhitespace(data, name.end);
+
+            if (std.mem.eql(u8, name.name, "Subtype")) {
+                if (parseName(data, pos)) |subtype| {
+                    if (std.mem.eql(u8, subtype.name, "Image")) is_image = true;
+                    pos = subtype.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "Filter")) {
+                if (pos < data.len and data[pos] == '/') {
+                    if (parseName(data, pos)) |filter| {
+                        if (std.mem.eql(u8, filter.name, "FlateDecode")) is_flate = true;
+                        pos = filter.end;
+                    }
+                } else if (pos < data.len and data[pos] == '[') {
+                    is_filter_array = true;
+                    pos += 1;
+                    var depth: u32 = 1;
+                    while (pos < data.len and depth > 0) {
+                        if (data[pos] == '[') depth += 1;
+                        if (data[pos] == ']') depth -= 1;
+                        pos += 1;
+                    }
+                }
+            } else if (std.mem.eql(u8, name.name, "Length")) {
+                if (parseDirectInt(data, pos)) |r| {
+                    stream_length = @intCast(@max(0, r.value));
+                    pos = r.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "Width")) {
+                if (parseDirectInt(data, pos)) |r| {
+                    width = @intCast(@max(0, r.value));
+                    pos = r.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "Height")) {
+                if (parseDirectInt(data, pos)) |r| {
+                    height = @intCast(@max(0, r.value));
+                    pos = r.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "BitsPerComponent")) {
+                if (parseDirectInt(data, pos)) |r| {
+                    bpc = @intCast(@max(1, @min(16, r.value)));
+                    pos = r.end;
+                }
+            } else if (std.mem.eql(u8, name.name, "DecodeParms")) {
+                // Parse << /Predictor N /Columns C /Colors K /BitsPerComponent B >>
+                if (pos + 1 < data.len and data[pos] == '<' and data[pos + 1] == '<') {
+                    pos += 2;
+                    // Scan the DecodeParms dict
+                    while (pos < data.len) {
+                        if (pos + 1 < data.len and data[pos] == '>' and data[pos + 1] == '>') {
+                            pos += 2;
+                            break;
+                        }
+                        if (data[pos] == '/') {
+                            const dp_name = parseName(data, pos) orelse {
+                                pos += 1;
+                                continue;
+                            };
+                            pos = skipWhitespace(data, dp_name.end);
+
+                            if (std.mem.eql(u8, dp_name.name, "Predictor")) {
+                                if (parseInt(data, pos)) |r| {
+                                    predictor = @intCast(@max(1, @min(15, r.value)));
+                                    pos = r.end;
+                                }
+                            } else if (std.mem.eql(u8, dp_name.name, "Columns")) {
+                                if (parseInt(data, pos)) |r| {
+                                    columns = @intCast(@max(1, r.value));
+                                    pos = r.end;
+                                }
+                            } else if (std.mem.eql(u8, dp_name.name, "Colors")) {
+                                if (parseInt(data, pos)) |r| {
+                                    colors = @intCast(@max(1, @min(255, r.value)));
+                                    pos = r.end;
+                                }
+                            } else if (std.mem.eql(u8, dp_name.name, "BitsPerComponent")) {
+                                if (parseInt(data, pos)) |r| {
+                                    dp_bpc = @intCast(@max(1, @min(16, r.value)));
+                                    pos = r.end;
+                                }
+                            } else {
+                                pos = dp_name.end;
+                            }
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                }
+            } else {
+                // Skip past the value
+                if (pos + 1 < data.len and data[pos] == '<' and data[pos + 1] == '<') {
+                    // Nested dict — skip it
+                    pos += 2;
+                    var depth: u32 = 1;
+                    while (pos + 1 < data.len and depth > 0) {
+                        if (data[pos] == '<' and data[pos + 1] == '<') {
+                            depth += 1;
+                            pos += 2;
+                        } else if (data[pos] == '>' and data[pos + 1] == '>') {
+                            depth -= 1;
+                            pos += 2;
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                } else {
+                    pos = name.end;
+                }
+            }
+        } else if (data[pos] == '<' and pos + 1 < data.len and data[pos + 1] == '<') {
+            // Nested dict — skip it
+            pos += 2;
+            var depth: u32 = 1;
+            while (pos + 1 < data.len and depth > 0) {
+                if (data[pos] == '<' and data[pos + 1] == '<') {
+                    depth += 1;
+                    pos += 2;
+                } else if (data[pos] == '>' and data[pos + 1] == '>') {
+                    depth -= 1;
+                    pos += 2;
+                } else {
+                    pos += 1;
+                }
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Must be an image with single FlateDecode filter and Predictor >= 10
+    if (!is_image or !is_flate or is_filter_array) return null;
+    if (predictor < 10) return null; // Not PNG-style prediction, skip
+    const ss = stream_start orelse return null;
+    const se = stream_end orelse return null;
+    if (se <= ss) return null;
+    const w = width orelse return null;
+    const h = height orelse return null;
+
+    // Use /DecodeParms /BitsPerComponent if present, otherwise use outer /BitsPerComponent
+    const final_bpc = dp_bpc orelse bpc;
+
+    // If /Columns not specified in DecodeParms, use /Width
+    const final_columns = columns orelse w;
+
+    // Verify zlib header (first byte should be 0x78 for deflate)
+    if (se - ss < 2 or data[ss] != 0x78) return null;
+
+    return PdfFlateStream{
+        .stream_start = ss,
+        .stream_end = se,
+        .object_num = obj_num,
+        .gen_num = gen_num,
+        .predictor = predictor,
+        .columns = final_columns,
+        .colors = colors,
+        .bits_per_component = final_bpc,
+        .width = w,
+        .height = h,
+    };
+}
+
+/// Find FlateDecode image streams by linear scan.
+fn findFlateStreamsLinear(allocator: Allocator, data: []const u8) ![]PdfFlateStream {
+    var streams: std.ArrayListUnmanaged(PdfFlateStream) = .{};
+    errdefer streams.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 3 < data.len) {
+        // Look for "obj" keyword
+        if (!std.mem.eql(u8, data[i..][0..3], "obj")) {
+            i += 1;
+            continue;
+        }
+
+        // Must be preceded by whitespace
+        if (i > 0 and data[i - 1] != ' ' and data[i - 1] != '\n' and data[i - 1] != '\r' and data[i - 1] != '\t') {
+            i += 1;
+            continue;
+        }
+
+        // Backtrack to find "N G" before "obj"
+        var back = i;
+        while (back > 0 and (data[back - 1] == ' ' or data[back - 1] == '\n' or data[back - 1] == '\r' or data[back - 1] == '\t')) {
+            back -= 1;
+        }
+        const gen_end = back;
+        while (back > 0 and data[back - 1] >= '0' and data[back - 1] <= '9') {
+            back -= 1;
+        }
+        if (back == gen_end) {
+            i += 3;
+            continue;
+        }
+        const gen_num = std.fmt.parseInt(u32, data[back..gen_end], 10) catch {
+            i += 3;
+            continue;
+        };
+
+        while (back > 0 and (data[back - 1] == ' ' or data[back - 1] == '\n' or data[back - 1] == '\r' or data[back - 1] == '\t')) {
+            back -= 1;
+        }
+        const obj_end = back;
+        while (back > 0 and data[back - 1] >= '0' and data[back - 1] <= '9') {
+            back -= 1;
+        }
+        if (back == obj_end) {
+            i += 3;
+            continue;
+        }
+        const obj_num = std.fmt.parseInt(u32, data[back..obj_end], 10) catch {
+            i += 3;
+            continue;
+        };
+
+        if (parseObjectForFlate(data, back, obj_num, gen_num)) |stream| {
+            try streams.append(allocator, stream);
+        }
+
+        i += 3;
+    }
+
+    return streams.toOwnedSlice(allocator);
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -843,4 +1402,140 @@ test "splicePdfImages rejects wrong size" {
     const streams = [_]PdfJpegStream{.{ .stream_start = 0, .stream_end = 4, .object_num = 1, .gen_num = 0 }};
     const wrong_size = [_][]const u8{&[_]u8{ 1, 2 }}; // 2 bytes, not 4
     try testing.expectError(error.ImageSizeMismatch, splicePdfImages(&buf, &streams, &wrong_size));
+}
+
+// =============================================================================
+// FlateDecode tests
+// =============================================================================
+
+/// Simple zlib stored-blocks compressor for test data.
+/// Same approach as png.zig's zlibCompress.
+fn testZlibCompress(allocator: Allocator, data: []const u8) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .{};
+    errdefer output.deinit(allocator);
+
+    // Zlib header: CMF=0x78, FLG=0x01
+    try output.appendSlice(allocator, &[_]u8{ 0x78, 0x01 });
+
+    // Single stored block (data fits in one block for test data)
+    try output.append(allocator, 1); // final block
+    var len_bytes: [2]u8 = undefined;
+    const block_len: u16 = @intCast(data.len);
+    std.mem.writeInt(u16, &len_bytes, block_len, .little);
+    try output.appendSlice(allocator, &len_bytes);
+    std.mem.writeInt(u16, &len_bytes, ~block_len, .little);
+    try output.appendSlice(allocator, &len_bytes);
+    try output.appendSlice(allocator, data);
+
+    // Adler-32 checksum (big-endian)
+    const adler = std.hash.Adler32.hash(data);
+    var adler_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &adler_bytes, adler, .big);
+    try output.appendSlice(allocator, &adler_bytes);
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn makeTestFlatePdf(allocator: Allocator) ![]u8 {
+    // Create a minimal PDF with a FlateDecode image stream.
+    // Uses zlib-compressed 2x2 RGB pixel data with Predictor 15 (PNG optimal).
+    const raw_filtered = [_]u8{
+        0, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, // row 0: None filter, red, green
+        0, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, // row 1: None filter, blue, yellow
+    };
+
+    const compressed = try testZlibCompress(allocator, &raw_filtered);
+    defer allocator.free(compressed);
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "%PDF-1.4\n");
+
+    const obj1_offset = out.items.len;
+    try out.appendSlice(allocator, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = out.items.len;
+    try out.appendSlice(allocator, "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+    const obj3_offset = out.items.len;
+    // FlateDecode image with DecodeParms
+    var len_buf: [20]u8 = undefined;
+    const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{compressed.len}) catch unreachable;
+    try out.appendSlice(allocator, "3 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns 2 /Colors 3 /BitsPerComponent 8 >> /Length ");
+    try out.appendSlice(allocator, len_str);
+    try out.appendSlice(allocator, " >>\nstream\n");
+    try out.appendSlice(allocator, compressed);
+    try out.appendSlice(allocator, "\nendstream\nendobj\n");
+
+    const xref_offset = out.items.len;
+    try out.appendSlice(allocator, "xref\n0 4\n");
+    try out.appendSlice(allocator, "0000000000 65535 f \n");
+    var offset_buf: [20]u8 = undefined;
+    for ([_]usize{ obj1_offset, obj2_offset, obj3_offset }) |off| {
+        const s = std.fmt.bufPrint(&offset_buf, "{d:0>10} 00000 n \n", .{off}) catch unreachable;
+        try out.appendSlice(allocator, s);
+    }
+
+    try out.appendSlice(allocator, "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+    const xref_str = std.fmt.bufPrint(&offset_buf, "{d}", .{xref_offset}) catch unreachable;
+    try out.appendSlice(allocator, xref_str);
+    try out.appendSlice(allocator, "\n%%EOF\n");
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "findFlateImageStreams finds FlateDecode image with Predictor 15" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(streams);
+
+    try testing.expectEqual(@as(usize, 1), streams.len);
+    try testing.expectEqual(@as(u32, 3), streams[0].object_num);
+    try testing.expectEqual(@as(u32, 0), streams[0].gen_num);
+    try testing.expectEqual(@as(u16, 15), streams[0].predictor);
+    try testing.expectEqual(@as(u32, 2), streams[0].columns);
+    try testing.expectEqual(@as(u8, 3), streams[0].colors);
+    try testing.expectEqual(@as(u8, 8), streams[0].bits_per_component);
+    try testing.expectEqual(@as(u32, 2), streams[0].width);
+    try testing.expectEqual(@as(u32, 2), streams[0].height);
+
+    // Verify zlib header
+    try testing.expectEqual(@as(u8, 0x78), pdf[streams[0].stream_start]);
+}
+
+test "findFlateImageStreams skips FlateDecode without Predictor" {
+    // FlateDecode image but no DecodeParms / Predictor — raw zlib, not image-like
+    const pdf = "%PDF-1.4\n3 0 obj\n<< /Type /XObject /Subtype /Image /Width 4 /Height 4 " ++
+        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length 4 >>\n" ++
+        "stream\n\x78\x9c\x03\x00\nendstream\nendobj\n" ++
+        "xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000009 00000 n \n0000000009 00000 n \n" ++
+        "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n220\n%%EOF\n";
+
+    const streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(streams);
+    try testing.expectEqual(@as(usize, 0), streams.len);
+}
+
+test "findFlateImageStreams skips non-image FlateDecode (content stream)" {
+    // Content stream, not /Subtype /Image
+    const pdf = "%PDF-1.4\n3 0 obj\n<< /Filter /FlateDecode /Length 4 >>\n" ++
+        "stream\n\x78\x9c\x03\x00\nendstream\nendobj\n" ++
+        "xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000009 00000 n \n0000000009 00000 n \n" ++
+        "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n98\n%%EOF\n";
+
+    const streams = try findFlateImageStreams(testing.allocator, pdf);
+    defer testing.allocator.free(streams);
+    try testing.expectEqual(@as(usize, 0), streams.len);
+}
+
+test "findJpegStreams still ignores FlateDecode images" {
+    const pdf = try makeTestFlatePdf(testing.allocator);
+    defer testing.allocator.free(pdf);
+
+    const streams = try findJpegStreams(testing.allocator, pdf);
+    defer testing.allocator.free(streams);
+    try testing.expectEqual(@as(usize, 0), streams.len);
 }

@@ -214,8 +214,12 @@ const CArchiveEntry = extern struct {
     zip_compression_method: u16, // original zip method (0=store, 8=deflate), 0xFFFF = not set
     pdf_stream_offset: u64, // byte offset of JPEG stream in PDF body, 0xFFFFFFFFFFFFFFFF = not set
     pdf_stream_length: u64, // original JPEG stream data length, 0xFFFFFFFFFFFFFFFF = not set
-    jxl_source_format: ?[*]const u8, // source format (e.g. "jpeg"), NULL = not set
+    jxl_source_format: ?[*]const u8, // source format (e.g. "jpeg", "flate"), NULL = not set
     jxl_source_format_len: usize, // 0 = not set
+    flate_predictor: u16, // PDF /Predictor (10-15), 0 = not set
+    flate_columns: u32, // PDF /Columns, 0 = not set
+    flate_colors: u8, // PDF /Colors, 0 = not set
+    flate_bpc: u8, // PDF /BitsPerComponent, 0 = not set
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -344,6 +348,10 @@ export fn blip_archive_create_full(
                     .pdf_stream_offset = if (e.pdf_stream_offset == 0xFFFFFFFFFFFFFFFF) null else e.pdf_stream_offset,
                     .pdf_stream_length = if (e.pdf_stream_length == 0xFFFFFFFFFFFFFFFF) null else e.pdf_stream_length,
                     .jxl_source_format = if (e.jxl_source_format) |p| p[0..e.jxl_source_format_len] else &.{},
+                    .flate_predictor = if (e.flate_predictor == 0) null else e.flate_predictor,
+                    .flate_columns = if (e.flate_columns == 0) null else e.flate_columns,
+                    .flate_colors = if (e.flate_colors == 0) null else e.flate_colors,
+                    .flate_bpc = if (e.flate_bpc == 0) null else e.flate_bpc,
                 },
             };
         }
@@ -1733,6 +1741,141 @@ export fn blip_png_encode(
     return 0;
 }
 
+// --- FlateDecode (PDF) ---
+
+/// Find all FlateDecode image streams in a PDF and return their info in parallel arrays.
+/// Only finds streams with Predictor >= 10 (PNG-style, worth transcoding to JXL).
+/// Caller must free the output arrays with blip_free when done.
+export fn blip_pdf_flate_streams(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_count: *u64,
+    out_offsets: *[*]u64,
+    out_lengths: *[*]u64,
+    out_obj_nums: *[*]u32,
+    out_gen_nums: *[*]u32,
+    out_predictors: *[*]u16,
+    out_columns: *[*]u32,
+    out_colors: *[*]u8,
+    out_bpcs: *[*]u8,
+    out_widths: *[*]u32,
+    out_heights: *[*]u32,
+) callconv(.c) i32 {
+    const streams = pdf_mod.findFlateImageStreams(page_allocator, buf[0..buf_len]) catch return -37;
+    defer page_allocator.free(streams);
+    const n = streams.len;
+    out_count.* = n;
+    if (n == 0) {
+        return 0;
+    }
+    const offsets = page_allocator.alloc(u64, n) catch return -1;
+    errdefer page_allocator.free(offsets);
+    const lengths = page_allocator.alloc(u64, n) catch return -1;
+    errdefer page_allocator.free(lengths);
+    const obj_nums = page_allocator.alloc(u32, n) catch return -1;
+    errdefer page_allocator.free(obj_nums);
+    const gen_nums = page_allocator.alloc(u32, n) catch return -1;
+    errdefer page_allocator.free(gen_nums);
+    const predictors = page_allocator.alloc(u16, n) catch return -1;
+    errdefer page_allocator.free(predictors);
+    const columns_arr = page_allocator.alloc(u32, n) catch return -1;
+    errdefer page_allocator.free(columns_arr);
+    const colors_arr = page_allocator.alloc(u8, n) catch return -1;
+    errdefer page_allocator.free(colors_arr);
+    const bpcs = page_allocator.alloc(u8, n) catch return -1;
+    errdefer page_allocator.free(bpcs);
+    const widths = page_allocator.alloc(u32, n) catch return -1;
+    errdefer page_allocator.free(widths);
+    const heights = page_allocator.alloc(u32, n) catch return -1;
+    errdefer page_allocator.free(heights);
+
+    for (streams, 0..) |s, i| {
+        offsets[i] = s.stream_start;
+        lengths[i] = s.len();
+        obj_nums[i] = s.object_num;
+        gen_nums[i] = s.gen_num;
+        predictors[i] = s.predictor;
+        columns_arr[i] = s.columns;
+        colors_arr[i] = s.colors;
+        bpcs[i] = s.bits_per_component;
+        widths[i] = s.width;
+        heights[i] = s.height;
+    }
+    out_offsets.* = offsets.ptr;
+    out_lengths.* = lengths.ptr;
+    out_obj_nums.* = obj_nums.ptr;
+    out_gen_nums.* = gen_nums.ptr;
+    out_predictors.* = predictors.ptr;
+    out_columns.* = columns_arr.ptr;
+    out_colors.* = colors_arr.ptr;
+    out_bpcs.* = bpcs.ptr;
+    out_widths.* = widths.ptr;
+    out_heights.* = heights.ptr;
+    return 0;
+}
+
+/// Decompress zlib data. Caller must free output with blip_free.
+export fn blip_zlib_decompress(
+    data: [*]const u8,
+    data_len: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.zlibDecompress(page_allocator, data[0..data_len]) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Compress data with zlib (stored blocks). Caller must free output with blip_free.
+export fn blip_zlib_compress(
+    data: [*]const u8,
+    data_len: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.zlibCompress(page_allocator, data[0..data_len]) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Remove PNG-style row filters from FlateDecode data.
+/// Returns raw pixel data. Caller must free output with blip_free.
+export fn blip_pdf_defilter(
+    data: [*]const u8,
+    data_len: usize,
+    columns: u32,
+    colors: u8,
+    bpc: u8,
+    predictor: u16,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.defilterPdfFlate(page_allocator, data[0..data_len], columns, colors, bpc, predictor) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Re-apply PNG-style row filters to pixel data for FlateDecode.
+/// Caller must free output with blip_free.
+export fn blip_pdf_refilter(
+    pixels: [*]const u8,
+    pixels_len: usize,
+    columns: u32,
+    colors: u8,
+    bpc: u8,
+    predictor: u16,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.refilterPdfFlate(page_allocator, pixels[0..pixels_len], columns, colors, bpc, predictor) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
 /// Read pdf_stream_offset from a FILE entry in a BLIP archive.
 export fn blip_archive_entry_pdf_offset(
     buf: [*]const u8,
@@ -2096,6 +2239,10 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
             .jxl_source_format = null,
             .jxl_source_format_len = 0,
+            .flate_predictor = 0,
+            .flate_columns = 0,
+            .flate_colors = 0,
+            .flate_bpc = 0,
         },
         .{
             .path = "mydir/file.txt", .path_len = 14,
@@ -2114,6 +2261,10 @@ test "C FFI: blip_archive_create_full with FILE + DIR entries" {
             .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
             .jxl_source_format = null,
             .jxl_source_format_len = 0,
+            .flate_predictor = 0,
+            .flate_columns = 0,
+            .flate_colors = 0,
+            .flate_bpc = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -2147,6 +2298,10 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
             .jxl_source_format = null,
             .jxl_source_format_len = 0,
+            .flate_predictor = 0,
+            .flate_columns = 0,
+            .flate_colors = 0,
+            .flate_bpc = 0,
         },
         .{
             .path = "bfile.txt", .path_len = 9,
@@ -2165,6 +2320,10 @@ test "C FFI: blip_archive_entry_type returns FILE vs DIR" {
             .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
             .jxl_source_format = null,
             .jxl_source_format_len = 0,
+            .flate_predictor = 0,
+            .flate_columns = 0,
+            .flate_colors = 0,
+            .flate_bpc = 0,
         },
     };
     var out_buf: [*]u8 = undefined;
@@ -2198,6 +2357,10 @@ test "C FFI: blip_archive_entry_metadata returns metadata" {
             .pdf_stream_length = 0xFFFFFFFFFFFFFFFF,
             .jxl_source_format = null,
             .jxl_source_format_len = 0,
+            .flate_predictor = 0,
+            .flate_columns = 0,
+            .flate_colors = 0,
+            .flate_bpc = 0,
         },
     };
     var out_buf: [*]u8 = undefined;

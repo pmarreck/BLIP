@@ -276,6 +276,22 @@ pub fn archiveToJson(allocator: Allocator, buf: []const u8) JsonSerdeError![]u8 
                     try out.appendSlice(allocator, ",\n      \"jxl_source_format\": ");
                     try writeJsonString(allocator, &out, f.jxl_source_format);
                 }
+                if (f.flate_predictor) |fp| {
+                    try out.appendSlice(allocator, ",\n      \"flate_predictor\": ");
+                    try writeJsonInt(allocator, &out, u16, fp);
+                }
+                if (f.flate_columns) |fc| {
+                    try out.appendSlice(allocator, ",\n      \"flate_columns\": ");
+                    try writeJsonInt(allocator, &out, u32, fc);
+                }
+                if (f.flate_colors) |fl| {
+                    try out.appendSlice(allocator, ",\n      \"flate_colors\": ");
+                    try writeJsonInt(allocator, &out, u8, fl);
+                }
+                if (f.flate_bpc) |fb| {
+                    try out.appendSlice(allocator, ",\n      \"flate_bpc\": ");
+                    try writeJsonInt(allocator, &out, u8, fb);
+                }
             },
             .dir => |d| {
                 try out.appendSlice(allocator, "\n      \"type\": \"dir\"");
@@ -457,6 +473,24 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                 break :blk jsf;
             } else &.{};
 
+            // Parse FlateDecode metadata (optional)
+            const flate_predictor: ?u16 = blk: {
+                const v = getJsonU32(obj, "flate_predictor");
+                break :blk if (v > 0) @intCast(v) else null;
+            };
+            const flate_columns: ?u32 = blk: {
+                const v = getJsonU32(obj, "flate_columns");
+                break :blk if (v > 0) v else null;
+            };
+            const flate_colors: ?u8 = blk: {
+                const v = getJsonU32(obj, "flate_colors");
+                break :blk if (v > 0) @intCast(v) else null;
+            };
+            const flate_bpc: ?u8 = blk: {
+                const v = getJsonU32(obj, "flate_bpc");
+                break :blk if (v > 0) @intCast(v) else null;
+            };
+
             archive_entries[i] = .{
                 .file = .{
                     .path = path,
@@ -475,6 +509,10 @@ pub fn jsonToArchive(allocator: Allocator, json_buf: []const u8) JsonSerdeError!
                     .pdf_stream_offset = pdf_stream_offset,
                     .pdf_stream_length = pdf_stream_length,
                     .jxl_source_format = jxl_source_format,
+                    .flate_predictor = flate_predictor,
+                    .flate_columns = flate_columns,
+                    .flate_colors = flate_colors,
+                    .flate_bpc = flate_bpc,
                 },
             };
         } else if (std.mem.eql(u8, type_str, "dir")) {

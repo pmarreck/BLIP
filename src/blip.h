@@ -149,8 +149,12 @@ typedef struct {
     uint16_t zip_compression_method;  /* original zip method (0=store, 8=deflate), 0xFFFF = not set */
     uint64_t pdf_stream_offset;       /* byte offset of JPEG stream in PDF body, UINT64_MAX = not set */
     uint64_t pdf_stream_length;       /* original JPEG stream data length, UINT64_MAX = not set */
-    const char *jxl_source_format;    /* source format (e.g. "jpeg"), NULL = not set */
+    const char *jxl_source_format;    /* source format (e.g. "jpeg", "flate"), NULL = not set */
     size_t jxl_source_format_len;     /* 0 = not set */
+    uint16_t flate_predictor;         /* PDF /Predictor (10-15 for PNG variants), 0 = not set */
+    uint32_t flate_columns;          /* PDF /Columns (image width in pixels), 0 = not set */
+    uint8_t flate_colors;            /* PDF /Colors (channel count), 0 = not set */
+    uint8_t flate_bpc;               /* PDF /BitsPerComponent, 0 = not set */
 } blip_archive_entry;
 
 /* Progress callback for archive creation.
@@ -515,6 +519,40 @@ int32_t blip_png_encode(
     uint32_t width, uint32_t height, uint32_t num_channels, uint32_t bits_per_sample,
     const uint8_t *meta, size_t meta_len,
     uint8_t **out_png, size_t *out_png_len);
+
+/* --- FlateDecode (PDF) operations --- */
+
+#define BLIP_ERR_FLATE -41
+
+/* Find all FlateDecode image streams in a PDF (Predictor >= 10 only).
+ * Returns stream info in parallel arrays. Caller must free with blip_free(). */
+int32_t blip_pdf_flate_streams(const uint8_t *buf, size_t buf_len,
+    uint64_t *out_count,
+    uint64_t **out_offsets, uint64_t **out_lengths,
+    uint32_t **out_obj_nums, uint32_t **out_gen_nums,
+    uint16_t **out_predictors, uint32_t **out_columns,
+    uint8_t **out_colors, uint8_t **out_bpcs,
+    uint32_t **out_widths, uint32_t **out_heights);
+
+/* Decompress zlib data. Caller must free output with blip_free(). */
+int32_t blip_zlib_decompress(const uint8_t *data, size_t data_len,
+    uint8_t **out, size_t *out_len);
+
+/* Compress data with zlib. Caller must free output with blip_free(). */
+int32_t blip_zlib_compress(const uint8_t *data, size_t data_len,
+    uint8_t **out, size_t *out_len);
+
+/* Remove PNG-style row filters from FlateDecode data.
+ * Returns raw pixels. Caller must free with blip_free(). */
+int32_t blip_pdf_defilter(const uint8_t *data, size_t data_len,
+    uint32_t columns, uint8_t colors, uint8_t bpc, uint16_t predictor,
+    uint8_t **out, size_t *out_len);
+
+/* Re-apply PNG-style row filters to pixels for FlateDecode.
+ * Caller must free with blip_free(). */
+int32_t blip_pdf_refilter(const uint8_t *pixels, size_t pixels_len,
+    uint32_t columns, uint8_t colors, uint8_t bpc, uint16_t predictor,
+    uint8_t **out, size_t *out_len);
 
 #define BLIP_ERR_INVALID_PNG -40
 
