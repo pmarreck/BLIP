@@ -25,6 +25,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 /* ── Module-scoped state ──────────────────────────────────────────────── */
@@ -59,6 +61,7 @@ typedef struct {
     uint64_t bytes_seen;    /* running total for progress updates */
     bool expand_containers; /* expand zip containers into DIR+FILE entries */
     bool expand_all_zips;   /* also expand .zip/.gz files (normally excluded) */
+    uint8_t num_threads;    /* thread count for parallel work (0=auto) */
 } entry_list_t;
 
 static void entry_list_init(entry_list_t *el) {
@@ -72,6 +75,7 @@ static void entry_list_init(entry_list_t *el) {
     el->bytes_seen = 0;
     el->expand_containers = false;
     el->expand_all_zips = false;
+    el->num_threads = 0;
 }
 
 static bool entry_list_add(entry_list_t *el, blip_archive_entry entry) {
@@ -309,57 +313,106 @@ static bool expand_zip_container(entry_list_t *el,
 
 /* Expand a PDF file by extracting JPEG streams as JXL files.
  * Returns true on success, false on failure (caller should fall back to opaque). */
+/* Context for parallel JPEG→JXL transcode workers */
+typedef struct {
+    const uint8_t *content;
+    const uint64_t *offsets;
+    const uint64_t *lengths;
+    uint64_t jpeg_count;
+    uint8_t **jxl_bufs;
+    size_t *jxl_lens;
+    _Atomic uint64_t next_idx;
+} jxl_transcode_ctx_t;
+
+static void *jxl_transcode_worker(void *arg) {
+    jxl_transcode_ctx_t *ctx = (jxl_transcode_ctx_t *)arg;
+    for (;;) {
+        uint64_t i = atomic_fetch_add(&ctx->next_idx, 1);
+        if (i >= ctx->jpeg_count) break;
+        uint8_t *jxl_data = NULL;
+        size_t jxl_len = 0;
+        if (blip_jxl_from_jpeg(ctx->content + ctx->offsets[i],
+                (size_t)ctx->lengths[i], &jxl_data, &jxl_len) == BLIP_OK) {
+            ctx->jxl_bufs[i] = jxl_data;
+            ctx->jxl_lens[i] = jxl_len;
+        }
+    }
+    return NULL;
+}
+
 static bool expand_pdf_container(entry_list_t *el,
                                   const uint8_t *content, size_t content_len,
                                   const blip_archive_entry *file_entry) {
-    /* Count JPEG streams */
+    /* Find all JPEG streams in one scan */
     uint64_t jpeg_count = 0;
-    if (blip_pdf_jpeg_count(content, content_len, &jpeg_count) != BLIP_OK)
+    uint64_t *offsets = NULL;
+    uint64_t *lengths = NULL;
+    uint32_t *obj_nums = NULL;
+    uint32_t *gen_nums = NULL;
+    if (blip_pdf_jpeg_streams(content, content_len, &jpeg_count,
+            &offsets, &lengths, &obj_nums, &gen_nums) != BLIP_OK)
         return false;
     if (jpeg_count == 0) return false; /* no benefit to expansion */
-
-    /* Gather stream info */
-    uint64_t *offsets = calloc(jpeg_count, sizeof(uint64_t));
-    uint64_t *lengths = calloc(jpeg_count, sizeof(uint64_t));
-    uint32_t *obj_nums = calloc(jpeg_count, sizeof(uint32_t));
-    uint32_t *gen_nums = calloc(jpeg_count, sizeof(uint32_t));
-    if (!offsets || !lengths || !obj_nums || !gen_nums) {
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
-        return false;
-    }
-
-    for (uint64_t i = 0; i < jpeg_count; i++) {
-        if (blip_pdf_jpeg_info(content, content_len, i,
-                &offsets[i], &lengths[i], &obj_nums[i], &gen_nums[i]) != BLIP_OK) {
-            free(offsets); free(lengths); free(obj_nums); free(gen_nums);
-            return false;
-        }
-    }
 
     /* Transcode each JPEG to JXL; track which succeeded */
     uint8_t **jxl_bufs = calloc(jpeg_count, sizeof(uint8_t *));
     size_t *jxl_lens = calloc(jpeg_count, sizeof(size_t));
     if (!jxl_bufs || !jxl_lens) {
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         return false;
     }
 
+    /* Resolve thread count */
+    uint8_t nthreads = el->num_threads;
+    if (nthreads == 0) {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = (ncpu > 0 && ncpu < 255) ? (uint8_t)ncpu : 4;
+    }
+    /* Cap threads to jpeg count */
+    if ((uint64_t)nthreads > jpeg_count) nthreads = (uint8_t)jpeg_count;
+
+    if (nthreads > 1 && jpeg_count > 1) {
+        /* Parallel transcode using pthreads + atomic work index */
+        jxl_transcode_ctx_t ctx = {
+            .content = content,
+            .offsets = offsets,
+            .lengths = lengths,
+            .jpeg_count = jpeg_count,
+            .jxl_bufs = jxl_bufs,
+            .jxl_lens = jxl_lens,
+            .next_idx = 0,
+        };
+
+        pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
+        if (threads) {
+            for (int t = 0; t < nthreads; t++)
+                pthread_create(&threads[t], NULL, jxl_transcode_worker, &ctx);
+            for (int t = 0; t < nthreads; t++)
+                pthread_join(threads[t], NULL);
+            free(threads);
+        }
+    } else {
+        /* Single-threaded fallback */
+        for (uint64_t i = 0; i < jpeg_count; i++) {
+            uint8_t *jxl_data = NULL;
+            size_t jxl_len = 0;
+            if (blip_jxl_from_jpeg(content + offsets[i], (size_t)lengths[i],
+                                   &jxl_data, &jxl_len) == BLIP_OK) {
+                jxl_bufs[i] = jxl_data;
+                jxl_lens[i] = jxl_len;
+            }
+        }
+    }
+
     size_t success_count = 0;
     for (uint64_t i = 0; i < jpeg_count; i++) {
-        uint8_t *jxl_data = NULL;
-        size_t jxl_len = 0;
-        if (blip_jxl_from_jpeg(content + offsets[i], (size_t)lengths[i],
-                               &jxl_data, &jxl_len) == BLIP_OK) {
-            jxl_bufs[i] = jxl_data;
-            jxl_lens[i] = jxl_len;
-            success_count++;
-        }
+        if (jxl_bufs[i]) success_count++;
     }
 
     if (success_count == 0) {
         /* All transcodes failed — no benefit */
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         return false;
     }
@@ -370,7 +423,7 @@ static bool expand_pdf_container(entry_list_t *el,
     if (!shell_offsets || !shell_lengths) {
         for (uint64_t i = 0; i < jpeg_count; i++)
             if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         free(shell_offsets); free(shell_lengths);
         return false;
@@ -393,7 +446,7 @@ static bool expand_pdf_container(entry_list_t *el,
     if (rc != BLIP_OK) {
         for (uint64_t i = 0; i < jpeg_count; i++)
             if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         return false;
     }
@@ -404,7 +457,7 @@ static bool expand_pdf_container(entry_list_t *el,
         blip_free(shell, shell_len);
         for (uint64_t i = 0; i < jpeg_count; i++)
             if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         return false;
     }
@@ -415,7 +468,7 @@ static bool expand_pdf_container(entry_list_t *el,
         free(shell_owned);
         for (uint64_t i = 0; i < jpeg_count; i++)
             if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
-        free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+        blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
         free(jxl_bufs); free(jxl_lens);
         return false;
     }
@@ -524,14 +577,14 @@ static bool expand_pdf_container(entry_list_t *el,
         el->bytes_seen += jxl_lens[i];
     }
 
-    free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+    blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
     free(jxl_bufs); free(jxl_lens);
     return true;
 
 fail:
     for (uint64_t i = 0; i < jpeg_count; i++)
         if (jxl_bufs[i]) blip_free(jxl_bufs[i], jxl_lens[i]);
-    free(offsets); free(lengths); free(obj_nums); free(gen_nums);
+    blip_free((uint8_t *)offsets, jpeg_count * sizeof(*offsets)); blip_free((uint8_t *)lengths, jpeg_count * sizeof(*lengths)); blip_free((uint8_t *)obj_nums, jpeg_count * sizeof(*obj_nums)); blip_free((uint8_t *)gen_nums, jpeg_count * sizeof(*gen_nums));
     free(jxl_bufs); free(jxl_lens);
     return false;
 }
@@ -1333,6 +1386,7 @@ static int cmd_create(int argc, char **argv) {
         el.expand_containers = true;
         el.expand_all_zips = expand_all;
     }
+    el.num_threads = num_threads;
 
     /* Progress: indeterminate scanning phase */
     progrez_ctx *progress = progrez_create("Scanning");

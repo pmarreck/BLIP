@@ -1488,6 +1488,59 @@ export fn blip_pdf_jpeg_info(
     return 0;
 }
 
+/// Find all JPEG streams in a PDF and return their info in parallel arrays.
+/// Caller must free the output arrays with blip_free when done.
+/// This is much faster than calling blip_pdf_jpeg_count + blip_pdf_jpeg_info in a loop
+/// because it only scans the PDF once.
+export fn blip_pdf_jpeg_streams(
+    buf: [*]const u8,
+    buf_len: usize,
+    out_count: *u64,
+    out_offsets: *[*]u64,
+    out_lengths: *[*]u64,
+    out_obj_nums: *[*]u32,
+    out_gen_nums: *[*]u32,
+) callconv(.c) i32 {
+    const streams = pdf_mod.findJpegStreams(page_allocator, buf[0..buf_len]) catch return -37;
+    defer page_allocator.free(streams);
+    const n = streams.len;
+    out_count.* = n;
+    if (n == 0) {
+        out_offsets.* = undefined;
+        out_lengths.* = undefined;
+        out_obj_nums.* = undefined;
+        out_gen_nums.* = undefined;
+        return 0;
+    }
+    const offsets = page_allocator.alloc(u64, n) catch return -1;
+    const lengths = page_allocator.alloc(u64, n) catch {
+        page_allocator.free(offsets);
+        return -1;
+    };
+    const obj_nums = page_allocator.alloc(u32, n) catch {
+        page_allocator.free(offsets);
+        page_allocator.free(lengths);
+        return -1;
+    };
+    const gen_nums = page_allocator.alloc(u32, n) catch {
+        page_allocator.free(offsets);
+        page_allocator.free(lengths);
+        page_allocator.free(obj_nums);
+        return -1;
+    };
+    for (streams, 0..) |s, i| {
+        offsets[i] = s.stream_start;
+        lengths[i] = s.len();
+        obj_nums[i] = s.object_num;
+        gen_nums[i] = s.gen_num;
+    }
+    out_offsets.* = offsets.ptr;
+    out_lengths.* = lengths.ptr;
+    out_obj_nums.* = obj_nums.ptr;
+    out_gen_nums.* = gen_nums.ptr;
+    return 0;
+}
+
 /// Create a PDF shell by zeroing JPEG stream regions.
 export fn blip_pdf_create_shell(
     buf: [*]const u8,

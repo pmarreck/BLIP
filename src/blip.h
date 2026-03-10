@@ -456,6 +456,13 @@ int32_t blip_pdf_jpeg_count(const uint8_t *buf, size_t buf_len, uint64_t *out_co
 int32_t blip_pdf_jpeg_info(const uint8_t *buf, size_t buf_len, uint64_t idx,
     uint64_t *out_offset, uint64_t *out_length, uint32_t *out_obj_num, uint32_t *out_gen_num);
 
+/* Find all JPEG streams in a PDF and return their info in parallel arrays.
+ * Single scan — much faster than calling jpeg_count + jpeg_info in a loop.
+ * Caller must free output arrays with blip_free(). */
+int32_t blip_pdf_jpeg_streams(const uint8_t *buf, size_t buf_len,
+    uint64_t *out_count, uint64_t **out_offsets, uint64_t **out_lengths,
+    uint32_t **out_obj_nums, uint32_t **out_gen_nums);
+
 /* Create a PDF shell by zeroing JPEG stream regions.
  * Caller must free returned buffer with blip_free(). */
 int32_t blip_pdf_create_shell(const uint8_t *buf, size_t buf_len,
