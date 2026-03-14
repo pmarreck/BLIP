@@ -48,6 +48,7 @@ static int cmd_from_json(int argc, char **argv);
 static int cmd_text(int argc, char **argv);
 static int cmd_from_text(int argc, char **argv);
 static int cmd_explode(int argc, char **argv);
+static int cmd_implode(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -1331,6 +1332,7 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "text") == 0) return cmd_text(argc - 2, argv + 2);
     if (strcmp(arg1, "from-text") == 0) return cmd_from_text(argc - 2, argv + 2);
     if (strcmp(arg1, "explode") == 0) return cmd_explode(argc - 2, argv + 2);
+    if (strcmp(arg1, "implode") == 0) return cmd_implode(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -1379,6 +1381,7 @@ static void print_usage(FILE *out) {
         "  text <archive> [-o <output>]          Dump as human-readable text\n"
         "  from-text <input.txt> -o <out.blar> [-z]  Rebuild archive from text\n"
         "  explode <archive> -C <output_dir>         Extract to dir tree + __meta__.json\n"
+        "  implode <directory> -o <archive> [-z]      Rebuild archive from dir tree\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -4506,4 +4509,477 @@ explode_cleanup:
     free(groups);
     free(buf);
     return ret;
+}
+
+/* ── Implode: rebuild archive from directory tree + __meta__.json sidecars ── */
+
+/* Parsed metadata for one entry from __meta__.json. */
+typedef struct {
+    char basename[1024];
+    uint16_t mode;
+    int64_t mtime_s;
+    char co[64];
+    char jx[64];
+    uint64_t po;
+    uint64_t pl;
+} implode_meta_entry_t;
+
+typedef struct {
+    implode_meta_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} implode_meta_t;
+
+/* Skip whitespace in JSON. */
+static const char *json_skip_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+/* Parse a JSON string starting at p (which points to the opening quote).
+ * Writes the unescaped string into buf (up to buf_size-1 chars).
+ * Returns pointer past the closing quote, or NULL on error. */
+static const char *json_parse_string(const char *p, const char *end,
+                                      char *buf, size_t buf_size) {
+    if (p >= end || *p != '"') return NULL;
+    p++; /* skip opening quote */
+    size_t len = 0;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            if (len < buf_size - 1) buf[len++] = *p;
+            p++;
+        } else {
+            if (len < buf_size - 1) buf[len++] = *p;
+            p++;
+        }
+    }
+    if (p >= end) return NULL;
+    buf[len] = '\0';
+    p++; /* skip closing quote */
+    return p;
+}
+
+/* Parse a JSON integer (possibly negative) starting at p.
+ * Returns pointer past the number, or NULL on error. */
+static const char *json_parse_int64(const char *p, const char *end, int64_t *out) {
+    if (p >= end) return NULL;
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; }
+    if (p >= end || *p < '0' || *p > '9') return NULL;
+    int64_t val = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        val = val * 10 + (*p - '0');
+        p++;
+    }
+    *out = neg ? -val : val;
+    return p;
+}
+
+static const char *json_parse_uint64(const char *p, const char *end, uint64_t *out) {
+    if (p >= end || *p < '0' || *p > '9') return NULL;
+    uint64_t val = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        val = val * 10 + (*p - '0');
+        p++;
+    }
+    *out = val;
+    return p;
+}
+
+/* Parse __meta__.json content into an implode_meta_t.
+ * Returns true on success. */
+static bool parse_meta_json(const char *json, size_t json_len, implode_meta_t *meta) {
+    const char *p = json;
+    const char *end = json + json_len;
+
+    p = json_skip_ws(p, end);
+    if (p >= end || *p != '{') return false;
+    p++;
+
+    while (p < end) {
+        p = json_skip_ws(p, end);
+        if (p >= end) return false;
+        if (*p == '}') break;
+
+        /* Parse key (basename) */
+        implode_meta_entry_t entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.po = UINT64_MAX;
+        entry.pl = UINT64_MAX;
+
+        p = json_parse_string(p, end, entry.basename, sizeof(entry.basename));
+        if (!p) return false;
+
+        p = json_skip_ws(p, end);
+        if (p >= end || *p != ':') return false;
+        p++;
+
+        p = json_skip_ws(p, end);
+        if (p >= end || *p != '{') return false;
+        p++;
+
+        /* Parse value object fields */
+        while (p < end) {
+            p = json_skip_ws(p, end);
+            if (p >= end) return false;
+            if (*p == '}') { p++; break; }
+
+            /* Parse field name */
+            char field[64];
+            p = json_parse_string(p, end, field, sizeof(field));
+            if (!p) return false;
+
+            p = json_skip_ws(p, end);
+            if (p >= end || *p != ':') return false;
+            p++;
+            p = json_skip_ws(p, end);
+            if (p >= end) return false;
+
+            /* Parse field value */
+            if (strcmp(field, "mode") == 0) {
+                int64_t val = 0;
+                p = json_parse_int64(p, end, &val);
+                if (!p) return false;
+                entry.mode = (uint16_t)val;
+            } else if (strcmp(field, "mtime") == 0) {
+                p = json_parse_int64(p, end, &entry.mtime_s);
+                if (!p) return false;
+            } else if (strcmp(field, "co") == 0) {
+                p = json_parse_string(p, end, entry.co, sizeof(entry.co));
+                if (!p) return false;
+            } else if (strcmp(field, "jx") == 0) {
+                p = json_parse_string(p, end, entry.jx, sizeof(entry.jx));
+                if (!p) return false;
+            } else if (strcmp(field, "po") == 0) {
+                p = json_parse_uint64(p, end, &entry.po);
+                if (!p) return false;
+            } else if (strcmp(field, "pl") == 0) {
+                p = json_parse_uint64(p, end, &entry.pl);
+                if (!p) return false;
+            } else {
+                /* Skip unknown value: string or number */
+                if (*p == '"') {
+                    char skip[1024];
+                    p = json_parse_string(p, end, skip, sizeof(skip));
+                    if (!p) return false;
+                } else {
+                    int64_t skip_val;
+                    p = json_parse_int64(p, end, &skip_val);
+                    if (!p) return false;
+                }
+            }
+
+            p = json_skip_ws(p, end);
+            if (p < end && *p == ',') p++;
+        }
+
+        /* Add entry to meta */
+        if (meta->count >= meta->capacity) {
+            size_t new_cap = meta->capacity == 0 ? 16 : meta->capacity * 2;
+            implode_meta_entry_t *new_arr = realloc(meta->entries,
+                new_cap * sizeof(implode_meta_entry_t));
+            if (!new_arr) return false;
+            meta->entries = new_arr;
+            meta->capacity = new_cap;
+        }
+        meta->entries[meta->count++] = entry;
+
+        p = json_skip_ws(p, end);
+        if (p < end && *p == ',') p++;
+    }
+
+    return true;
+}
+
+/* Find metadata for a basename in the parsed meta. Returns NULL if not found. */
+static const implode_meta_entry_t *find_meta(const implode_meta_t *meta,
+                                              const char *basename) {
+    for (size_t i = 0; i < meta->count; i++) {
+        if (strcmp(meta->entries[i].basename, basename) == 0)
+            return &meta->entries[i];
+    }
+    return NULL;
+}
+
+/* Recursively walk a directory and add entries to the entry list.
+ * prefix: archive path prefix (e.g. "" for root, "subdir/" for nested).
+ * dir_path: filesystem path of the directory. */
+static bool implode_walk(entry_list_t *el, const char *dir_path, const char *prefix) {
+    /* Read __meta__.json if present */
+    implode_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+
+    char meta_path[4096];
+    snprintf(meta_path, sizeof(meta_path), "%s/__meta__.json", dir_path);
+
+    size_t meta_json_len = 0;
+    uint8_t *meta_json = read_file(meta_path, &meta_json_len);
+    if (meta_json) {
+        if (!parse_meta_json((const char *)meta_json, meta_json_len, &meta)) {
+            fprintf(stderr, "blar: implode: warning: cannot parse %s\n", meta_path);
+        }
+        free(meta_json);
+    }
+
+    /* List directory entries, sorted */
+    struct dirent **namelist = NULL;
+    int n = scandir(dir_path, &namelist, NULL, alphasort);
+    if (n < 0) {
+        fprintf(stderr, "blar: implode: cannot read directory '%s': %s\n",
+                dir_path, strerror(errno));
+        free(meta.entries);
+        return false;
+    }
+
+    bool ok = true;
+
+    for (int i = 0; i < n; i++) {
+        const char *name = namelist[i]->d_name;
+
+        /* Skip . and .. */
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            free(namelist[i]);
+            continue;
+        }
+
+        /* Skip reserved sidecar files */
+        if (strcmp(name, "__meta__.json") == 0 || strcmp(name, "__archive__.json") == 0) {
+            free(namelist[i]);
+            continue;
+        }
+
+        /* Build filesystem path and archive path */
+        char fs_path[4096];
+        snprintf(fs_path, sizeof(fs_path), "%s/%s", dir_path, name);
+
+        char archive_path[4096];
+        if (prefix[0] == '\0') {
+            snprintf(archive_path, sizeof(archive_path), "%s", name);
+        } else {
+            snprintf(archive_path, sizeof(archive_path), "%s%s", prefix, name);
+        }
+
+        struct stat st;
+        if (stat(fs_path, &st) != 0) {
+            fprintf(stderr, "blar: implode: cannot stat '%s': %s\n",
+                    fs_path, strerror(errno));
+            free(namelist[i]);
+            ok = false;
+            break;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Look up metadata with trailing slash */
+            char dir_basename[1024];
+            snprintf(dir_basename, sizeof(dir_basename), "%s/", name);
+            const implode_meta_entry_t *me = find_meta(&meta, dir_basename);
+
+            /* Create DIR entry */
+            blip_archive_entry entry;
+            memset(&entry, 0, sizeof(entry));
+            entry.pdf_stream_offset = UINT64_MAX;
+            entry.pdf_stream_length = UINT64_MAX;
+            entry.zip_compression_method = 0xFFFF;
+
+            char *path_dup = entry_list_strdup(el, archive_path);
+            if (!path_dup) { ok = false; free(namelist[i]); break; }
+            entry.path = path_dup;
+            entry.path_len = strlen(path_dup);
+            entry.is_dir = 1;
+
+            if (me) {
+                entry.mode = me->mode;
+                entry.mtime_ns = me->mtime_s * 1000000000LL;
+                if (me->co[0] != '\0') {
+                    char *co_dup = entry_list_strdup(el, me->co);
+                    if (co_dup) {
+                        entry.container_type = co_dup;
+                        entry.container_type_len = strlen(co_dup);
+                    }
+                }
+            } else {
+                entry.mode = (uint16_t)(st.st_mode & 0777);
+            }
+
+            if (!entry_list_add(el, entry)) { ok = false; free(namelist[i]); break; }
+
+            /* Recurse into subdirectory */
+            char sub_prefix[4096];
+            snprintf(sub_prefix, sizeof(sub_prefix), "%s/", archive_path);
+            if (!implode_walk(el, fs_path, sub_prefix)) {
+                ok = false;
+                free(namelist[i]);
+                break;
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            /* Look up metadata (no trailing slash) */
+            const implode_meta_entry_t *me = find_meta(&meta, name);
+
+            /* Read file content */
+            size_t content_len = 0;
+            uint8_t *content = read_file(fs_path, &content_len);
+            if (!content && st.st_size > 0) {
+                fprintf(stderr, "blar: implode: cannot read '%s': %s\n",
+                        fs_path, strerror(errno));
+                ok = false;
+                free(namelist[i]);
+                break;
+            }
+
+            /* Track the content buffer for cleanup */
+            if (content) {
+                if (!entry_list_add_content(el, content)) {
+                    free(content);
+                    ok = false;
+                    free(namelist[i]);
+                    break;
+                }
+            }
+
+            blip_archive_entry entry;
+            memset(&entry, 0, sizeof(entry));
+            entry.pdf_stream_offset = UINT64_MAX;
+            entry.pdf_stream_length = UINT64_MAX;
+            entry.zip_compression_method = 0xFFFF;
+
+            char *path_dup = entry_list_strdup(el, archive_path);
+            if (!path_dup) { ok = false; free(namelist[i]); break; }
+            entry.path = path_dup;
+            entry.path_len = strlen(path_dup);
+            entry.content = content;
+            entry.content_len = content_len;
+            entry.is_dir = 0;
+
+            if (me) {
+                entry.mode = me->mode;
+                entry.mtime_ns = me->mtime_s * 1000000000LL;
+                if (me->jx[0] != '\0') {
+                    char *jx_dup = entry_list_strdup(el, me->jx);
+                    if (jx_dup) {
+                        entry.jxl_source_format = jx_dup;
+                        entry.jxl_source_format_len = strlen(jx_dup);
+                    }
+                }
+                if (me->po != UINT64_MAX) entry.pdf_stream_offset = me->po;
+                if (me->pl != UINT64_MAX) entry.pdf_stream_length = me->pl;
+            } else {
+                entry.mode = (uint16_t)(st.st_mode & 0777);
+            }
+
+            if (!entry_list_add(el, entry)) { ok = false; free(namelist[i]); break; }
+        }
+        /* Skip symlinks, devices, etc. */
+
+        free(namelist[i]);
+    }
+
+    free(namelist);
+    free(meta.entries);
+    return ok;
+}
+
+static int cmd_implode(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "blar: implode: missing directory path\n");
+        return EXIT_USAGE;
+    }
+
+    const char *input_dir = NULL;
+    const char *output_path = NULL;
+    bool do_compress = false;
+
+    /* Parse arguments: <directory> -o <output> [-z] */
+    int i = 0;
+    while (i < argc) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: implode: -o requires an argument\n");
+                return EXIT_USAGE;
+            }
+            output_path = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "-z") == 0) {
+            do_compress = true;
+            i++;
+        } else {
+            if (!input_dir) {
+                input_dir = argv[i];
+            }
+            i++;
+        }
+    }
+
+    if (!input_dir) {
+        fprintf(stderr, "blar: implode: missing directory path\n");
+        return EXIT_USAGE;
+    }
+    if (!output_path) {
+        fprintf(stderr, "blar: implode: -o <output.blar> is required\n");
+        return EXIT_USAGE;
+    }
+
+    /* Verify input is a directory */
+    struct stat dir_st;
+    if (stat(input_dir, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
+        fprintf(stderr, "blar: implode: '%s' is not a directory\n", input_dir);
+        return EXIT_USAGE;
+    }
+
+    /* Walk the directory tree and collect entries */
+    entry_list_t el;
+    entry_list_init(&el);
+
+    if (!implode_walk(&el, input_dir, "")) {
+        entry_list_free(&el);
+        return EXIT_IO;
+    }
+
+    if (el.count == 0) {
+        fprintf(stderr, "blar: implode: no entries found in '%s'\n", input_dir);
+        entry_list_free(&el);
+        return EXIT_IO;
+    }
+
+    /* Create archive */
+    uint8_t *archive_buf = NULL;
+    size_t archive_len = 0;
+    int32_t rc = blip_archive_create_full(el.entries, el.count, 0, 0, 0,
+                                           NULL, NULL, NULL,
+                                           &archive_buf, &archive_len);
+    entry_list_free(&el);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: implode: archive creation failed: %s\n",
+                blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    /* Optionally compress */
+    if (do_compress) {
+        uint8_t *compressed_buf = NULL;
+        size_t compressed_len = 0;
+        rc = blip_compress_container(archive_buf, archive_len, BLIP_COMP_LZMA2, 0,
+                                      NULL, NULL, NULL,
+                                      &compressed_buf, &compressed_len);
+        blip_free(archive_buf, archive_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: implode: compression failed: %s\n",
+                    blip_error_string(rc));
+            return EXIT_IO;
+        }
+        archive_buf = compressed_buf;
+        archive_len = compressed_len;
+    }
+
+    /* Write output file */
+    if (!write_file(output_path, archive_buf, archive_len)) {
+        fprintf(stderr, "blar: implode: cannot write '%s': %s\n",
+                output_path, strerror(errno));
+        blip_free(archive_buf, archive_len);
+        return EXIT_IO;
+    }
+
+    blip_free(archive_buf, archive_len);
+    return EXIT_OK;
 }

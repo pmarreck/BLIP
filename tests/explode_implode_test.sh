@@ -52,5 +52,36 @@ grep -q '"mtime"' "$TMPDIR/tree/__meta__.json" || { echo "FAIL: mtime not in __m
 
 echo "PASS: blar explode metadata fields"
 
+# === Round-trip test: implode back to archive ===
+$BLAR implode "$TMPDIR/tree" -o "$TMPDIR/roundtrip.blar"
+
+# Extract both and compare
+mkdir -p "$TMPDIR/orig_extract" "$TMPDIR/rt_extract"
+$BLAR extract "$TMPDIR/test.blar" -C "$TMPDIR/orig_extract"
+$BLAR extract "$TMPDIR/roundtrip.blar" -C "$TMPDIR/rt_extract"
+
+diff "$TMPDIR/orig_extract/hello.txt" "$TMPDIR/rt_extract/hello.txt" || { echo "FAIL: hello.txt differs"; exit 1; }
+diff "$TMPDIR/orig_extract/subdir/nested.txt" "$TMPDIR/rt_extract/subdir/nested.txt" || { echo "FAIL: nested.txt differs"; exit 1; }
+
+echo "PASS: explode/implode round-trip"
+
+# === Compressed output test ===
+$BLAR implode "$TMPDIR/tree" -o "$TMPDIR/rt_z.blar" -z
+mkdir -p "$TMPDIR/rt_z_extract"
+$BLAR extract "$TMPDIR/rt_z.blar" -C "$TMPDIR/rt_z_extract"
+diff "$TMPDIR/orig_extract/hello.txt" "$TMPDIR/rt_z_extract/hello.txt" || { echo "FAIL: compressed implode"; exit 1; }
+
+echo "PASS: compressed implode"
+
+# === Verify imploded archive integrity ===
+$BLAR verify "$TMPDIR/roundtrip.blar" || { echo "FAIL: roundtrip archive verification"; exit 1; }
+
+echo "PASS: imploded archive verifies"
+
+# === Verify directory entries are preserved ===
+$BLAR list "$TMPDIR/roundtrip.blar" | grep -q "subdir" || { echo "FAIL: subdir not in imploded archive"; exit 1; }
+
+echo "PASS: directory entries preserved in implode"
+
 echo ""
-echo "All explode tests passed."
+echo "All explode/implode tests passed."
