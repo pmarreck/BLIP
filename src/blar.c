@@ -1207,14 +1207,15 @@ static bool expand_containers_pass(entry_list_t *el) {
         if (el->entries[i].is_dir) continue;
         const uint8_t *content = el->entries[i].content;
         size_t content_len = el->entries[i].content_len;
-        if (content_len >= 4 && blip_is_zip(content, content_len) &&
-            (el->expand_all_zips || !is_archive_extension(el->entries[i].path))) {
-            expandable++;
-            total_expandable_bytes += content_len;
-        } else if (content_len >= 5 && blip_is_pdf(content, content_len)) {
-            expandable++;
-            total_expandable_bytes += content_len;
-        } else if (content_len >= 8 && blip_is_png(content, content_len)) {
+        const blar_codec_t *codec = blar_codec_detect(&builtin_registry, content, content_len);
+        if (codec) {
+            /* ZIP special case: skip archives unless --expand-all-zips */
+            if (strcmp(codec->name, "zip") == 0 &&
+                !el->expand_all_zips && is_archive_extension(el->entries[i].path)) {
+                codec = NULL;
+            }
+        }
+        if (codec) {
             expandable++;
             total_expandable_bytes += content_len;
         }
@@ -1253,28 +1254,18 @@ static bool expand_containers_pass(entry_list_t *el) {
             progrez_set_label(el->progress, label_buf);
         }
 
-        /* Try ZIP */
-        if (!expanded && content_len >= 4 &&
-            blip_is_zip(content, content_len) &&
-            (el->expand_all_zips || !is_archive_extension(entry_copy.path))) {
-            if (expand_zip_container(el, content, content_len, &entry_copy)) {
-                expanded = true;
-            }
-        }
-
-        /* Try PDF */
-        if (!expanded && content_len >= 5 &&
-            blip_is_pdf(content, content_len)) {
-            if (expand_pdf_container(el, content, content_len, &entry_copy)) {
-                expanded = true;
-            }
-        }
-
-        /* Try PNG */
-        if (!expanded && content_len >= 8 &&
-            blip_is_png(content, content_len)) {
-            if (expand_png_container(el, content, content_len, &entry_copy)) {
-                expanded = true;
+        /* Detect and expand via codec registry */
+        {
+            const blar_codec_t *codec = blar_codec_detect(&builtin_registry, content, content_len);
+            if (codec) {
+                /* ZIP special case: skip archives unless --expand-all-zips */
+                if (strcmp(codec->name, "zip") == 0 &&
+                    !el->expand_all_zips && is_archive_extension(entry_copy.path)) {
+                    codec = NULL;
+                }
+                if (codec && codec->expand(el, content, content_len, &entry_copy)) {
+                    expanded = true;
+                }
             }
         }
 
