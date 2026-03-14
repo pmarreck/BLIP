@@ -1865,12 +1865,14 @@ static int cmd_list(int argc, char **argv) {
             size_t co_type_len = 0;
             if (blip_archive_entry_container_type(buf, buf_len, i,
                     &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
-                if (co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0)
-                    type_char = 'p';
-                else if (co_type_len == 3 && memcmp(co_type, "png", 3) == 0)
-                    type_char = 'n';
-                else
-                    type_char = 'z';
+                const blar_codec_t *codec = blar_codec_find_by_name(&builtin_registry, co_type, co_type_len);
+                if (codec) {
+                    if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
+                    else if (strcmp(codec->name, "png") == 0) type_char = 'n';
+                    else type_char = 'z';
+                } else {
+                    type_char = '?';  /* unknown codec */
+                }
             }
         }
 
@@ -2233,8 +2235,19 @@ static int cmd_extract(int argc, char **argv) {
         size_t co_type_len = 0;
         blip_archive_entry_container_type(buf, buf_len, co_idx, &co_type, &co_type_len);
 
+        /* Look up codec in registry; warn if unknown */
+        const blar_codec_t *codec = co_type
+            ? blar_codec_find_by_name(&builtin_registry, co_type, co_type_len)
+            : NULL;
+        if (co_type && !codec) {
+            fprintf(stderr, "warning: codec \"%.*s\" not found for container '%.*s', skipping reconstruction\n",
+                    (int)co_type_len, co_type, (int)co_path_len, co_path);
+            failed++;
+            continue;
+        }
+
         /* PDF container re-assembly */
-        if (co_type && co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0) {
+        if (codec && strcmp(codec->name, "pdf") == 0) {
             /* Find __body__ child → read shell */
             uint8_t *shell_data = NULL;
             size_t shell_len = 0;
@@ -2626,7 +2639,7 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         /* PNG container re-assembly */
-        if (co_type && co_type_len == 3 && memcmp(co_type, "png", 3) == 0) {
+        if (codec && strcmp(codec->name, "png") == 0) {
             /* Find __meta__ and __pixels__.jxl children */
             uint8_t *meta_data = NULL;
             size_t meta_data_len = 0;
@@ -3315,12 +3328,14 @@ static int cmd_info(int argc, char **argv) {
             size_t co_type_len = 0;
             if (blip_archive_entry_container_type(buf, buf_len, i,
                     &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
-                if (co_type_len == 3 && memcmp(co_type, "pdf", 3) == 0)
-                    type_char = 'p';
-                else if (co_type_len == 3 && memcmp(co_type, "png", 3) == 0)
-                    type_char = 'n';
-                else
-                    type_char = 'z';
+                const blar_codec_t *codec = blar_codec_find_by_name(&builtin_registry, co_type, co_type_len);
+                if (codec) {
+                    if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
+                    else if (strcmp(codec->name, "png") == 0) type_char = 'n';
+                    else type_char = 'z';
+                } else {
+                    type_char = '?';  /* unknown codec */
+                }
             }
         }
 
