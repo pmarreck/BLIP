@@ -1013,6 +1013,20 @@ export fn blip_poke(
     return 0;
 }
 
+/// Decode printable-binary UTF-8 back to raw bytes.
+/// Caller must free the output buffer with blip_free().
+export fn blip_decode_printable_binary(
+    encoded: [*]const u8,
+    encoded_len: usize,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pb.decode(page_allocator, encoded[0..encoded_len], .{}) catch return -1;
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
 /// Encode binary data as printable-binary UTF-8.
 /// Caller must free the output buffer with blip_free().
 export fn blip_encode_printable_binary(

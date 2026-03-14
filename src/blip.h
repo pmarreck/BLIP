@@ -287,6 +287,11 @@ int32_t blip_poke(const uint8_t *buf, size_t buf_len,
 int32_t blip_encode_printable_binary(const uint8_t *input, size_t input_len,
                                       uint8_t **out_buf, size_t *out_len);
 
+/* Decode printable-binary UTF-8 back to raw bytes.
+ * Caller must free the output buffer with blip_free(). */
+int32_t blip_decode_printable_binary(const uint8_t *encoded, size_t encoded_len,
+                                      uint8_t **out_buf, size_t *out_len);
+
 /* --- JSON serialization/deserialization --- */
 
 /* Convert a BLIP archive to JSON.

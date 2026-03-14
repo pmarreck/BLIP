@@ -46,6 +46,7 @@ static int cmd_poke(int argc, char **argv);
 static int cmd_to_json(int argc, char **argv);
 static int cmd_from_json(int argc, char **argv);
 static int cmd_text(int argc, char **argv);
+static int cmd_from_text(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -1327,6 +1328,7 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "to-json") == 0) return cmd_to_json(argc - 2, argv + 2);
     if (strcmp(arg1, "from-json") == 0) return cmd_from_json(argc - 2, argv + 2);
     if (strcmp(arg1, "text") == 0) return cmd_text(argc - 2, argv + 2);
+    if (strcmp(arg1, "from-text") == 0) return cmd_from_text(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -1373,6 +1375,7 @@ static void print_usage(FILE *out) {
         "  to-json <archive>                     Convert archive to JSON (stdout)\n"
         "  from-json [-o <archive>] [<json>]     Convert JSON to archive\n"
         "  text <archive> [-o <output>]          Dump as human-readable text\n"
+        "  from-text <input.txt> -o <out.blar> [-z]  Rebuild archive from text\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -3704,4 +3707,461 @@ static int cmd_text(int argc, char **argv) {
     if (output_path) fclose(out);
     free(buf);
     return EXIT_OK;
+}
+
+/* ── cmd_from_text ────────────────────────────────────────────────────── */
+
+/* Parse key=value metadata pairs from the portion of a text line after the
+ * quoted filename.  Recognised keys:
+ *   mode=ONNN  (octal)          mtime=N  (decimal seconds → mtime_ns)
+ *   co=X  (container_type)      jx=X     (jxl_source_format)
+ *   po=N  (pdf_stream_offset)   pl=N     (pdf_stream_length)
+ *   fp=N  (flate_predictor)     fc=N     (flate_columns)
+ *   fl=N  (flate_colors)        fb=N     (flate_bpc)                    */
+static void parse_text_metadata(const char *start, const char *end,
+                                 blip_archive_entry *entry) {
+    const char *p = start;
+    while (p < end) {
+        /* skip whitespace */
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end) break;
+
+        /* find '=' */
+        const char *eq = p;
+        while (eq < end && *eq != '=') eq++;
+        if (eq >= end) break;
+
+        size_t key_len = (size_t)(eq - p);
+        const char *val = eq + 1;
+        const char *val_end = val;
+        while (val_end < end && *val_end != ' ' && *val_end != '\t' &&
+               *val_end != '\n' && *val_end != '\r') val_end++;
+
+        if (key_len == 4 && memcmp(p, "mode", 4) == 0) {
+            entry->mode = (uint16_t)strtoul(val, NULL, 8);
+        } else if (key_len == 5 && memcmp(p, "mtime", 5) == 0) {
+            entry->mtime_ns = strtoll(val, NULL, 10) * 1000000000LL;
+        } else if (key_len == 2 && memcmp(p, "co", 2) == 0) {
+            size_t vlen = (size_t)(val_end - val);
+            char *s = malloc(vlen + 1);
+            if (s) { memcpy(s, val, vlen); s[vlen] = '\0'; }
+            entry->container_type = s;
+            entry->container_type_len = vlen;
+        } else if (key_len == 2 && memcmp(p, "jx", 2) == 0) {
+            size_t vlen = (size_t)(val_end - val);
+            char *s = malloc(vlen + 1);
+            if (s) { memcpy(s, val, vlen); s[vlen] = '\0'; }
+            entry->jxl_source_format = s;
+            entry->jxl_source_format_len = vlen;
+        } else if (key_len == 2 && memcmp(p, "po", 2) == 0) {
+            entry->pdf_stream_offset = strtoull(val, NULL, 10);
+        } else if (key_len == 2 && memcmp(p, "pl", 2) == 0) {
+            entry->pdf_stream_length = strtoull(val, NULL, 10);
+        } else if (key_len == 2 && memcmp(p, "fp", 2) == 0) {
+            entry->flate_predictor = (uint16_t)strtoul(val, NULL, 10);
+        } else if (key_len == 2 && memcmp(p, "fc", 2) == 0) {
+            entry->flate_columns = (uint32_t)strtoul(val, NULL, 10);
+        } else if (key_len == 2 && memcmp(p, "fl", 2) == 0) {
+            entry->flate_colors = (uint8_t)strtoul(val, NULL, 10);
+        } else if (key_len == 2 && memcmp(p, "fb", 2) == 0) {
+            entry->flate_bpc = (uint8_t)strtoul(val, NULL, 10);
+        }
+
+        p = val_end;
+    }
+}
+
+/* Accumulator for payload lines (|...|) between entries */
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} payload_buf_t;
+
+static void payload_buf_init(payload_buf_t *pb) {
+    pb->data = NULL;
+    pb->len = 0;
+    pb->cap = 0;
+}
+
+static bool payload_buf_append(payload_buf_t *pb, const uint8_t *chunk, size_t chunk_len) {
+    if (pb->len + chunk_len > pb->cap) {
+        size_t new_cap = pb->cap == 0 ? 256 : pb->cap * 2;
+        while (new_cap < pb->len + chunk_len) new_cap *= 2;
+        uint8_t *tmp = realloc(pb->data, new_cap);
+        if (!tmp) return false;
+        pb->data = tmp;
+        pb->cap = new_cap;
+    }
+    memcpy(pb->data + pb->len, chunk, chunk_len);
+    pb->len += chunk_len;
+    return true;
+}
+
+static void payload_buf_reset(payload_buf_t *pb) {
+    pb->len = 0;
+}
+
+static void payload_buf_free(payload_buf_t *pb) {
+    free(pb->data);
+    pb->data = NULL;
+    pb->len = 0;
+    pb->cap = 0;
+}
+
+/* Flush accumulated payload into the most-recently-added FILE entry */
+static bool flush_payload(payload_buf_t *pb, entry_list_t *el) {
+    if (pb->len == 0 || el->count == 0) return true;
+
+    /* Decode the accumulated printable-binary text */
+    uint8_t *decoded = NULL;
+    size_t decoded_len = 0;
+    int32_t rc = blip_decode_printable_binary(pb->data, pb->len,
+                                               &decoded, &decoded_len);
+    if (rc != 0) return false;
+
+    /* Copy to a malloc'd buffer so entry_list_free can free() it */
+    uint8_t *content = (uint8_t *)malloc(decoded_len);
+    if (!content) {
+        blip_free(decoded, decoded_len);
+        return false;
+    }
+    memcpy(content, decoded, decoded_len);
+    blip_free(decoded, decoded_len);
+
+    /* Patch the last entry */
+    el->entries[el->count - 1].content = content;
+    el->entries[el->count - 1].content_len = decoded_len;
+    entry_list_add_content(el, content);
+
+    payload_buf_reset(pb);
+    return true;
+}
+
+static int cmd_from_text(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "blar: from-text: missing input text file\n");
+        return EXIT_USAGE;
+    }
+
+    const char *input_path = NULL;
+    const char *output_path = NULL;
+    uint8_t compress_algo = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: from-text: -o requires an argument\n");
+                return EXIT_USAGE;
+            }
+            output_path = argv[++i];
+        } else if (strcmp(argv[i], "-z") == 0) {
+            compress_algo = BLIP_COMP_LZMA2;
+            /* Check for optional algorithm argument */
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                const char *algo = argv[i+1];
+                if (strcmp(algo, "lzma2") == 0 || strcmp(algo, "lzma") == 0) {
+                    compress_algo = BLIP_COMP_LZMA2; i++;
+                } else if (strcmp(algo, "bzip2") == 0 || strcmp(algo, "bz2") == 0) {
+                    compress_algo = BLIP_COMP_BZIP2; i++;
+                } else if (strcmp(algo, "lz4") == 0) {
+                    compress_algo = BLIP_COMP_LZ4; i++;
+                } else if (strcmp(algo, "zstd") == 0 || strcmp(algo, "zst") == 0) {
+                    compress_algo = BLIP_COMP_ZSTD; i++;
+                }
+            }
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            fprintf(stdout,
+                "Usage: blar from-text <input.txt> -o <output.blar> [-z [algo]]\n"
+                "\n"
+                "Rebuild a BLIP archive from the text form produced by 'blar text'.\n");
+            return EXIT_OK;
+        } else if (argv[i][0] != '-') {
+            if (!input_path)
+                input_path = argv[i];
+            else {
+                fprintf(stderr, "blar: from-text: unexpected argument '%s'\n", argv[i]);
+                return EXIT_USAGE;
+            }
+        } else {
+            fprintf(stderr, "blar: from-text: unknown option '%s'\n", argv[i]);
+            return EXIT_USAGE;
+        }
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "blar: from-text: missing input text file\n");
+        return EXIT_USAGE;
+    }
+    if (!output_path) {
+        fprintf(stderr, "blar: from-text: -o <output> is required\n");
+        return EXIT_USAGE;
+    }
+
+    /* Read the text file */
+    size_t text_len = 0;
+    uint8_t *text_buf = read_file(input_path, &text_len);
+    if (!text_buf) {
+        fprintf(stderr, "blar: from-text: cannot open '%s': %s\n",
+                input_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    /* Parse line by line */
+    const char *text = (const char *)text_buf;
+    const char *text_end = text + text_len;
+    const char *line = text;
+
+    /* Verify header */
+    const char *nl = memchr(line, '\n', (size_t)(text_end - line));
+    if (!nl) {
+        fprintf(stderr, "blar: from-text: invalid text (no header line)\n");
+        free(text_buf);
+        return EXIT_IO;
+    }
+    size_t hdr_len = (size_t)(nl - line);
+    if (hdr_len < 6 || memcmp(line, "BLAR/1", 6) != 0) {
+        fprintf(stderr, "blar: from-text: expected BLAR/1 header\n");
+        free(text_buf);
+        return EXIT_IO;
+    }
+    line = nl + 1;
+
+    entry_list_t el;
+    entry_list_init(&el);
+
+    /* DIR path stack: full path prefix at each depth */
+    char **dir_stack = NULL;   /* malloc'd full-path strings */
+    int dir_stack_count = 0;
+    int dir_stack_cap = 0;
+
+    payload_buf_t payload;
+    payload_buf_init(&payload);
+    int last_file_depth = -1; /* depth of the last FILE entry (for payload indentation) */
+
+    int ret = EXIT_OK;
+
+    while (line < text_end) {
+        /* Find end of line */
+        nl = memchr(line, '\n', (size_t)(text_end - line));
+        const char *line_end = nl ? nl : text_end;
+        size_t line_len = (size_t)(line_end - line);
+
+        /* Measure indent */
+        size_t indent = 0;
+        while (indent < line_len && line[indent] == ' ') indent++;
+        int depth = (int)(indent / 2);
+        const char *content_start = line + indent;
+        size_t content_len = line_len - indent;
+
+        if (content_len == 0) {
+            /* blank line — skip */
+            line = nl ? nl + 1 : text_end;
+            continue;
+        }
+
+        if (content_start[0] == '|') {
+            /* Payload line: extract text between first | and last | */
+            const char *pstart = content_start + 1;
+            const char *pend = content_start + content_len;
+            /* Find closing | */
+            if (pend > pstart && pend[-1] == '|') pend--;
+
+            if (pend > pstart) {
+                if (!payload_buf_append(&payload, (const uint8_t *)pstart,
+                                        (size_t)(pend - pstart))) {
+                    fprintf(stderr, "blar: from-text: out of memory\n");
+                    ret = EXIT_IO;
+                    goto cleanup;
+                }
+            }
+        } else if (content_len >= 5 &&
+                   (memcmp(content_start, "DIR ", 4) == 0 ||
+                    memcmp(content_start, "FILE ", 5) == 0)) {
+            /* Flush any pending payload for the previous FILE entry */
+            if (!flush_payload(&payload, &el)) {
+                fprintf(stderr, "blar: from-text: failed to decode payload\n");
+                ret = EXIT_IO;
+                goto cleanup;
+            }
+
+            bool is_dir = (content_start[0] == 'D');
+            /* Find quoted name: skip to first '"' */
+            const char *q1 = memchr(content_start, '"', content_len);
+            if (!q1) {
+                fprintf(stderr, "blar: from-text: missing quoted name\n");
+                ret = EXIT_IO;
+                goto cleanup;
+            }
+            q1++; /* skip opening quote */
+            const char *q2 = memchr(q1, '"', (size_t)(line_end - q1));
+            if (!q2) {
+                fprintf(stderr, "blar: from-text: unterminated quote\n");
+                ret = EXIT_IO;
+                goto cleanup;
+            }
+            size_t name_len = (size_t)(q2 - q1);
+
+            /* Pop DIR stack to match current depth */
+            while (dir_stack_count > depth) {
+                dir_stack_count--;
+                free(dir_stack[dir_stack_count]);
+                dir_stack[dir_stack_count] = NULL;
+            }
+
+            /* Build full path: top-of-stack prefix + basename.
+             * Each dir_stack entry is a full prefix (e.g. "deep/a/b/"),
+             * so we only use the top entry, not concatenate all. */
+            size_t prefix_len = 0;
+            if (dir_stack_count > 0) {
+                prefix_len = strlen(dir_stack[dir_stack_count - 1]);
+            }
+
+            size_t full_path_len = prefix_len + name_len;
+            /* For DIRs in the text, the name already has trailing / (e.g. "sub/").
+             * In the archive, DIR paths do NOT have trailing /.
+             * So we strip the trailing / for the archive path. */
+            size_t archive_path_len = full_path_len;
+            if (is_dir && name_len > 0 && q1[name_len - 1] == '/') {
+                archive_path_len = full_path_len - 1;
+            }
+
+            char *full_path = malloc(archive_path_len + 1);
+            if (!full_path) {
+                fprintf(stderr, "blar: from-text: out of memory\n");
+                ret = EXIT_IO;
+                goto cleanup;
+            }
+            if (prefix_len > 0) {
+                memcpy(full_path, dir_stack[dir_stack_count - 1], prefix_len);
+            }
+            /* Copy the basename (up to archive_path_len - prefix_len chars) */
+            size_t name_copy = archive_path_len - prefix_len;
+            memcpy(full_path + prefix_len, q1, name_copy);
+            full_path[archive_path_len] = '\0';
+
+            /* Build archive entry */
+            blip_archive_entry entry;
+            memset(&entry, 0, sizeof(entry));
+            entry.path = full_path;
+            entry.path_len = archive_path_len;
+            entry.is_dir = is_dir ? 1 : 0;
+            entry.pdf_stream_offset = UINT64_MAX;
+            entry.pdf_stream_length = UINT64_MAX;
+            entry.zip_compression_method = 0xFFFF;
+
+            /* Parse metadata after closing quote */
+            const char *meta_start = q2 + 1;
+            if (meta_start < line_end) {
+                parse_text_metadata(meta_start, line_end, &entry);
+            }
+
+            entry_list_add(&el, entry);
+            entry_list_add_content(&el, (uint8_t *)full_path);
+
+            /* If co= was parsed, register that string for cleanup */
+            if (entry.container_type) {
+                entry_list_add_content(&el, (uint8_t *)(char *)entry.container_type);
+            }
+            if (entry.jxl_source_format) {
+                entry_list_add_content(&el, (uint8_t *)(char *)entry.jxl_source_format);
+            }
+
+            if (is_dir) {
+                /* Push onto DIR stack: store the full prefix including this dir + "/" */
+                if (dir_stack_count >= dir_stack_cap) {
+                    int new_cap = dir_stack_cap == 0 ? 16 : dir_stack_cap * 2;
+                    char **tmp = realloc(dir_stack, (size_t)new_cap * sizeof(char *));
+                    if (!tmp) {
+                        fprintf(stderr, "blar: from-text: out of memory\n");
+                        ret = EXIT_IO;
+                        goto cleanup;
+                    }
+                    dir_stack = tmp;
+                    dir_stack_cap = new_cap;
+                }
+                /* The prefix for children is full_path + "/" */
+                size_t plen = archive_path_len + 1;
+                char *prefix = malloc(plen + 1);
+                if (!prefix) {
+                    fprintf(stderr, "blar: from-text: out of memory\n");
+                    ret = EXIT_IO;
+                    goto cleanup;
+                }
+                memcpy(prefix, full_path, archive_path_len);
+                prefix[archive_path_len] = '/';
+                prefix[plen] = '\0';
+                dir_stack[dir_stack_count++] = prefix;
+            } else {
+                last_file_depth = depth;
+            }
+        }
+        /* else: skip unrecognized lines */
+
+        line = nl ? nl + 1 : text_end;
+    }
+
+    /* Flush any trailing payload */
+    if (!flush_payload(&payload, &el)) {
+        fprintf(stderr, "blar: from-text: failed to decode trailing payload\n");
+        ret = EXIT_IO;
+        goto cleanup;
+    }
+
+    if (el.count == 0) {
+        fprintf(stderr, "blar: from-text: no entries found\n");
+        ret = EXIT_IO;
+        goto cleanup;
+    }
+
+    /* Build the archive */
+    {
+        uint8_t *archive_buf = NULL;
+        size_t archive_len = 0;
+        int32_t rc = blip_archive_create_full(el.entries, el.count, 0, 0, 0,
+                                               NULL, NULL, NULL,
+                                               &archive_buf, &archive_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: from-text: archive creation failed: %s\n",
+                    blip_error_string(rc));
+            ret = EXIT_IO;
+            goto cleanup;
+        }
+
+        /* Optionally compress */
+        if (compress_algo != 0) {
+            uint8_t *compressed_buf = NULL;
+            size_t compressed_len = 0;
+            rc = blip_compress_container(archive_buf, archive_len, compress_algo, 0,
+                                          NULL, NULL, NULL,
+                                          &compressed_buf, &compressed_len);
+            blip_free(archive_buf, archive_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "blar: from-text: compression failed: %s\n",
+                        blip_error_string(rc));
+                ret = EXIT_IO;
+                goto cleanup;
+            }
+            archive_buf = compressed_buf;
+            archive_len = compressed_len;
+        }
+
+        if (!write_file(output_path, archive_buf, archive_len)) {
+            fprintf(stderr, "blar: from-text: cannot write '%s': %s\n",
+                    output_path, strerror(errno));
+            blip_free(archive_buf, archive_len);
+            ret = EXIT_IO;
+            goto cleanup;
+        }
+
+        blip_free(archive_buf, archive_len);
+    }
+
+cleanup:
+    payload_buf_free(&payload);
+    for (int i = 0; i < dir_stack_count; i++) free(dir_stack[i]);
+    free(dir_stack);
+    entry_list_free(&el);
+    free(text_buf);
+    return ret;
 }
