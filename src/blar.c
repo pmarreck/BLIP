@@ -47,6 +47,7 @@ static int cmd_to_json(int argc, char **argv);
 static int cmd_from_json(int argc, char **argv);
 static int cmd_text(int argc, char **argv);
 static int cmd_from_text(int argc, char **argv);
+static int cmd_explode(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -1329,6 +1330,7 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "from-json") == 0) return cmd_from_json(argc - 2, argv + 2);
     if (strcmp(arg1, "text") == 0) return cmd_text(argc - 2, argv + 2);
     if (strcmp(arg1, "from-text") == 0) return cmd_from_text(argc - 2, argv + 2);
+    if (strcmp(arg1, "explode") == 0) return cmd_explode(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -1376,6 +1378,7 @@ static void print_usage(FILE *out) {
         "  from-json [-o <archive>] [<json>]     Convert JSON to archive\n"
         "  text <archive> [-o <output>]          Dump as human-readable text\n"
         "  from-text <input.txt> -o <out.blar> [-z]  Rebuild archive from text\n"
+        "  explode <archive> -C <output_dir>         Extract to dir tree + __meta__.json\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -3937,8 +3940,6 @@ static int cmd_from_text(int argc, char **argv) {
 
     payload_buf_t payload;
     payload_buf_init(&payload);
-    int last_file_depth = -1; /* depth of the last FILE entry (for payload indentation) */
-
     int ret = EXIT_OK;
 
     while (line < text_end) {
@@ -4092,8 +4093,6 @@ static int cmd_from_text(int argc, char **argv) {
                 prefix[archive_path_len] = '/';
                 prefix[plen] = '\0';
                 dir_stack[dir_stack_count++] = prefix;
-            } else {
-                last_file_depth = depth;
             }
         }
         /* else: skip unrecognized lines */
@@ -4163,5 +4162,348 @@ cleanup:
     free(dir_stack);
     entry_list_free(&el);
     free(text_buf);
+    return ret;
+}
+
+/* ── Explode: extract archive to directory tree with __meta__.json sidecars ─ */
+
+/* Metadata entry for one file/dir in a parent directory. */
+typedef struct {
+    char basename[1024];    /* entry basename (with trailing / for dirs) */
+    uint16_t mode;
+    int64_t mtime_s;        /* seconds since epoch */
+    char co[64];            /* container type, empty if none */
+    char jx[64];            /* jxl source format, empty if none */
+    uint64_t po;            /* pdf offset, UINT64_MAX if not set */
+    uint64_t pl;            /* pdf length, UINT64_MAX if not set */
+} explode_meta_entry_t;
+
+/* Dynamic array of meta entries grouped by parent directory. */
+typedef struct {
+    char parent_dir[4096];  /* output filesystem path of the parent dir */
+    explode_meta_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} explode_meta_group_t;
+
+static bool explode_meta_group_add(explode_meta_group_t *g, const explode_meta_entry_t *e) {
+    if (g->count >= g->capacity) {
+        size_t new_cap = g->capacity == 0 ? 16 : g->capacity * 2;
+        explode_meta_entry_t *new_arr = realloc(g->entries, new_cap * sizeof(explode_meta_entry_t));
+        if (!new_arr) return false;
+        g->entries = new_arr;
+        g->capacity = new_cap;
+    }
+    g->entries[g->count++] = *e;
+    return true;
+}
+
+/* Find or create a meta group for the given parent directory. */
+static explode_meta_group_t *explode_find_or_create_group(
+    explode_meta_group_t **groups, size_t *group_count, size_t *group_cap,
+    const char *parent_dir)
+{
+    for (size_t i = 0; i < *group_count; i++) {
+        if (strcmp((*groups)[i].parent_dir, parent_dir) == 0)
+            return &(*groups)[i];
+    }
+    if (*group_count >= *group_cap) {
+        size_t new_cap = *group_cap == 0 ? 16 : (*group_cap) * 2;
+        explode_meta_group_t *new_arr = realloc(*groups, new_cap * sizeof(explode_meta_group_t));
+        if (!new_arr) return NULL;
+        *groups = new_arr;
+        *group_cap = new_cap;
+    }
+    explode_meta_group_t *g = &(*groups)[(*group_count)++];
+    memset(g, 0, sizeof(*g));
+    snprintf(g->parent_dir, sizeof(g->parent_dir), "%s", parent_dir);
+    return g;
+}
+
+/* Write a JSON string with minimal escaping (backslash and double-quote). */
+static void fprint_json_string(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') fputc('\\', f);
+        fputc(*s, f);
+    }
+    fputc('"', f);
+}
+
+/* Write a __meta__.json file for one group. */
+static bool write_meta_json(const explode_meta_group_t *g) {
+    char meta_path[4096];
+    snprintf(meta_path, sizeof(meta_path), "%s/__meta__.json", g->parent_dir);
+
+    FILE *f = fopen(meta_path, "w");
+    if (!f) return false;
+
+    fprintf(f, "{\n");
+    for (size_t i = 0; i < g->count; i++) {
+        const explode_meta_entry_t *e = &g->entries[i];
+        fprintf(f, "  ");
+        fprint_json_string(f, e->basename);
+        fprintf(f, ": {\"mode\": %u, \"mtime\": %lld",
+                (unsigned)e->mode, (long long)e->mtime_s);
+        if (e->co[0] != '\0') {
+            fprintf(f, ", \"co\": ");
+            fprint_json_string(f, e->co);
+        }
+        if (e->jx[0] != '\0') {
+            fprintf(f, ", \"jx\": ");
+            fprint_json_string(f, e->jx);
+        }
+        if (e->po != UINT64_MAX) {
+            fprintf(f, ", \"po\": %llu", (unsigned long long)e->po);
+        }
+        if (e->pl != UINT64_MAX) {
+            fprintf(f, ", \"pl\": %llu", (unsigned long long)e->pl);
+        }
+        fprintf(f, "}%s\n", (i + 1 < g->count) ? "," : "");
+    }
+    fprintf(f, "}\n");
+    fclose(f);
+    return true;
+}
+
+static int cmd_explode(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "blar: explode: missing archive path\n");
+        return EXIT_USAGE;
+    }
+
+    const char *archive_path = argv[0];
+    const char *output_dir = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-C") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: explode: -C requires an argument\n");
+                return EXIT_USAGE;
+            }
+            output_dir = argv[i + 1];
+            i++;
+        }
+    }
+
+    if (!output_dir) {
+        fprintf(stderr, "blar: explode: -C <output_dir> is required\n");
+        return EXIT_USAGE;
+    }
+
+    /* Read and transparently decrypt/decompress the archive */
+    size_t buf_len = 0;
+    uint8_t *buf = read_archive(archive_path, &buf_len);
+    if (!buf) {
+        fprintf(stderr, "blar: explode: cannot open '%s': %s\n",
+                archive_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    uint64_t count = 0;
+    int32_t rc = blip_archive_file_count(buf, buf_len, &count);
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: explode: %s\n", blip_error_string(rc));
+        free(buf);
+        return EXIT_IO;
+    }
+
+    /* Create the output directory */
+    if (!mkdirp(output_dir)) {
+        fprintf(stderr, "blar: explode: cannot create output directory '%s': %s\n",
+                output_dir, strerror(errno));
+        free(buf);
+        return EXIT_IO;
+    }
+
+    /* Metadata groups (one per unique parent directory) */
+    explode_meta_group_t *groups = NULL;
+    size_t group_count = 0;
+    size_t group_cap = 0;
+    int ret = EXIT_OK;
+
+    /* Pass 1: create directories and extract files */
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+
+        const char *path = NULL;
+        size_t path_len = 0;
+        rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: explode: entry %llu: %s\n",
+                    (unsigned long long)i, blip_error_string(rc));
+            ret = EXIT_IO;
+            goto explode_cleanup;
+        }
+
+        /* Build full output path */
+        char out_path[4096];
+        int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                         output_dir, (int)path_len, path);
+        if (n < 0 || (size_t)n >= sizeof(out_path)) {
+            fprintf(stderr, "blar: explode: path too long\n");
+            ret = EXIT_IO;
+            goto explode_cleanup;
+        }
+
+        if (entry_type == 0x07) {
+            /* Directory */
+            if (!mkdirp(out_path)) {
+                fprintf(stderr, "blar: explode: cannot create directory '%s': %s\n",
+                        out_path, strerror(errno));
+                ret = EXIT_IO;
+                goto explode_cleanup;
+            }
+        } else if (entry_type == 0x05) {
+            /* File: ensure parent dir exists, then write content */
+            if (!ensure_parent_dir(out_path)) {
+                fprintf(stderr, "blar: explode: cannot create parent directory for '%s': %s\n",
+                        out_path, strerror(errno));
+                ret = EXIT_IO;
+                goto explode_cleanup;
+            }
+
+            uint8_t *content = NULL;
+            size_t content_len = 0;
+            rc = blip_archive_file_content(buf, buf_len, i, &content, &content_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "blar: explode: cannot read content of '%.*s': %s\n",
+                        (int)path_len, path, blip_error_string(rc));
+                ret = EXIT_IO;
+                goto explode_cleanup;
+            }
+
+            FILE *f = fopen(out_path, "wb");
+            if (!f) {
+                fprintf(stderr, "blar: explode: cannot write '%s': %s\n",
+                        out_path, strerror(errno));
+                blip_free_content(content, content_len);
+                ret = EXIT_IO;
+                goto explode_cleanup;
+            }
+            if (content_len > 0) {
+                fwrite(content, 1, content_len, f);
+            }
+            fclose(f);
+            blip_free_content(content, content_len);
+        }
+
+        /* Set mode if available */
+        uint16_t mode = 0;
+        int64_t mtime_ns = 0;
+        const char *owner = NULL;
+        size_t owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+        if (mode != 0) {
+            chmod(out_path, mode);
+        }
+    }
+
+    /* Pass 2: build and write __meta__.json sidecars */
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+
+        const char *path = NULL;
+        size_t path_len = 0;
+        blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+
+        /* Get metadata */
+        uint16_t mode = 0;
+        int64_t mtime_ns = 0;
+        const char *owner = NULL;
+        size_t owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns, &owner, &owner_len);
+
+        /* Get optional container/jxl/pdf metadata */
+        const char *co_type = NULL;
+        size_t co_type_len = 0;
+        blip_archive_entry_container_type(buf, buf_len, i, &co_type, &co_type_len);
+
+        const char *jx_fmt = NULL;
+        size_t jx_fmt_len = 0;
+        blip_archive_entry_jxl_source(buf, buf_len, i, &jx_fmt, &jx_fmt_len);
+
+        uint64_t po = UINT64_MAX;
+        blip_archive_entry_pdf_offset(buf, buf_len, i, &po);
+
+        uint64_t pl = UINT64_MAX;
+        blip_archive_entry_pdf_length(buf, buf_len, i, &pl);
+
+        /* Determine basename and parent directory */
+        /* path is like "dir/sub/file.txt" — basename is "file.txt", parent is output_dir/dir/sub */
+        char path_str[4096];
+        snprintf(path_str, sizeof(path_str), "%.*s", (int)path_len, path);
+
+        /* For directories, strip trailing slash for path parsing, add back to basename */
+        size_t effective_len = path_len;
+        bool is_dir = (entry_type == 0x07);
+
+        /* Find the last slash to split parent/basename */
+        const char *last_slash = NULL;
+        for (size_t j = 0; j < effective_len; j++) {
+            if (path_str[j] == '/') last_slash = &path_str[j];
+        }
+
+        char parent_path[4096];
+        char basename[1024];
+
+        if (last_slash) {
+            /* Has parent component(s) */
+            size_t parent_part_len = (size_t)(last_slash - path_str);
+            snprintf(parent_path, sizeof(parent_path), "%s/%.*s",
+                     output_dir, (int)parent_part_len, path_str);
+            snprintf(basename, sizeof(basename), "%s%s",
+                     last_slash + 1, is_dir ? "/" : "");
+        } else {
+            /* Top-level entry */
+            snprintf(parent_path, sizeof(parent_path), "%s", output_dir);
+            snprintf(basename, sizeof(basename), "%s%s",
+                     path_str, is_dir ? "/" : "");
+        }
+
+        /* Build meta entry */
+        explode_meta_entry_t meta;
+        memset(&meta, 0, sizeof(meta));
+        snprintf(meta.basename, sizeof(meta.basename), "%s", basename);
+        meta.mode = mode;
+        meta.mtime_s = mtime_ns / 1000000000LL;
+        meta.po = po;
+        meta.pl = pl;
+        if (co_type && co_type_len > 0) {
+            snprintf(meta.co, sizeof(meta.co), "%.*s", (int)co_type_len, co_type);
+        }
+        if (jx_fmt && jx_fmt_len > 0) {
+            snprintf(meta.jx, sizeof(meta.jx), "%.*s", (int)jx_fmt_len, jx_fmt);
+        }
+
+        /* Add to the appropriate group */
+        explode_meta_group_t *grp = explode_find_or_create_group(
+            &groups, &group_count, &group_cap, parent_path);
+        if (!grp || !explode_meta_group_add(grp, &meta)) {
+            fprintf(stderr, "blar: explode: out of memory\n");
+            ret = EXIT_IO;
+            goto explode_cleanup;
+        }
+    }
+
+    /* Write __meta__.json for each group */
+    for (size_t gi = 0; gi < group_count; gi++) {
+        if (!write_meta_json(&groups[gi])) {
+            fprintf(stderr, "blar: explode: cannot write __meta__.json in '%s': %s\n",
+                    groups[gi].parent_dir, strerror(errno));
+            ret = EXIT_IO;
+            goto explode_cleanup;
+        }
+    }
+
+explode_cleanup:
+    for (size_t gi = 0; gi < group_count; gi++) {
+        free(groups[gi].entries);
+    }
+    free(groups);
+    free(buf);
     return ret;
 }
