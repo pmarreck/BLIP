@@ -45,6 +45,7 @@ static int cmd_peek(int argc, char **argv);
 static int cmd_poke(int argc, char **argv);
 static int cmd_to_json(int argc, char **argv);
 static int cmd_from_json(int argc, char **argv);
+static int cmd_text(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -1325,6 +1326,7 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "poke") == 0)   return cmd_poke(argc - 2, argv + 2);
     if (strcmp(arg1, "to-json") == 0) return cmd_to_json(argc - 2, argv + 2);
     if (strcmp(arg1, "from-json") == 0) return cmd_from_json(argc - 2, argv + 2);
+    if (strcmp(arg1, "text") == 0) return cmd_text(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -1370,6 +1372,7 @@ static void print_usage(FILE *out) {
         "  poke <archive> <path> [options]        Modify a value in archive\n"
         "  to-json <archive>                     Convert archive to JSON (stdout)\n"
         "  from-json [-o <archive>] [<json>]     Convert JSON to archive\n"
+        "  text <archive> [-o <output>]          Dump as human-readable text\n"
         "\n"
         "Tar-style shorthand (hyphen optional):\n"
         "  blar cf  <archive> <files/dirs...>     Create\n"
@@ -3464,4 +3467,241 @@ static int cmd_to_json(int argc, char **argv) {
 
 static int cmd_from_json(int argc, char **argv) {
     return cmd_from_json_common("blar", argc, argv);
+}
+
+/* ── cmd_text ─────────────────────────────────────────────────────────── */
+
+static void text_indent(FILE *out, int depth) {
+    for (int i = 0; i < depth; i++) fprintf(out, "  ");
+}
+
+static void text_write_payload(FILE *out, const uint8_t *data, size_t data_len,
+                                int depth) {
+    /* Encode to printable-binary */
+    uint8_t *pb = NULL;
+    size_t pb_len = 0;
+    int32_t rc = blip_encode_printable_binary(data, data_len, &pb, &pb_len);
+    if (rc != BLIP_OK || !pb) {
+        text_indent(out, depth);
+        fprintf(out, "|<encode error>|\n");
+        return;
+    }
+
+    /* Wrap at ~76 chars per line */
+    const size_t wrap = 72; /* leave room for indent + delimiters */
+    size_t pos = 0;
+    while (pos < pb_len) {
+        size_t chunk = pb_len - pos;
+        if (chunk > wrap) chunk = wrap;
+        text_indent(out, depth);
+        fprintf(out, "|%.*s|\n", (int)chunk, pb + pos);
+        pos += chunk;
+    }
+
+    blip_free(pb, pb_len);
+}
+
+static int cmd_text(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "blar: text: missing archive path\n");
+        return EXIT_USAGE;
+    }
+
+    const char *archive_path = argv[0];
+    const char *output_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: text: -o requires an argument\n");
+                return EXIT_USAGE;
+            }
+            output_path = argv[i + 1];
+            i++;
+        }
+    }
+
+    size_t buf_len = 0;
+    uint8_t *buf = read_archive(archive_path, &buf_len);
+    if (!buf) {
+        fprintf(stderr, "blar: text: cannot open '%s': %s\n",
+                archive_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    uint64_t count = 0;
+    int32_t rc = blip_archive_file_count(buf, buf_len, &count);
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: text: %s\n", blip_error_string(rc));
+        free(buf);
+        return EXIT_IO;
+    }
+
+    FILE *out = stdout;
+    if (output_path) {
+        out = fopen(output_path, "w");
+        if (!out) {
+            fprintf(stderr, "blar: text: cannot open '%s': %s\n",
+                    output_path, strerror(errno));
+            free(buf);
+            return EXIT_IO;
+        }
+    }
+
+    fprintf(out, "BLAR/1\n");
+
+    int depth = 0;
+
+    /* DIR path stack for tracking nesting depth */
+    const char **dir_paths = NULL;
+    size_t *dir_path_lens = NULL;
+    int dir_stack_cap = 0;
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t entry_type = 0;
+        blip_archive_entry_type(buf, buf_len, i, &entry_type);
+
+        const char *path = NULL;
+        size_t path_len = 0;
+        rc = blip_archive_file_path(buf, buf_len, i, &path, &path_len);
+        if (rc != BLIP_OK) {
+            fprintf(stderr, "blar: text: entry %llu: %s\n",
+                    (unsigned long long)i, blip_error_string(rc));
+            if (output_path) fclose(out);
+            free(dir_paths);
+            free(dir_path_lens);
+            free(buf);
+            return EXIT_IO;
+        }
+
+        /* Pop DIR stack: if current path is not under the top DIR, pop.
+         * DIR paths from the FFI don't have trailing /, so we check
+         * that the current path starts with "dirpath/" */
+        while (depth > 0) {
+            const char *top_dir = dir_paths[depth - 1];
+            size_t top_len = dir_path_lens[depth - 1];
+            /* Check if current path starts with "top_dir/" */
+            if (path_len > top_len &&
+                path[top_len] == '/' &&
+                memcmp(path, top_dir, top_len) == 0) {
+                break; /* still inside this DIR */
+            }
+            depth--;
+        }
+
+        /* Get metadata */
+        uint16_t mode = 0;
+        int64_t mtime_ns = 0;
+        const char *owner = NULL;
+        size_t owner_len = 0;
+        blip_archive_entry_metadata(buf, buf_len, i, &mode, &mtime_ns,
+                                     &owner, &owner_len);
+
+        /* Extract just the basename for display (last component of path) */
+        const char *display_name = path;
+        size_t display_len = path_len;
+        if (entry_type == 0x07) {
+            /* DIR: show just the last directory component with trailing / */
+            /* For "a/b/c/", show "c/" at the proper depth */
+            /* Find the second-to-last slash */
+            size_t name_end = path_len;
+            if (name_end > 0 && path[name_end - 1] == '/') name_end--; /* skip trailing / */
+            size_t name_start = 0;
+            for (size_t j = 0; j < name_end; j++) {
+                if (path[j] == '/') name_start = j + 1;
+            }
+            display_name = path + name_start;
+            display_len = path_len - name_start; /* includes trailing / */
+        } else {
+            /* FILE: show just the filename */
+            size_t name_start = 0;
+            for (size_t j = 0; j < path_len; j++) {
+                if (path[j] == '/') name_start = j + 1;
+            }
+            display_name = path + name_start;
+            display_len = path_len - name_start;
+        }
+
+        if (entry_type == 0x07) {
+            /* DIR entry — show with trailing / */
+            text_indent(out, depth);
+            if (display_len > 0 && display_name[display_len - 1] == '/')
+                fprintf(out, "DIR \"%.*s\"", (int)display_len, display_name);
+            else
+                fprintf(out, "DIR \"%.*s/\"", (int)display_len, display_name);
+
+            /* Container type */
+            const char *co_type = NULL;
+            size_t co_type_len = 0;
+            if (blip_archive_entry_container_type(buf, buf_len, i,
+                    &co_type, &co_type_len) == BLIP_OK && co_type != NULL) {
+                fprintf(out, " co=%.*s", (int)co_type_len, co_type);
+            }
+
+            if (mode != 0)
+                fprintf(out, " mode=%04o", mode);
+            if (mtime_ns != 0) {
+                int64_t mtime_sec = mtime_ns / 1000000000LL;
+                fprintf(out, " mtime=%lld", (long long)mtime_sec);
+            }
+            fprintf(out, "\n");
+
+            /* Push this DIR onto the stack */
+            if (depth >= dir_stack_cap) {
+                int new_cap = dir_stack_cap == 0 ? 16 : dir_stack_cap * 2;
+                dir_paths = realloc(dir_paths, (size_t)new_cap * sizeof(const char *));
+                dir_path_lens = realloc(dir_path_lens, (size_t)new_cap * sizeof(size_t));
+                dir_stack_cap = new_cap;
+            }
+            dir_paths[depth] = path;
+            dir_path_lens[depth] = path_len;
+            depth++;
+        } else {
+            /* FILE entry */
+            text_indent(out, depth);
+            fprintf(out, "FILE \"%.*s\"", (int)display_len, display_name);
+
+            /* JXL source format */
+            const char *jx_fmt = NULL;
+            size_t jx_fmt_len = 0;
+            if (blip_archive_entry_jxl_source(buf, buf_len, i,
+                    &jx_fmt, &jx_fmt_len) == BLIP_OK && jx_fmt != NULL) {
+                fprintf(out, " jx=%.*s", (int)jx_fmt_len, jx_fmt);
+            }
+
+            /* PDF stream offset/length */
+            uint64_t po = UINT64_MAX;
+            uint64_t pl = UINT64_MAX;
+            blip_archive_entry_pdf_offset(buf, buf_len, i, &po);
+            blip_archive_entry_pdf_length(buf, buf_len, i, &pl);
+            if (po != UINT64_MAX)
+                fprintf(out, " po=%llu", (unsigned long long)po);
+            if (pl != UINT64_MAX)
+                fprintf(out, " pl=%llu", (unsigned long long)pl);
+
+            if (mode != 0)
+                fprintf(out, " mode=%04o", mode);
+            if (mtime_ns != 0) {
+                int64_t mtime_sec = mtime_ns / 1000000000LL;
+                fprintf(out, " mtime=%lld", (long long)mtime_sec);
+            }
+            fprintf(out, "\n");
+
+            /* Get file content and write payload */
+            uint8_t *data = NULL;
+            size_t data_len = 0;
+            rc = blip_archive_file_content(buf, buf_len, i, &data, &data_len);
+            if (rc == BLIP_OK && data != NULL && data_len > 0) {
+                text_write_payload(out, data, data_len, depth + 1);
+                blip_free_content(data, data_len);
+            }
+        }
+    }
+
+    free(dir_paths);
+    free(dir_path_lens);
+
+    if (output_path) fclose(out);
+    free(buf);
+    return EXIT_OK;
 }
