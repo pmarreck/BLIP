@@ -950,6 +950,87 @@ static bool expand_png_container(entry_list_t *el,
     return true;
 }
 
+/* ── Codec plugin interface ───────────────────────────────────────────── */
+
+/* A codec describes how to detect and expand a container format. */
+typedef struct {
+    const char *name;                   /* e.g. "pdf", "png", "zip" */
+    const char *const *extensions;      /* NULL-terminated list of file extensions */
+    bool (*detect)(const uint8_t *buf, size_t len);
+    bool (*expand)(entry_list_t *el, const uint8_t *content, size_t content_len,
+                   const blip_archive_entry *entry);
+    bool (*collapse)(entry_list_t *el, const uint8_t *content, size_t content_len,
+                     const blip_archive_entry *entry);  /* NULL = not implemented */
+} blar_codec_t;
+
+/* A registry holds an array of codecs. */
+typedef struct {
+    const blar_codec_t *codecs;
+    size_t count;
+} blar_codec_registry_t;
+
+/* ── Builtin codec structs & registry ─────────────────────────────────── */
+
+static const char *const pdf_extensions[] = { ".pdf", NULL };
+static const char *const png_extensions[] = { ".png", NULL };
+static const char *const zip_extensions[] = { ".zip", ".jar", ".war", ".ear", ".apk", ".ipa",
+                                              ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+                                              ".epub", ".cbz", NULL };
+
+static const blar_codec_t builtin_codecs[] = {
+    {
+        .name       = "pdf",
+        .extensions = pdf_extensions,
+        .detect     = blip_is_pdf,
+        .expand     = expand_pdf_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "png",
+        .extensions = png_extensions,
+        .detect     = blip_is_png,
+        .expand     = expand_png_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "zip",
+        .extensions = zip_extensions,
+        .detect     = blip_is_zip,
+        .expand     = expand_zip_container,
+        .collapse   = NULL,
+    },
+};
+
+static const blar_codec_registry_t builtin_registry = {
+    .codecs = builtin_codecs,
+    .count  = sizeof(builtin_codecs) / sizeof(builtin_codecs[0]),
+};
+
+/* Find a codec by name (e.g. "pdf", "zip").
+ * Returns NULL if not found. */
+static const blar_codec_t *blar_codec_find_by_name(const blar_codec_registry_t *reg,
+                                                     const char *name, size_t name_len) {
+    for (size_t i = 0; i < reg->count; i++) {
+        if (strlen(reg->codecs[i].name) == name_len &&
+            memcmp(reg->codecs[i].name, name, name_len) == 0) {
+            return &reg->codecs[i];
+        }
+    }
+    return NULL;
+}
+
+/* Detect which codec matches a buffer's magic bytes.
+ * Returns the first matching codec, or NULL if none match. */
+static const blar_codec_t *blar_codec_detect(const blar_codec_registry_t *reg,
+                                               const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < reg->count; i++) {
+        if (reg->codecs[i].detect && reg->codecs[i].detect(buf, len)) {
+            return &reg->codecs[i];
+        }
+    }
+    return NULL;
+}
+
 static bool collect_entries_recurse(const char *path, entry_list_t *el);
 
 static bool collect_dir_children(const char *path, entry_list_t *el) {
