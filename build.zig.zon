@@ -5,20 +5,24 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .z7z = .{
-            .url = "https://github.com/pmarreck/z7z/archive/ef93d8f4f8e2792f72bb48d3aea2d83194e2a250.tar.gz",
-            .hash = "z7z-0.1.0-rkKuF47_BQCI0cECPS0cc4V0YwBldfOmQIy9ByJQqBv6",
+            .url = "https://github.com/pmarreck/z7z/archive/675d2e0f15c91624b53de296d02b0ade7f386ce3.tar.gz",
+            .hash = "z7z-0.1.0-rkKuF2hCBgBoySmohPLRbhwKnIStQLLRO5O2OgelO0hE",
+            .lazy = true,
         },
         .bzip2z = .{
             .url = "https://github.com/pmarreck/bzip2z/archive/76d3ca8f35dad2c1393eb35d97332d5a8e9da2bb.tar.gz",
             .hash = "bzip2z-0.1.0-m5NdlvkqAwCEafj8KkeEu4fIXSTRp-sKQewGM28tYrcr",
+            .lazy = true,
         },
         .lz4 = .{
             .url = "https://github.com/pmarreck/lz4/archive/675532cbcc0609ddfc44a6e13240902574579a25.tar.gz",
             .hash = "lz4-1.10.0-TtaqjVLWBwDiQxASdpBmT-44zoqcVnVkA9kQGAonGWDf",
+            .lazy = true,
         },
         .zstdz = .{
             .url = "https://github.com/pmarreck/zstdz/archive/c79c202b8d6512a72a5b0b65ad771adfda66d301.tar.gz",
             .hash = "zstdz-1.6.0-yDWjzshaNABOkMCYfrjAhKjPt46sKjdR9cLB-XgzeTt4",
+            .lazy = true,
         },
         .progrez = .{
             .url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz",

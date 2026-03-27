@@ -3,7 +3,11 @@ const Allocator = std.mem.Allocator;
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const csum_mod = @import("checksum.zig");
-const compression = @import("compression.zig");
+const build_options = @import("build_options");
+const compression = if (build_options.enable_compression)
+    @import("compression.zig")
+else
+    @import("compression_stub.zig");
 const testing = std.testing;
 
 const ContainerError = container.ContainerError;
@@ -76,6 +80,7 @@ pub fn verifyChecksum(buf: []const u8) ContainerError!bool {
 // =============================================================================
 
 test "LZMA2 round-trip: compress and decompress a DATA container" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -92,6 +97,7 @@ test "LZMA2 round-trip: compress and decompress a DATA container" {
 }
 
 test "LZMA2 hash/checksum verification" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -105,6 +111,7 @@ test "LZMA2 hash/checksum verification" {
 }
 
 test "LZMA2 checksum detects corruption" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -121,6 +128,7 @@ test "LZMA2 checksum detects corruption" {
 }
 
 test "LZMA2 wraps an ARRAY container" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
     const array_mod = @import("array.zig");
@@ -143,6 +151,7 @@ test "LZMA2 wraps an ARRAY container" {
 }
 
 test "LZMA2 Reader: header inspection without decompression" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -160,6 +169,7 @@ test "LZMA2 Reader: header inspection without decompression" {
 }
 
 test "LZMA2 compression shrinks compressible data" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -186,6 +196,7 @@ test "LZMA2 compression shrinks compressible data" {
 }
 
 test "LZMA2 empty container round-trip" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -201,6 +212,7 @@ test "LZMA2 empty container round-trip" {
 }
 
 test "LZMA2 rejects non-compressed container (no COMP attribute)" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -211,6 +223,7 @@ test "LZMA2 rejects non-compressed container (no COMP attribute)" {
 }
 
 test "isCompressed returns true for LZMA2 container" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 
@@ -234,6 +247,7 @@ test "isCompressed returns false for plain container" {
 }
 
 test "Verify LP attributes are correct (TYPE=data, COMP=lzma2, DECOMP_LEN present, CSUM=blake3_128)" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const leaf = @import("leaf.zig");
 

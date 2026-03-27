@@ -640,7 +640,11 @@ pub const peek_mod = @import("peek.zig");
 pub const poke_mod = @import("poke.zig");
 pub const json_serde = @import("json_serde.zig");
 pub const lzma2_mod = @import("lzma2.zig");
-pub const compression_mod = @import("compression.zig");
+pub const build_options = @import("build_options");
+pub const compression_mod = if (build_options.enable_compression)
+    @import("compression.zig")
+else
+    @import("compression_stub.zig");
 pub const encryption = @import("encryption.zig");
 pub const zip_mod = @import("zip.zig");
 pub const jxl_mod = @import("jxl.zig");
@@ -670,7 +674,10 @@ test {
     _ = @import("mini_blar.zig");
     _ = @import("json_serde.zig");
     _ = @import("lzma2.zig");
-    _ = @import("compression.zig");
+    _ = if (build_options.enable_compression)
+        @import("compression.zig")
+    else
+        @import("compression_stub.zig");
     _ = @import("encryption.zig");
     _ = @import("checksum.zig");
     _ = @import("zip.zig");

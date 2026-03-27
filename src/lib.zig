@@ -2288,6 +2288,7 @@ test "C FFI: blip_archive_file_verify checks per-file hash" {
 }
 
 test "C FFI: bzip2 compress+decompress multi-block archive" {
+    if (comptime !@import("blip").build_options.enable_compression) return;
     // Regression test: bzip2 multi-block streams (data > ~900KB at level 9)
     // previously caused OutputOverflow on decompression. Fixed in bzip2z f9187bf.
     const size = 950_000; // >900KB to ensure multi-block

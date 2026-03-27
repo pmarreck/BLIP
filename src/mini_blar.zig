@@ -6,7 +6,11 @@ const ct = @import("container_types.zig");
 pub const leaf = @import("leaf.zig");
 pub const array_mod = @import("array.zig");
 pub const dict_mod = @import("dict.zig");
-pub const compression_mod = @import("compression.zig");
+const build_options = @import("build_options");
+pub const compression_mod = if (build_options.enable_compression)
+    @import("compression.zig")
+else
+    @import("compression_stub.zig");
 // data_mod removed in v2 — use leaf directly (data.zig merged into leaf.zig)
 const testing = std.testing;
 
@@ -1515,6 +1519,7 @@ test "Merkle hash uses per-file xxHash64 from FILE ARRAY container" {
 }
 
 test "per-file compression: createFullArchive with comp_id produces recoverable content" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
 
     const entries = [_]ArchiveEntry{
@@ -1570,6 +1575,7 @@ test "fileContentDecompress works on uncompressed archives" {
 }
 
 test "per-file compression with all algorithms" {
+    if (comptime !build_options.enable_compression) return;
     const allocator = testing.allocator;
     const algos = [_]ct.CompressionId{ .lz4, .zstd, .lzma2, .bzip2 };
 
@@ -1585,5 +1591,68 @@ test "per-file compression with all algorithms" {
         const content = try reader.fileContentDecompress(0, allocator);
         defer allocator.free(content);
         try testing.expectEqualSlices(u8, "Hello, per-file compression test!", content);
+    }
+}
+
+test "enable_compression flag: archive create/read works regardless of flag" {
+    // This test runs with BOTH enable_compression=true and false,
+    // verifying that uncompressed archive operations always work.
+    const allocator = testing.allocator;
+
+    const entries = [_]ArchiveEntry{
+        .{ .file = .{ .path = "a.txt", .content = "alpha" } },
+        .{ .file = .{ .path = "b.txt", .content = "beta" } },
+    };
+
+    // Create archive without compression (comp_id = null) — must always work
+    const archive = try createFullArchive(allocator, &entries, null, null, null, null, 0);
+    defer allocator.free(archive);
+
+    const reader = try ArchiveReader.init(archive);
+    try testing.expect(try reader.verifyMagic());
+    try testing.expectEqual(@as(u64, 2), try reader.entryCount());
+
+    // Path lookup works
+    try testing.expectEqualSlices(u8, "a.txt", try reader.entryPathAt(0));
+    try testing.expectEqualSlices(u8, "b.txt", try reader.entryPathAt(1));
+
+    // Content retrieval works
+    const content0 = try reader.fileContentDecompress(0, allocator);
+    defer allocator.free(content0);
+    try testing.expectEqualSlices(u8, "alpha", content0);
+
+    const content1 = try reader.fileContentDecompress(1, allocator);
+    defer allocator.free(content1);
+    try testing.expectEqualSlices(u8, "beta", content1);
+
+    // Checksum verification works
+    try testing.expect(try reader.verifyChecksum());
+    try testing.expect(try reader.verifyFileAt(0));
+    try testing.expect(try reader.verifyFileAt(1));
+}
+
+test "enable_compression flag: isCompressed works regardless of flag" {
+    // isCompressed only parses LP headers — works without compression libs
+    const leaf_mod = @import("leaf.zig");
+    const allocator = testing.allocator;
+
+    const plain = try leaf_mod.serializeData(allocator, "not compressed");
+    defer allocator.free(plain);
+    try testing.expect(!compression_mod.isCompressed(plain));
+}
+
+test "enable_compression flag: build_options reflects correct state" {
+    // Verify the build_options module is accessible and has the expected type
+    const flag = build_options.enable_compression;
+    // The flag is a comptime bool — if we're running, it compiled correctly
+    if (flag) {
+        // Compression enabled: real compression module should be loaded
+        // (verified by the compression-specific tests that also run)
+    } else {
+        // Compression disabled: stub should return UnsupportedCompression
+        try testing.expectError(
+            error.UnsupportedCompression,
+            compression_mod.compress(testing.allocator, .lzma2, "test", null, null, 0),
+        );
     }
 }

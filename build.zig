@@ -8,6 +8,18 @@ pub fn build(b: *std.Build) void {
         "Optimization mode",
     ) orelse .ReleaseFast;
 
+    // Build option: enable compression support (z7z, bzip2z, lz4, zstd).
+    // Default true. Downstream consumers can set false to avoid heavy deps.
+    const enable_compression = b.option(
+        bool,
+        "enable_compression",
+        "Enable compression support (requires z7z, bzip2z, lz4, zstd). Default: true.",
+    ) orelse true;
+
+    // Build options module — passed to Zig source files via @import("build_options")
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_compression", enable_compression);
+
     // printable-binary module (vendored) — needed by static lib for peek FFI
     // NOTE: must be defined before blip_module so it can be imported
     const pb_module = b.createModule(.{
@@ -16,33 +28,30 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // z7z dependency — provides LZMA2 compression engine
-    const z7z_dep = b.dependency("z7z", .{
+    // Compression dependencies — lazy, only fetched when enable_compression is true
+    const z7z_dep = if (enable_compression) b.lazyDependency("z7z", .{
         .target = target,
         .optimize = optimize,
-    });
-    const z7z_module = z7z_dep.module("z7z");
+    }) else null;
+    const z7z_module = if (z7z_dep) |dep| dep.module("z7z") else null;
 
-    // bzip2z dependency — provides bzip2 compression engine
-    const bzip2z_dep = b.dependency("bzip2z", .{
+    const bzip2z_dep = if (enable_compression) b.lazyDependency("bzip2z", .{
         .target = target,
         .optimize = optimize,
-    });
-    const bzip2z_module = bzip2z_dep.module("bzip2z");
+    }) else null;
+    const bzip2z_module = if (bzip2z_dep) |dep| dep.module("bzip2z") else null;
 
-    // lz4 dependency — provides LZ4 compression (C library)
-    const lz4_dep = b.dependency("lz4", .{
+    const lz4_dep = if (enable_compression) b.lazyDependency("lz4", .{
         .target = target,
         .optimize = optimize,
-    });
-    const lz4_lib = lz4_dep.artifact("lz4");
+    }) else null;
+    const lz4_lib = if (lz4_dep) |dep| dep.artifact("lz4") else null;
 
-    // zstdz dependency — provides Zstandard compression (C library)
-    const zstdz_dep = b.dependency("zstdz", .{
+    const zstdz_dep = if (enable_compression) b.lazyDependency("zstdz", .{
         .target = target,
         .optimize = optimize,
-    });
-    const zstdz_lib = zstdz_dep.artifact("zstd");
+    }) else null;
+    const zstdz_lib = if (zstdz_dep) |dep| dep.artifact("zstd") else null;
 
     // progrez dependency — provides progress bar (C library)
     const progrez_dep = b.dependency("progrez", .{
@@ -56,6 +65,39 @@ pub fn build(b: *std.Build) void {
     const jxl_include_path = b.option([]const u8, "jxl-include-path", "Path to libjxl headers");
     const jxl_lib_path = b.option([]const u8, "jxl-lib-path", "Path to libjxl libraries");
 
+    // Helper: add compression deps + build_options to a module
+    const addCompressionSupport = struct {
+        fn apply(
+            module: *std.Build.Module,
+            z7z_mod: ?*std.Build.Module,
+            bzip2z_mod: ?*std.Build.Module,
+            lz4: ?*std.Build.Step.Compile,
+            zstdz: ?*std.Build.Step.Compile,
+            opts: *std.Build.Step.Options,
+        ) void {
+            module.addOptions("build_options", opts);
+            if (z7z_mod) |m| module.addImport("z7z", m);
+            if (bzip2z_mod) |m| module.addImport("bzip2z", m);
+            if (lz4) |lib| module.linkLibrary(lib);
+            if (zstdz) |lib| module.linkLibrary(lib);
+        }
+    }.apply;
+
+    // Helper: add libjxl support to a module
+    const addJxlSupport = struct {
+        fn apply(
+            module: *std.Build.Module,
+            inc_path: ?[]const u8,
+            lib_path: ?[]const u8,
+        ) void {
+            if (inc_path) |inc| module.addSystemIncludePath(.{ .cwd_relative = inc });
+            if (lib_path) |lib| module.addLibraryPath(.{ .cwd_relative = lib });
+            module.linkSystemLibrary("jxl", .{});
+            module.linkSystemLibrary("jxl_threads", .{});
+            module.linkSystemLibrary("z", .{});
+        }
+    }.apply;
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -63,18 +105,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
-            .{ .name = "z7z", .module = z7z_module },
-            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
-    blip_module.linkLibrary(lz4_lib);
-    blip_module.linkLibrary(zstdz_lib);
-    // libjxl: add include/lib paths and link
-    if (jxl_include_path) |inc| blip_module.addSystemIncludePath(.{ .cwd_relative = inc });
-    if (jxl_lib_path) |lib| blip_module.addLibraryPath(.{ .cwd_relative = lib });
-    blip_module.linkSystemLibrary("jxl", .{});
-    blip_module.linkSystemLibrary("jxl_threads", .{});
-    blip_module.linkSystemLibrary("z", .{});
+    addCompressionSupport(blip_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    addJxlSupport(blip_module, jxl_include_path, jxl_lib_path);
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
@@ -85,17 +119,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
-            .{ .name = "z7z", .module = z7z_module },
-            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
-    exposed_blip.linkLibrary(lz4_lib);
-    exposed_blip.linkLibrary(zstdz_lib);
-    if (jxl_include_path) |inc| exposed_blip.addSystemIncludePath(.{ .cwd_relative = inc });
-    if (jxl_lib_path) |lib| exposed_blip.addLibraryPath(.{ .cwd_relative = lib });
-    exposed_blip.linkSystemLibrary("jxl", .{});
-    exposed_blip.linkSystemLibrary("jxl_threads", .{});
-    exposed_blip.linkSystemLibrary("z", .{});
+    addCompressionSupport(exposed_blip, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    addJxlSupport(exposed_blip, jxl_include_path, jxl_lib_path);
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
@@ -103,17 +130,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
-            .{ .name = "z7z", .module = z7z_module },
-            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
-    exposed_mini_blar.linkLibrary(lz4_lib);
-    exposed_mini_blar.linkLibrary(zstdz_lib);
-    if (jxl_include_path) |inc| exposed_mini_blar.addSystemIncludePath(.{ .cwd_relative = inc });
-    if (jxl_lib_path) |lib| exposed_mini_blar.addLibraryPath(.{ .cwd_relative = lib });
-    exposed_mini_blar.linkSystemLibrary("jxl", .{});
-    exposed_mini_blar.linkSystemLibrary("jxl_threads", .{});
-    exposed_mini_blar.linkSystemLibrary("z", .{});
+    addCompressionSupport(exposed_mini_blar, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    addJxlSupport(exposed_mini_blar, jxl_include_path, jxl_lib_path);
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -245,17 +265,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "printable_binary", .module = pb_module },
-            .{ .name = "z7z", .module = z7z_module },
-            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
-    unit_test_module.linkLibrary(lz4_lib);
-    unit_test_module.linkLibrary(zstdz_lib);
-    if (jxl_include_path) |inc| unit_test_module.addSystemIncludePath(.{ .cwd_relative = inc });
-    if (jxl_lib_path) |lib| unit_test_module.addLibraryPath(.{ .cwd_relative = lib });
-    unit_test_module.linkSystemLibrary("jxl", .{});
-    unit_test_module.linkSystemLibrary("jxl_threads", .{});
-    unit_test_module.linkSystemLibrary("z", .{});
+    addCompressionSupport(unit_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    addJxlSupport(unit_test_module, jxl_include_path, jxl_lib_path);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -269,17 +282,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "blip", .module = blip_module },
             .{ .name = "printable_binary", .module = pb_module },
-            .{ .name = "z7z", .module = z7z_module },
-            .{ .name = "bzip2z", .module = bzip2z_module },
         },
     });
-    ffi_test_module.linkLibrary(lz4_lib);
-    ffi_test_module.linkLibrary(zstdz_lib);
-    if (jxl_include_path) |inc| ffi_test_module.addSystemIncludePath(.{ .cwd_relative = inc });
-    if (jxl_lib_path) |lib| ffi_test_module.addLibraryPath(.{ .cwd_relative = lib });
-    ffi_test_module.linkSystemLibrary("jxl", .{});
-    ffi_test_module.linkSystemLibrary("jxl_threads", .{});
-    ffi_test_module.linkSystemLibrary("z", .{});
+    addCompressionSupport(ffi_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    addJxlSupport(ffi_test_module, jxl_include_path, jxl_lib_path);
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,
     });
