@@ -1,8 +1,9 @@
 /*
  * miniblar -- Minimal BLIP Archive CLI
  *
- * Creates flat miniBlar archives (FILE entries only, no directory support,
- * no metadata). For full directory and metadata support, use blar.
+ * Creates flat miniBlar archives (FILE entries only with metadata,
+ * no directories, no compression, no encryption).
+ * For directory support, compression, and encryption, use blar.
  *
  * Usage:
  *   miniblar create [-o <archive>] <files...>
@@ -110,7 +111,7 @@ static void print_usage(FILE *out) {
         "For directory support, use 'blar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-z [algo]] [-o <archive>] <files...>   Create a BLIP archive\n"
+        "  create [-o <archive>] <files...>               Create a BLIP archive\n"
         "  list <archive>                     List files in archive\n"
         "  extract <archive> [-C <dir>]       Extract files from archive\n"
         "  verify <archive>                   Verify archive integrity\n"
@@ -137,9 +138,6 @@ static void print_usage(FILE *out) {
         "  P                              Absolute names (preserve leading /)\n"
         "\n"
         "Options:\n"
-        "  -z [algo]        Compress (lzma2=default, bzip2, lz4, zstd)\n"
-        "                   Default: per-file compression\n"
-        "  --solid          Solid compression (whole archive, better ratio)\n"
         "  -j <N>, --threads <N>  Thread count (0=auto, default: 0)\n"
         "  -f, --force      Overwrite output file without prompting\n"
         "  --absolute-names Preserve absolute paths in archive\n"
@@ -158,13 +156,6 @@ static void create_progress_cb(uint64_t entries_done, uint64_t bytes_done,
                                 void *user_ctx) {
     progrez_ctx *progress = (progrez_ctx *)user_ctx;
     if (progress) progrez_update(progress, entries_done, bytes_done);
-}
-
-static void compress_progress_cb(uint64_t bytes_done, uint64_t bytes_total,
-                                  void *user_ctx) {
-    (void)bytes_total;
-    progrez_ctx *progress = (progrez_ctx *)user_ctx;
-    if (progress) progrez_update(progress, 0, bytes_done);
 }
 
 static void write_progress_cb(uint64_t bytes_written, void *user_ctx) {
@@ -189,8 +180,6 @@ static int cmd_create(int argc, char **argv) {
     const char *out_path = NULL;
     int file_start = 0;
     bool absolute_names = g_absolute_names;
-    uint8_t compress_algo = 0;  /* 0 = no compression */
-    bool solid_mode = false;    /* --solid: solid compression (old behavior) */
     uint8_t num_threads = 0;    /* 0 = auto */
     bool force = false;        /* -f/--force: overwrite without prompting */
 
@@ -199,7 +188,7 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
-    /* Scan for --absolute-names, -z, and -o before positional parsing.
+    /* Scan for --absolute-names and -o before positional parsing.
      * Named options can appear anywhere in the argument list. */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--absolute-names") == 0) {
@@ -208,42 +197,16 @@ static int cmd_create(int argc, char **argv) {
             argc--;
             i--;
         } else if (strcmp(argv[i], "-z") == 0) {
-            compress_algo = BLIP_COMP_LZMA2; /* default */
-            /* Check for optional algorithm argument */
-            if (i + 1 < argc && argv[i+1][0] != '-') {
-                const char *algo = argv[i+1];
-                if (strcmp(algo, "lzma2") == 0 || strcmp(algo, "lzma") == 0) {
-                    compress_algo = BLIP_COMP_LZMA2;
-                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
-                    argc--;
-                } else if (strcmp(algo, "bzip2") == 0 || strcmp(algo, "bz2") == 0) {
-                    compress_algo = BLIP_COMP_BZIP2;
-                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
-                    argc--;
-                } else if (strcmp(algo, "lz4") == 0) {
-                    compress_algo = BLIP_COMP_LZ4;
-                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
-                    argc--;
-                } else if (strcmp(algo, "zstd") == 0 || strcmp(algo, "zst") == 0) {
-                    compress_algo = BLIP_COMP_ZSTD;
-                    for (int j = i+1; j < argc - 1; j++) argv[j] = argv[j + 1];
-                    argc--;
-                }
-                /* else: not an algo name, don't consume */
-            }
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--;
-            i--;
+            fprintf(stderr, "miniblar: create: compression not supported (use blar for compression)\n");
+            return EXIT_USAGE;
         } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
             force = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
         } else if (strcmp(argv[i], "--solid") == 0) {
-            solid_mode = true;
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--;
-            i--;
+            fprintf(stderr, "miniblar: create: compression not supported (use blar for compression)\n");
+            return EXIT_USAGE;
         } else if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--threads") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "miniblar: create: %s requires an argument\n", argv[i]);
@@ -423,19 +386,11 @@ static int cmd_create(int argc, char **argv) {
         progrez_update(progress, 0, 0);
     }
 
-    /* Determine per-file vs solid compression.
-     * Default when -z is used: per-file compression.
-     * --solid: solid compression (wrap entire archive). */
-    uint8_t per_file_comp = 0;
-    if (compress_algo != 0 && !solid_mode) {
-        per_file_comp = compress_algo;
-    }
-
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
     uint32_t create_flags = absolute_names ? BLIP_ARCHIVE_ABSOLUTE_PATHS : 0;
     int32_t rc = blip_archive_create_full(entries, (size_t)file_count, create_flags,
-                                           per_file_comp, num_threads,
+                                           0 /* no compression */, num_threads,
                                            progress ? create_progress_cb : NULL,
                                            progress ? phase_cb : NULL,
                                            progress,
@@ -452,31 +407,6 @@ static int cmd_create(int argc, char **argv) {
         if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "miniblar: create: %s\n", blip_error_string(rc));
         return EXIT_IO;
-    }
-
-    /* Solid compression: wrap entire archive in one compressed LP */
-    if (compress_algo != 0 && solid_mode) {
-        if (progress) {
-            progrez_set_label(progress, "Compressing");
-            progrez_set_determinate(progress, 0, archive_len);
-            progrez_update(progress, 0, 0);
-        }
-        uint8_t *compressed_buf = NULL;
-        size_t compressed_len = 0;
-        rc = blip_compress_container(archive_buf, archive_len, compress_algo, num_threads,
-                                      progress ? compress_progress_cb : NULL,
-                                      progress ? phase_cb : NULL,
-                                      progress,
-                                      &compressed_buf, &compressed_len);
-        blip_free(archive_buf, archive_len);
-        if (rc != BLIP_OK) {
-            if (progress) { progrez_finish(progress); progrez_destroy(progress); }
-            fprintf(stderr, "miniblar: create: compression failed: %s\n",
-                    blip_error_string(rc));
-            return EXIT_IO;
-        }
-        archive_buf = compressed_buf;
-        archive_len = compressed_len;
     }
 
     if (progress) {
@@ -520,7 +450,7 @@ static int cmd_list(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_archive(archive_path, &buf_len);
+    uint8_t *buf = read_archive_plain(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "miniblar: list: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -576,7 +506,7 @@ static int cmd_extract(int argc, char **argv) {
     }
 
     size_t buf_len = 0;
-    uint8_t *buf = read_archive(archive_path, &buf_len);
+    uint8_t *buf = read_archive_plain(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "miniblar: extract: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -739,7 +669,7 @@ static int cmd_verify(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     size_t buf_len = 0;
-    uint8_t *buf = read_archive(archive_path, &buf_len);
+    uint8_t *buf = read_archive_plain(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "miniblar: verify: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -826,7 +756,7 @@ static int cmd_info(int argc, char **argv) {
     }
 
     size_t buf_len = 0;
-    uint8_t *buf = read_archive(archive_path, &buf_len);
+    uint8_t *buf = read_archive_plain(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "miniblar: info: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -956,7 +886,7 @@ static int cmd_cat(int argc, char **argv) {
     const char *file_path = argv[1];
 
     size_t buf_len = 0;
-    uint8_t *buf = read_archive(archive_path, &buf_len);
+    uint8_t *buf = read_archive_plain(archive_path, &buf_len);
     if (!buf) {
         fprintf(stderr, "miniblar: cat: cannot open '%s': %s\n",
                 archive_path, strerror(errno));
@@ -1008,5 +938,16 @@ static int cmd_to_json(int argc, char **argv) {
 /* ── cmd_from_json ────────────────────────────────────────────────────── */
 
 static int cmd_from_json(int argc, char **argv) {
+    /* Reject compression/encryption flags — not supported by miniblar */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-z") == 0) {
+            fprintf(stderr, "miniblar: from-json: compression not supported (use blar)\n");
+            return EXIT_USAGE;
+        }
+        if (strcmp(argv[i], "-e") == 0) {
+            fprintf(stderr, "miniblar: from-json: encryption not supported (use blar)\n");
+            return EXIT_USAGE;
+        }
+    }
     return cmd_from_json_common("miniblar", argc, argv);
 }

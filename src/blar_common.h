@@ -173,6 +173,29 @@ static const char *get_password(void) {
 
 /* ── Utility: read archive with transparent decryption/decompression ──── */
 
+/* Read a plain (uncompressed, unencrypted) archive file.
+ * For use by miniblar which only handles MBAR-magic flat archives.
+ * Rejects compressed or encrypted LP containers — those need blar.
+ * Returns a malloc'd buffer — caller frees with free(). */
+static uint8_t *read_archive_plain(const char *path, size_t *out_len) {
+    uint8_t *buf = read_file(path, out_len);
+    if (!buf) return NULL;
+
+    if (blip_is_encrypted(buf, *out_len)) {
+        fprintf(stderr, "Encrypted archives not supported by miniblar (use blar)\n");
+        free(buf);
+        return NULL;
+    }
+
+    if (blip_is_compressed(buf, *out_len)) {
+        fprintf(stderr, "Compressed archives not supported by miniblar (use blar)\n");
+        free(buf);
+        return NULL;
+    }
+
+    return buf;
+}
+
 /* Read an archive file, transparently decrypting and/or decompressing.
  * Always returns a malloc'd buffer — caller frees with free().
  * Layering order on disk: compress → encrypt (innermost to outermost).
