@@ -1353,6 +1353,53 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Smart defaults: infer command from first argument */
+
+    /* Check if any argument is -z (implies create with compression) */
+    bool has_z = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-z") == 0) { has_z = true; break; }
+    }
+
+    /* Check if first arg looks like a .blar file (by extension or magic) */
+    size_t arg1_len = strlen(arg1);
+    bool looks_like_blar = false;
+    if (arg1_len > 5 && strcmp(arg1 + arg1_len - 5, ".blar") == 0) {
+        looks_like_blar = true;
+    } else {
+        /* Check magic bytes */
+        FILE *f = fopen(arg1, "rb");
+        if (f) {
+            uint8_t magic[8];
+            size_t n = fread(magic, 1, sizeof(magic), f);
+            fclose(f);
+            if (n >= 5 && (blip_is_compressed(magic, n) ||
+                           blip_is_encrypted(magic, n))) {
+                looks_like_blar = true;
+            } else if (n >= 5) {
+                /* Check for BLAR/MBAR magic inside the outer ARRAY */
+                /* Simple heuristic: not a known archive format → check stat */
+            }
+        }
+    }
+
+    if (looks_like_blar && !has_z) {
+        /* .blar file without -z → default to extract */
+        return cmd_extract(argc - 1, argv + 1);
+    }
+
+    /* Check if first arg is an existing file or directory → default to create */
+    struct stat st_smart;
+    if (stat(arg1, &st_smart) == 0) {
+        /* Existing path → create archive from it */
+        return cmd_create(argc - 1, argv + 1);
+    }
+
+    /* -z flag present but no recognized command → create with compression */
+    if (has_z) {
+        return cmd_create(argc - 1, argv + 1);
+    }
+
     fprintf(stderr, "blar: unknown command '%s'\n", arg1);
     print_usage(stderr);
     return EXIT_USAGE;

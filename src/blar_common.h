@@ -694,13 +694,16 @@ static bool tar_flags_has_P(const char *flags) {
  * Returns the buffer on success, NULL if the result would overflow. */
 static char *default_output_name(const char *input_path, const char *ext,
                                  char *buf, size_t buf_size) {
-    /* Find the basename: last component after '/' */
-    const char *base = strrchr(input_path, '/');
-    base = base ? base + 1 : input_path;
+    /* Strip trailing slashes from input path before finding basename */
+    size_t path_len = strlen(input_path);
+    while (path_len > 1 && input_path[path_len - 1] == '/') path_len--;
 
-    /* Strip trailing slash if any */
-    size_t base_len = strlen(base);
-    while (base_len > 0 && base[base_len - 1] == '/') base_len--;
+    /* Find the basename: last component after '/' */
+    const char *base = input_path;
+    for (size_t i = 0; i < path_len; i++) {
+        if (input_path[i] == '/' && i + 1 < path_len) base = input_path + i + 1;
+    }
+    size_t base_len = (size_t)(input_path + path_len - base);
     if (base_len == 0) return NULL;
 
     size_t ext_len = strlen(ext);
