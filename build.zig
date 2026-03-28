@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     const jxl_include_path = b.option([]const u8, "jxl-include-path", "Path to libjxl headers");
     const jxl_lib_path = b.option([]const u8, "jxl-lib-path", "Path to libjxl libraries");
 
-    // Helper: add compression deps + build_options to a module
+    // Helper: add compression deps to a module (only call when enable_compression is true)
     const addCompressionSupport = struct {
         fn apply(
             module: *std.Build.Module,
@@ -73,9 +73,7 @@ pub fn build(b: *std.Build) void {
             bzip2z_mod: ?*std.Build.Module,
             lz4: ?*std.Build.Step.Compile,
             zstdz: ?*std.Build.Step.Compile,
-            opts: *std.Build.Step.Options,
         ) void {
-            module.addOptions("build_options", opts);
             if (z7z_mod) |m| module.addImport("z7z", m);
             if (bzip2z_mod) |m| module.addImport("bzip2z", m);
             if (lz4) |lib| module.linkLibrary(lib);
@@ -107,8 +105,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    addCompressionSupport(blip_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    blip_module.addOptions("build_options", build_options);
     addJxlSupport(blip_module, jxl_include_path, jxl_lib_path);
+    if (enable_compression) {
+        addCompressionSupport(blip_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
 
     // Expose named modules for downstream Zig consumers:
     //   dep.module("blip")      — full API (blip.zig + printable_binary)
@@ -121,8 +122,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    addCompressionSupport(exposed_blip, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    exposed_blip.addOptions("build_options", build_options);
     addJxlSupport(exposed_blip, jxl_include_path, jxl_lib_path);
+    if (enable_compression) {
+        addCompressionSupport(exposed_blip, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
         .root_source_file = b.path("src/mini_blar.zig"),
@@ -132,8 +136,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    addCompressionSupport(exposed_mini_blar, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
-    addJxlSupport(exposed_mini_blar, jxl_include_path, jxl_lib_path);
+    exposed_mini_blar.addOptions("build_options", build_options);
+    if (enable_compression) {
+        addCompressionSupport(exposed_mini_blar, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
@@ -267,8 +273,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    addCompressionSupport(unit_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    unit_test_module.addOptions("build_options", build_options);
     addJxlSupport(unit_test_module, jxl_include_path, jxl_lib_path);
+    if (enable_compression) {
+        addCompressionSupport(unit_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -284,8 +293,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    addCompressionSupport(ffi_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib, build_options);
+    ffi_test_module.addOptions("build_options", build_options);
     addJxlSupport(ffi_test_module, jxl_include_path, jxl_lib_path);
+    if (enable_compression) {
+        addCompressionSupport(ffi_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,
     });
