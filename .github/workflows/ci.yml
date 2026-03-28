@@ -14,9 +14,11 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@main
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/flakehub-login@main
         with:
-          flakehub-token: ${{ secrets.FLAKEHUB_TOKEN }}
+          token: ${{ secrets.FLAKEHUB_TOKEN }}
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build
         run: nix build
