@@ -189,7 +189,7 @@ blip_free(archive, archive_len);
 
 ## blar: BLIP Archive Tool
 
-`blar` is a full-featured CLI for creating, inspecting, and extracting BLIP archives — similar to `tar`. It supports directory recursion, metadata preservation (permissions, mtime, owner), and Merkle hash integrity for directory trees.
+`blar` is a full-featured CLI for creating, inspecting, and extracting BLIP archives — similar to `tar`. It supports directory recursion, metadata preservation (permissions, timestamps, uid/gid, owner/group names), extended attributes (xattrs), macOS resource forks, and Merkle hash integrity for directory trees. Extended attributes and resource forks are stored in the FILE container's optional forks DICT and restored on extraction where the target filesystem supports them.
 
 ### Usage
 
@@ -562,7 +562,7 @@ blar list archive.blar
 
 ## miniblar: Minimal BLIP Archive Tool
 
-`miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, ownership). No directory entries — files only. The result is a compact bag of files with full metadata preservation. Entry order is caller-controlled (the CLI sorts by path; the Zig API preserves the order given).
+`miniblar` is a flat-file archiver that bundles files with their relative paths, content, and file metadata (permissions, timestamps, uid/gid, owner/group names, extended attributes, macOS resource forks). No directory entries, no compression, no encryption — files only. The result is a compact bag of files with full metadata preservation. Entry order is caller-controlled (the CLI sorts by path; the Zig API preserves the order given).
 
 ### Use cases
 
