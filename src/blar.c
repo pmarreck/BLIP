@@ -1405,7 +1405,7 @@ static void print_usage(FILE *out) {
         "                   Auto-enables MIME-type sorting\n"
         "  --no-sort        Disable MIME sorting (only with --solid)\n"
         "  -j <N>, --threads <N>  Thread count (0=auto, default: 0)\n"
-        "  -f, --force      Overwrite output file without prompting\n"
+        "  -f, --force      Overwrite without prompting (create and extract)\n"
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "                   Password: BLIP_PASSWORD env var, or interactive prompt\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
@@ -1915,6 +1915,7 @@ static int cmd_extract(int argc, char **argv) {
 
     const char *archive_path = argv[0];
     const char *output_dir = NULL;
+    bool force = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-C") == 0) {
@@ -1924,6 +1925,45 @@ static int cmd_extract(int argc, char **argv) {
             }
             output_dir = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+            force = true;
+        }
+    }
+
+    /* Check if output directory already has files — warn unless --force */
+    if (!force && output_dir) {
+        struct stat out_st;
+        if (stat(output_dir, &out_st) == 0 && S_ISDIR(out_st.st_mode)) {
+            /* Directory exists — check if non-empty */
+            DIR *d = opendir(output_dir);
+            if (d) {
+                struct dirent *de;
+                bool has_files = false;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.' && (de->d_name[1] == '\0' ||
+                        (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                        continue;
+                    has_files = true;
+                    break;
+                }
+                closedir(d);
+                if (has_files) {
+                    if (isatty(STDIN_FILENO)) {
+                        fprintf(stderr, "blar: extract: '%s' is non-empty. "
+                                "Overwrite existing files? (y/N) ", output_dir);
+                        int ch = getchar();
+                        if (ch != 'y' && ch != 'Y') {
+                            fprintf(stderr, "blar: extract: aborted\n");
+                            return EXIT_USAGE;
+                        }
+                        while (ch != '\n' && ch != EOF) ch = getchar();
+                    } else {
+                        fprintf(stderr, "blar: extract: '%s' is non-empty "
+                                "(use -f to overwrite)\n", output_dir);
+                        return EXIT_USAGE;
+                    }
+                }
+            }
         }
     }
 
