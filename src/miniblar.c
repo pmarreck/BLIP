@@ -106,8 +106,8 @@ static void print_usage(FILE *out) {
     fprintf(out,
         "Usage: miniblar <command> [options] [arguments]\n"
         "\n"
-        "Minimal BLIP archive tool (flat files only, no directories).\n"
-        "For directory support and metadata, use 'blar'.\n"
+        "Minimal BLIP archive tool (flat files with metadata, no directories).\n"
+        "For directory support, use 'blar'.\n"
         "\n"
         "Commands:\n"
         "  create [-z [algo]] [-o <archive>] <files...>   Create a BLIP archive\n"
