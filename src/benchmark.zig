@@ -198,11 +198,12 @@ fn blipPayloadSlice(encoded_val: []const u8) struct { start: usize, len: usize }
     }
 
     // Length-prefixed: determine header length
+    // Bit 6: E (endianness), Bit 5: C (continuation), Bits 4-0: L
     var header_bytes: usize = 1;
-    var L: usize = first & 0x3F;
+    var L: usize = first & 0x1F;
 
-    // Check continuation flag (bit 6)
-    if (first & 0x40 != 0) {
+    // Check continuation flag (bit 5)
+    if (first & 0x20 != 0) {
         // C = 1: more L bytes follow
         var pos: usize = 1;
         while (pos < encoded_val.len) {
@@ -213,8 +214,8 @@ fn blipPayloadSlice(encoded_val: []const u8) struct { start: usize, len: usize }
         header_bytes = pos;
 
         // Recompute full L
-        L = first & 0x3F;
-        var shift: u6 = 6;
+        L = first & 0x1F;
+        var shift: u6 = 5;
         for (1..header_bytes) |i| {
             L |= @as(usize, encoded_val[i] & 0x7F) << shift;
             shift +|= 7;
@@ -241,9 +242,9 @@ fn blipReencode(payload: []const u8, buf: []u8) !usize {
 
     // Length-prefixed mode: header byte + L payload bytes
     const L = eff_len;
-    if (L < 64) {
+    if (L < 32) {
         if (buf.len < 1 + L) return error.BufferTooSmall;
-        buf[0] = @as(u8, 0x80) | @as(u8, @intCast(L));
+        buf[0] = @as(u8, 0x80) | @as(u8, @intCast(L)); // E=0 (LE), C=0
         @memcpy(buf[1..][0..L], payload[0..L]);
         return 1 + L;
     }

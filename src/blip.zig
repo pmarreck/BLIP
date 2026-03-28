@@ -5,9 +5,15 @@ const std = @import("std");
 
 pub const name = "BLIP";
 
+pub const Endian = enum(u1) {
+    little = 0,
+    big = 1,
+};
+
 pub const DecodeResult = struct {
     value: u64,
     bytes_read: usize,
+    endian: Endian = .little,
 };
 
 pub const Error = error{
@@ -33,9 +39,24 @@ pub fn encodedSize(value: u64) usize {
     return 1 + minBytes(value); // header byte + L value bytes
 }
 
-/// Encode a u64 value in BLIP format. Returns number of bytes written.
+/// Encode a u64 value in BLIP format (little-endian payload). Returns number of bytes written.
 pub fn encode(value: u64, buf: []u8) Error!usize {
-    // Immediate mode: values 0-127 fit in a single byte
+    return encodeEndian(value, buf, .little);
+}
+
+/// Encode a u64 value in BLIP format with big-endian payload (lexicographically sortable).
+pub fn encodeBE(value: u64, buf: []u8) Error!usize {
+    return encodeEndian(value, buf, .big);
+}
+
+/// Encode a u64 value in BLIP format with specified endianness. Returns number of bytes written.
+/// Header layout for length-prefixed values:
+///   Bit 7: 1 (length-prefixed mode)
+///   Bit 6: E (0=LE, 1=BE)
+///   Bit 5: C (continuation flag for L)
+///   Bits 4-0: L (payload length, 0-31)
+pub fn encodeEndian(value: u64, buf: []u8, endian: Endian) Error!usize {
+    // Immediate mode: values 0-127 fit in a single byte (endianness irrelevant)
     if (value < 128) {
         if (buf.len < 1) return Error.BufferTooSmall;
         buf[0] = @intCast(value);
@@ -44,23 +65,24 @@ pub fn encode(value: u64, buf: []u8) Error!usize {
 
     // Length-prefixed mode
     const L = minBytes(value);
+    const e_bit: u8 = @as(u8, @intFromEnum(endian)) << 6;
 
     // Encode L into header byte(s)
     var pos: usize = 0;
-    if (L < 64) {
-        // Single header byte: bit 7 = 1, C = 0, bits 5-0 = L
+    if (L < 32) {
+        // Single header byte: bit 7 = 1, bit 6 = E, bit 5 = 0 (no continuation), bits 4-0 = L
         if (buf.len < 1 + L) return Error.BufferTooSmall;
-        buf[0] = @as(u8, 0x80) | @as(u8, @intCast(L));
+        buf[0] = 0x80 | e_bit | @as(u8, @intCast(L));
         pos = 1;
     } else {
-        // L >= 64: use continuation encoding for L
-        // First byte: bit 7 = 1, C = 1, bits 5-0 = low 6 bits of L
-        const first: u8 = 0x80 | 0x40 | @as(u8, @intCast(L & 0x3F));
+        // L >= 32: use continuation encoding for L
+        // First byte: bit 7 = 1, bit 6 = E, bit 5 = 1 (continuation), bits 4-0 = low 5 bits of L
+        const first: u8 = 0x80 | e_bit | 0x20 | @as(u8, @intCast(L & 0x1F));
         if (buf.len < 1) return Error.BufferTooSmall;
         buf[0] = first;
         pos = 1;
 
-        var remaining = L >> 6;
+        var remaining = L >> 5;
         while (remaining >= 128) {
             if (pos >= buf.len) return Error.BufferTooSmall;
             buf[pos] = 0x80 | @as(u8, @intCast(remaining & 0x7F));
@@ -74,11 +96,23 @@ pub fn encode(value: u64, buf: []u8) Error!usize {
         if (buf.len < pos + L) return Error.BufferTooSmall;
     }
 
-    // Write raw value in little-endian
+    // Write raw value in specified byte order
     var val = value;
-    for (0..L) |i| {
-        buf[pos + i] = @intCast(val & 0xFF);
-        val >>= 8;
+    switch (endian) {
+        .little => {
+            for (0..L) |i| {
+                buf[pos + i] = @intCast(val & 0xFF);
+                val >>= 8;
+            }
+        },
+        .big => {
+            var i: usize = L;
+            while (i > 0) {
+                i -= 1;
+                buf[pos + i] = @intCast(val & 0xFF);
+                val >>= 8;
+            }
+        },
     }
 
     return pos + L;
@@ -86,20 +120,22 @@ pub fn encode(value: u64, buf: []u8) Error!usize {
 
 /// Encode a value as a sentinel (overlong encoding). Value must be 0-127.
 /// This encodes using L=1 length-prefixed mode instead of immediate mode.
+/// Sentinels are always LE (E=0): header = 0x81 (bit7=1, E=0, C=0, L=1).
 pub fn encodeSentinel(value: u7, buf: []u8) Error!usize {
     if (buf.len < 2) return Error.BufferTooSmall;
-    buf[0] = 0x81; // bit 7 = 1, C = 0, L = 1
+    buf[0] = 0x81; // bit 7 = 1, E = 0, C = 0, L = 1
     buf[1] = @intCast(value);
     return 2;
 }
 
 /// Decode a BLIP-encoded value from a buffer.
+/// Automatically detects endianness from the E bit in the header.
 pub fn decode(buf: []const u8) Error!DecodeResult {
     if (buf.len == 0) return Error.UnexpectedEndOfInput;
 
     const first = buf[0];
 
-    // Immediate mode: bit 7 = 0
+    // Immediate mode: bit 7 = 0 (endianness irrelevant for single byte)
     if (first & 0x80 == 0) {
         return DecodeResult{
             .value = first,
@@ -108,13 +144,15 @@ pub fn decode(buf: []const u8) Error!DecodeResult {
     }
 
     // Length-prefixed mode
-    var L: usize = first & 0x3F; // low 6 bits
+    // Bit 6: E (endianness), Bit 5: C (continuation), Bits 4-0: L
+    const endian: Endian = @enumFromInt((first >> 6) & 1);
+    var L: usize = first & 0x1F; // low 5 bits
     var header_bytes: usize = 1;
 
-    // Check continuation flag (bit 6)
-    if (first & 0x40 != 0) {
+    // Check continuation flag (bit 5)
+    if (first & 0x20 != 0) {
         // C = 1: more L bytes follow
-        var shift: u6 = 6;
+        var shift: u6 = 5;
         while (true) {
             if (header_bytes >= buf.len) return Error.UnexpectedEndOfInput;
             const next = buf[header_bytes];
@@ -137,20 +175,31 @@ pub fn decode(buf: []const u8) Error!DecodeResult {
         return DecodeResult{
             .value = 0,
             .bytes_read = header_bytes,
+            .endian = endian,
         };
     }
 
     if (L > 8) return Error.Overflow; // Can't fit in u64
 
-    // Read little-endian value from L bytes
+    // Read value bytes according to endianness
     var value: u64 = 0;
-    for (0..L) |i| {
-        value |= @as(u64, buf[header_bytes + i]) << @intCast(i * 8);
+    switch (endian) {
+        .little => {
+            for (0..L) |i| {
+                value |= @as(u64, buf[header_bytes + i]) << @intCast(i * 8);
+            }
+        },
+        .big => {
+            for (0..L) |i| {
+                value = (value << 8) | @as(u64, buf[header_bytes + i]);
+            }
+        },
     }
 
     return DecodeResult{
         .value = value,
         .bytes_read = header_bytes + L,
+        .endian = endian,
     };
 }
 
@@ -626,6 +675,124 @@ test "encodedSize matches actual encode size" {
         const actual = try encode(value, &buf);
         try testing.expectEqual(actual, encodedSize(value));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Big-endian encoding tests
+// ---------------------------------------------------------------------------
+
+fn encodeBEToSlice(value: u64, buf: []u8) []const u8 {
+    const n = encodeBE(value, buf) catch unreachable;
+    return buf[0..n];
+}
+
+test "encodeBE: immediate values are identical to LE" {
+    var buf_le: [16]u8 = undefined;
+    var buf_be: [16]u8 = undefined;
+    for (0..128) |v| {
+        const le = encodeToSlice(@intCast(v), &buf_le);
+        const be = encodeBEToSlice(@intCast(v), &buf_be);
+        try testing.expectEqualSlices(u8, le, be);
+    }
+}
+
+test "encodeBE: header byte has E=1 (bit 6 set)" {
+    var buf: [16]u8 = undefined;
+    _ = try encodeBE(200, &buf); // L=1
+    try testing.expectEqual(@as(u8, 0xC1), buf[0]); // 1_1_0_00001 = bit7=1, E=1, C=0, L=1
+}
+
+test "encodeBE: value 256 = [0xC2, 0x01, 0x00] L=2 big-endian" {
+    var buf: [16]u8 = undefined;
+    const result = encodeBEToSlice(256, &buf);
+    // 256 = 0x0100 → BE payload: [0x01, 0x00]
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC2, 0x01, 0x00 }, result);
+}
+
+test "encodeBE: value 1000 = [0xC2, 0x03, 0xE8] L=2 big-endian" {
+    var buf: [16]u8 = undefined;
+    const result = encodeBEToSlice(1000, &buf);
+    // 1000 = 0x03E8 → BE payload: [0x03, 0xE8]
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC2, 0x03, 0xE8 }, result);
+}
+
+test "encodeBE: value 0xDEADBEEF = [0xC4, 0xDE, 0xAD, 0xBE, 0xEF]" {
+    var buf: [16]u8 = undefined;
+    const result = encodeBEToSlice(0xDEADBEEF, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC4, 0xDE, 0xAD, 0xBE, 0xEF }, result);
+}
+
+test "encodeBE: decode auto-detects endianness" {
+    var buf: [16]u8 = undefined;
+
+    // Encode BE
+    const be_n = try encodeBE(1000, &buf);
+    const be_result = try decode(buf[0..be_n]);
+    try testing.expectEqual(@as(u64, 1000), be_result.value);
+    try testing.expectEqual(Endian.big, be_result.endian);
+
+    // Encode LE
+    const le_n = try encode(1000, &buf);
+    const le_result = try decode(buf[0..le_n]);
+    try testing.expectEqual(@as(u64, 1000), le_result.value);
+    try testing.expectEqual(Endian.little, le_result.endian);
+}
+
+test "encodeBE: round-trip all u64 magnitude classes" {
+    var buf: [16]u8 = undefined;
+    const values = [_]u64{
+        0, 1, 42, 127, 128, 200, 255, 256, 1000,
+        50000, 65535, 65536, 5000000, 0xFFFFFFFF,
+        0x100000000, 0xFFFFFFFFFFFFFFFF,
+    };
+    for (values) |value| {
+        const n = try encodeBE(value, &buf);
+        const result = try decode(buf[0..n]);
+        try testing.expectEqual(value, result.value);
+        if (value >= 128) {
+            try testing.expectEqual(Endian.big, result.endian);
+        }
+    }
+}
+
+test "encodeBE: lexicographic ordering matches numeric ordering" {
+    var buf_a: [16]u8 = undefined;
+    var buf_b: [16]u8 = undefined;
+
+    const pairs = [_][2]u64{
+        .{ 0, 1 },
+        .{ 127, 128 },
+        .{ 255, 256 },
+        .{ 256, 257 },
+        .{ 511, 512 },
+        .{ 999, 1000 },
+        .{ 65535, 65536 },
+        .{ 0xFFFFFFFF, 0x100000000 },
+        .{ 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF },
+    };
+
+    for (pairs) |pair| {
+        const a = pair[0];
+        const b = pair[1];
+        const slice_a = encodeBEToSlice(a, &buf_a);
+        const slice_b = encodeBEToSlice(b, &buf_b);
+
+        // Lexicographic comparison: a < b should mean encode(a) < encode(b)
+        const order = std.mem.order(u8, slice_a, slice_b);
+        try testing.expect(order == .lt);
+    }
+}
+
+test "encodeBE: same-L values sort correctly (the LE failure case)" {
+    var buf_a: [16]u8 = undefined;
+    var buf_b: [16]u8 = undefined;
+
+    // This is the case that fails with LE: 511 vs 512
+    // LE: 511 = [0x82, 0xFF, 0x01], 512 = [0x82, 0x00, 0x02] → 0xFF > 0x00, WRONG
+    // BE: 511 = [0xC2, 0x01, 0xFF], 512 = [0xC2, 0x02, 0x00] → 0x01 < 0x02, CORRECT
+    const slice_511 = encodeBEToSlice(511, &buf_a);
+    const slice_512 = encodeBEToSlice(512, &buf_b);
+    try testing.expect(std.mem.order(u8, slice_511, slice_512) == .lt);
 }
 
 // ---------------------------------------------------------------------------
