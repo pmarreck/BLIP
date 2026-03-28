@@ -7,3 +7,5 @@ result
 *.mblar
 .DS_Store
 compile_commands.json
+AGENTS.md
+ZIG_RECENT_API_CHANGES.md
