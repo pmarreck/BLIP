@@ -1407,6 +1407,7 @@ static void print_usage(FILE *out) {
         "  -j <N>, --threads <N>  Thread count (0=auto, default: 0)\n"
         "  -f, --force      Overwrite output file without prompting\n"
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
+        "                   Password: BLIP_PASSWORD env var, or interactive prompt\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
         "  --no-expand-containers  Don't expand zip containers (with -z)\n"
         "  --expand-all-zips      Also expand .zip files (normally opaque)\n"
