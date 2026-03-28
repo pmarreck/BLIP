@@ -194,6 +194,13 @@ blip_free(archive, archive_len);
 ### Usage
 
 ```bash
+# Smart defaults — no subcommand needed:
+blar myproject/              # create archive (detects directory)
+blar archive.blar            # extract (detects .blar extension)
+blar -z myproject/           # create with compression (infers from -z)
+
+# Explicit commands:
+
 # Create an archive from a directory tree (recurses automatically)
 blar create -o archive.blar myproject/
 
