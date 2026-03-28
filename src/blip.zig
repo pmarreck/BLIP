@@ -212,6 +212,15 @@ pub fn isSentinel(buf: []const u8) bool {
     return buf[0] == 0x81 and buf[1] < 0x80;
 }
 
+/// Returns the endianness of a BLIP-encoded value by reading bit 6 of the header.
+/// Returns null for immediate values (single byte, endianness not applicable).
+/// Returns null for empty buffers.
+pub fn endianOf(buf: []const u8) ?Endian {
+    if (buf.len == 0) return null;
+    if (buf[0] & 0x80 == 0) return null; // immediate
+    return @enumFromInt((buf[0] >> 6) & 1);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -684,6 +693,28 @@ test "encodedSize matches actual encode size" {
 fn encodeBEToSlice(value: u64, buf: []u8) []const u8 {
     const n = encodeBE(value, buf) catch unreachable;
     return buf[0..n];
+}
+
+test "endianOf: null for immediate values" {
+    try testing.expectEqual(@as(?Endian, null), endianOf(&[_]u8{0x00}));
+    try testing.expectEqual(@as(?Endian, null), endianOf(&[_]u8{0x7F}));
+    try testing.expectEqual(@as(?Endian, null), endianOf(&[_]u8{0x2A}));
+}
+
+test "endianOf: null for empty buffer" {
+    try testing.expectEqual(@as(?Endian, null), endianOf(&[_]u8{}));
+}
+
+test "endianOf: detects LE" {
+    var buf: [16]u8 = undefined;
+    _ = try encode(256, &buf);
+    try testing.expectEqual(@as(?Endian, .little), endianOf(&buf));
+}
+
+test "endianOf: detects BE" {
+    var buf: [16]u8 = undefined;
+    _ = try encodeBE(256, &buf);
+    try testing.expectEqual(@as(?Endian, .big), endianOf(&buf));
 }
 
 test "encodeBE: immediate values are identical to LE" {
