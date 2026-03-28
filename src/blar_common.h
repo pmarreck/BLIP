@@ -550,13 +550,24 @@ static void write_file_xattrs(const char *path,
         }
     }
 #else
-    (void)resource_fork;
-    (void)resource_fork_len;
+    if (resource_fork && resource_fork_len > 0) {
+        fprintf(stderr, "\033[33mwarning: resource fork data for '%s' cannot be restored "
+                "(not macOS) — %zu bytes dropped\033[0m\n", path, resource_fork_len);
+    }
 #endif
 
 #else
-    (void)path; (void)xattrs; (void)count;
-    (void)resource_fork; (void)resource_fork_len;
+    /* No xattr support on this platform */
+    if (count > 0) {
+        fprintf(stderr, "\033[33mwarning: %zu extended attribute(s) for '%s' cannot be restored "
+                "(platform lacks xattr support)\033[0m\n", count, path);
+    }
+    if (resource_fork && resource_fork_len > 0) {
+        fprintf(stderr, "\033[33mwarning: resource fork data for '%s' cannot be restored "
+                "(platform lacks xattr support) — %zu bytes dropped\033[0m\n",
+                path, resource_fork_len);
+    }
+    (void)xattrs;
 #endif /* HAVE_XATTR */
 }
 
