@@ -973,8 +973,100 @@ typedef struct {
     size_t count;
 } blar_codec_registry_t;
 
+/* ── JPEG container expansion ────────────────────────────────────────── */
+
+static bool is_jpeg(const uint8_t *buf, size_t len) {
+    return len >= 3 && buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF;
+}
+
+static bool expand_jpeg_container(entry_list_t *el,
+                                   const uint8_t *content, size_t content_len,
+                                   const blip_archive_entry *file_entry) {
+    /* Skip tiny JPEGs */
+    if (content_len < 1024) return false;
+
+    /* Transcode JPEG → JXL lossless */
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_jpeg(content, content_len, &jxl_data, &jxl_len) != BLIP_OK)
+        return false;
+
+    /* Size check: if JXL >= 90% of original, not worth expanding */
+    if (jxl_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        return false;
+    }
+
+    /* Copy JXL data to malloc'd buffer */
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) {
+        blip_free(jxl_data, jxl_len);
+        return false;
+    }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    if (!entry_list_add_content(el, jxl_owned))
+        return false;
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "jpeg";
+    dir_entry.container_type_len = 4;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* Add __body__.jxl FILE entry */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__body__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__body__.jxl", strlen("/__body__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path))
+            return false;
+
+        blip_archive_entry jxl_entry;
+        memset(&jxl_entry, 0, sizeof(jxl_entry));
+        jxl_entry.path = jxl_path;
+        jxl_entry.path_len = jxl_path_len;
+        jxl_entry.content = jxl_owned;
+        jxl_entry.content_len = jxl_len;
+        jxl_entry.is_dir = 0;
+        jxl_entry.mode = file_entry->mode;
+        jxl_entry.jxl_source_format = "jpeg";
+        jxl_entry.jxl_source_format_len = 4;
+        jxl_entry.zip_compression_method = 0xFFFF;
+        jxl_entry.pdf_stream_offset = UINT64_MAX;
+        jxl_entry.pdf_stream_length = UINT64_MAX;
+        if (!entry_list_add(el, jxl_entry)) return false;
+    }
+
+    return true;
+}
+
 /* ── Builtin codec structs & registry ─────────────────────────────────── */
 
+static const char *const jpeg_extensions[] = { ".jpg", ".jpeg", ".jpe", NULL };
 static const char *const pdf_extensions[] = { ".pdf", NULL };
 static const char *const png_extensions[] = { ".png", NULL };
 static const char *const zip_extensions[] = { ".zip", ".jar", ".war", ".ear", ".apk", ".ipa",
@@ -982,6 +1074,13 @@ static const char *const zip_extensions[] = { ".zip", ".jar", ".war", ".ear", ".
                                               ".epub", ".cbz", NULL };
 
 static const blar_codec_t builtin_codecs[] = {
+    {
+        .name       = "jpeg",
+        .extensions = jpeg_extensions,
+        .detect     = is_jpeg,
+        .expand     = expand_jpeg_container,
+        .collapse   = NULL,
+    },
     {
         .name       = "pdf",
         .extensions = pdf_extensions,
@@ -1934,6 +2033,7 @@ static int cmd_list(int argc, char **argv) {
                 if (codec) {
                     if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
+                    else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
@@ -2744,6 +2844,121 @@ static int cmd_extract(int argc, char **argv) {
         }
 
         /* PNG container re-assembly */
+        if (codec && strcmp(codec->name, "jpeg") == 0) {
+            /* JPEG container: find __body__.jxl, transcode JXL → JPEG */
+            uint8_t *jxl_data = NULL;
+            size_t jxl_data_len = 0;
+            bool found_body = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len <= co_path_len + 1 ||
+                    memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/')
+                    continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+
+                if (inner_len == 12 && memcmp(inner, "__body__.jxl", 12) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_body = true;
+                }
+            }
+
+            if (!found_body) {
+                fprintf(stderr, "\033[31mERROR: JPEG container '%.*s': missing __body__.jxl\033[0m\n",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            /* Transcode JXL → JPEG (bit-exact) */
+            uint8_t *jpeg_data = NULL;
+            size_t jpeg_len = 0;
+            rc = blip_jxl_to_jpeg(jxl_data, jxl_data_len, &jpeg_data, &jpeg_len);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) {
+                fprintf(stderr, "\033[31mERROR: JPEG container '%.*s': JXL → JPEG decode failed\033[0m\n",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            /* Write reconstructed JPEG */
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    blip_free(jpeg_data, jpeg_len);
+                    failed++;
+                    continue;
+                }
+            } else {
+                if (co_path_len >= sizeof(out_path)) {
+                    blip_free(jpeg_data, jpeg_len);
+                    failed++;
+                    continue;
+                }
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path)) {
+                fprintf(stderr, "\033[31mERROR: JPEG container '%.*s': cannot create parent dir: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(jpeg_data, jpeg_len);
+                failed++;
+                continue;
+            }
+
+            if (!write_file(out_path, jpeg_data, jpeg_len)) {
+                fprintf(stderr, "\033[31mERROR: JPEG container '%.*s': cannot write: %s\033[0m\n",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(jpeg_data, jpeg_len);
+                failed++;
+                continue;
+            }
+            blip_free(jpeg_data, jpeg_len);
+
+            /* Restore metadata */
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            /* Restore xattrs */
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress) progrez_update(progress, files_done, bytes_done);
+            continue;
+        }
+
         if (codec && strcmp(codec->name, "png") == 0) {
             /* Find __meta__ and __pixels__.jxl children */
             uint8_t *meta_data = NULL;
@@ -3437,6 +3652,7 @@ static int cmd_info(int argc, char **argv) {
                 if (codec) {
                     if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
+                    else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
