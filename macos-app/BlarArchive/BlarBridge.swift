@@ -50,16 +50,33 @@ class BlarBridge {
         var archiveBuf: UnsafeMutablePointer<UInt8>? = nil
         var archiveLen: Int = 0
 
+        // Progress bridge for the C create function
+        let progressBridge = ProgressBridge(callback: progress, totalBytes: 0)
+        let bridgePtr = Unmanaged.passRetained(progressBridge).toOpaque()
+
+        let createProgressFn: @convention(c) (UInt64, UInt64, UInt64, UInt64, UnsafeMutableRawPointer?) -> Void = {
+            entriesDone, bytesDone, _, _, ctx in
+            guard let ctx = ctx else { return }
+            let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
+            // Use bytes as the more granular progress indicator
+            let fraction = bytesDone > 0 ? min(Double(bytesDone) / Double(max(bridge.totalBytes, bytesDone)), 1.0) : 0
+            DispatchQueue.main.async {
+                bridge.callback(fraction)
+            }
+        }
+
         // Call C layer which does: collect entries → expand containers → create archive
         let rc: Int32 = pathStrings.withCStringArray { cPaths in
             return blar_gui_create(
                 cPaths, paths.count,
                 perFileComp, threads,
                 expandContainers, false, // expand_all_zips = false
-                nil, nil, // progress (TODO: wire up)
+                createProgressFn, bridgePtr,
                 &archiveBuf, &archiveLen
             )
         }
+
+        Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
 
         if rc != 0 {
             throw BlarError.createFailed(rc)

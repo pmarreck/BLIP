@@ -12,6 +12,19 @@
 
 /* ── Archive creation ─────────────────────────────────────────────────── */
 
+/* Progress adapter: wraps 5-arg GUI callback for 3-arg FFI callback */
+typedef struct {
+    blar_extract_progress_fn fn;
+    void *ctx;
+    size_t total_files;
+    uint64_t total_bytes;
+} gui_create_progress_ctx_t;
+
+static void gui_create_progress_adapter(uint64_t entries_done, uint64_t bytes_done, void *ctx) {
+    gui_create_progress_ctx_t *g = (gui_create_progress_ctx_t *)ctx;
+    if (g->fn) g->fn(entries_done, bytes_done, (uint64_t)g->total_files, g->total_bytes, g->ctx);
+}
+
 int blar_gui_create(const char *const *paths, size_t path_count,
                      uint8_t per_file_comp, uint8_t num_threads,
                      bool expand_containers, bool expand_all_zips,
@@ -50,9 +63,13 @@ int blar_gui_create(const char *const *paths, size_t path_count,
 
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
+    /* Adapt the 5-arg progress callback to the 3-arg one that
+     * blip_archive_create_full expects. */
     int32_t rc = blip_archive_create_full(el.entries, el.count, 0,
                                            per_file_comp, num_threads,
-                                           NULL, NULL, NULL,
+                                           progress_fn ? gui_create_progress_adapter : NULL,
+                                           NULL,
+                                           progress_fn ? &(gui_create_progress_ctx_t){progress_fn, progress_ctx, el.count, el.bytes_seen} : NULL,
                                            &archive_buf, &archive_len);
     entry_list_free(&el);
     if (rc != 0) return rc;
