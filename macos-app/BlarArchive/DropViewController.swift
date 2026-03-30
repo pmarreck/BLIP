@@ -6,7 +6,8 @@ class DropViewController: NSViewController {
     private var progressBar: NSProgressIndicator!
     private var optionsPanel: OptionsPanel!
     private var optionsContainer: NSView!
-    var autoQuit: Bool = false  // quit after processing (CLI mode)
+    var autoQuit: Bool = false       // quit after processing (CLI mode)
+    var forceOverwrite: Bool = false  // skip overwrite prompts (CLI mode)
 
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 420))
@@ -95,6 +96,7 @@ class DropViewController: NSViewController {
     /// Apply CLI options: set the GUI controls and auto-quit flag
     func applyCLIOptions(_ opts: CLIOptions) {
         autoQuit = opts.autoQuit
+        forceOverwrite = opts.forceOverwrite
         optionsPanel.applyOptions(opts)
     }
 
@@ -166,7 +168,7 @@ class DropViewController: NSViewController {
         let outputDir = firstURL.deletingLastPathComponent()
         let outputPath = outputDir.appendingPathComponent(baseName + ".blar")
 
-        if FileManager.default.fileExists(atPath: outputPath.path) {
+        if FileManager.default.fileExists(atPath: outputPath.path) && !forceOverwrite {
             let alert = NSAlert()
             alert.messageText = "Overwrite existing archive?"
             alert.informativeText = "\(outputPath.lastPathComponent) already exists."
@@ -292,7 +294,7 @@ class DropViewController: NSViewController {
                 }
             }
         }
-        if !existingDirs.isEmpty {
+        if !existingDirs.isEmpty && !forceOverwrite {
             let alert = NSAlert()
             alert.messageText = "Overwrite existing files?"
             if existingDirs.count == 1 {

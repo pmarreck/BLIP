@@ -9,6 +9,7 @@ struct CLIOptions {
     var password: String? = nil
     var expandContainers: Bool = true
     var autoQuit: Bool = false   // quit after processing
+    var forceOverwrite: Bool = false // skip overwrite prompts
     var hasOptions: Bool = false // true if any CLI flags were given
 }
 
@@ -64,6 +65,8 @@ func parseCLIOptions() -> CLIOptions {
             opts.expandContainers = false
         case "--auto-quit", "-q":
             opts.autoQuit = true
+        case "-f", "--force", "--overwrite":
+            opts.forceOverwrite = true
         case "-h", "--help":
             fputs("""
             Usage: BlarArchive [options] [paths...]
@@ -75,6 +78,7 @@ func parseCLIOptions() -> CLIOptions {
               -e [cipher]      Encrypt: aes (default), chacha
               -p <password>    Password (or $ENV_VAR)
               --no-expand      Don't expand containers (PDF/PNG/JPEG/ZIP)
+              -f, --force      Overwrite existing files without prompting
               -q, --auto-quit  Quit after processing (for scripting)
               -h, --help       Show this help
 
