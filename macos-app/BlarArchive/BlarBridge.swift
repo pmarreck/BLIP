@@ -101,10 +101,29 @@ class BlarBridge {
             } else {
                 let pathData = path.data(using: .utf8)!
                 contentBuffers.append(pathData)
-                // Read file data — skip files that can't be read (dead aliases, etc.)
+                // Read raw file data (don't resolve aliases — read the alias file itself)
                 let fileData: Data
                 do {
-                    fileData = try Data(contentsOf: url, options: .mappedIfSafe)
+                    // Use POSIX open to avoid alias resolution
+                    let fd = open(url.path, O_RDONLY | O_NOFOLLOW)
+                    if fd >= 0 {
+                        defer { close(fd) }
+                        var st = stat()
+                        fstat(fd, &st)
+                        let size = Int(st.st_size)
+                        if size > 0 {
+                            var buf = Data(count: size)
+                            let bytesRead = buf.withUnsafeMutableBytes { ptr in
+                                read(fd, ptr.baseAddress!, size)
+                            }
+                            fileData = bytesRead > 0 ? Data(buf.prefix(bytesRead)) : Data()
+                        } else {
+                            fileData = Data()
+                        }
+                    } else {
+                        // Fallback for files that can't be opened with O_NOFOLLOW
+                        fileData = try Data(contentsOf: url, options: .mappedIfSafe)
+                    }
                 } catch {
                     NSLog("Warning: skipping unreadable file '%@': %@", url.path, error.localizedDescription)
                     continue
@@ -127,6 +146,22 @@ class BlarBridge {
                         entry.mtime_ns = Int64(mtime.timeIntervalSince1970 * 1_000_000_000)
                     }
                 }
+
+                // Read xattrs and resource fork
+                var xattrs: UnsafeMutablePointer<blip_xattr_entry>? = nil
+                var xattrCount: Int = 0
+                var rfork: UnsafeMutablePointer<UInt8>? = nil
+                var rforkLen: Int = 0
+                blar_gui_read_xattrs(url.path, &xattrs, &xattrCount, &rfork, &rforkLen)
+                if xattrCount > 0 {
+                    entry.xattrs = UnsafePointer(xattrs)
+                    entry.xattr_count = xattrCount
+                }
+                if rforkLen > 0 {
+                    entry.resource_fork = UnsafePointer(rfork)
+                    entry.resource_fork_len = rforkLen
+                }
+
                 entries.append(entry)
             }
         }
@@ -165,6 +200,17 @@ class BlarBridge {
                 &archiveBuf,
                 &archiveLen
             )
+        }
+
+        // Free xattr/resource fork data now that entries are serialized
+        for entry in entries {
+            if entry.xattr_count > 0 || entry.resource_fork_len > 0 {
+                blar_gui_free_xattrs(
+                    UnsafeMutablePointer(mutating: entry.xattrs),
+                    entry.xattr_count,
+                    UnsafeMutablePointer(mutating: entry.resource_fork)
+                )
+            }
         }
 
         if rc != 0 { // BLIP_OK = 0

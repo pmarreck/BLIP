@@ -10,6 +10,19 @@
 #include "../../src/blip.h"
 #include "../../src/blar_common.h"
 
+/* Read xattrs and resource fork for a file — wraps blar_common.h static function */
+void blar_gui_read_xattrs(const char *path,
+                           blip_xattr_entry **out_xattrs, size_t *out_count,
+                           uint8_t **out_resource_fork, size_t *out_resource_fork_len) {
+    read_file_xattrs(path, out_xattrs, out_count, out_resource_fork, out_resource_fork_len);
+}
+
+/* Free xattr data */
+void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
+                            uint8_t *resource_fork) {
+    free_file_xattrs(xattrs, count, resource_fork);
+}
+
 /* Extern-linkage wrapper callable from Swift */
 int blar_gui_extract(const uint8_t *buf, size_t buf_len,
                       const char *output_dir,

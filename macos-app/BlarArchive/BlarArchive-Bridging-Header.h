@@ -34,6 +34,15 @@ typedef void (*blar_extract_log_fn)(const char *msg, void *ctx);
 /* We can't call the static function from blar_common.h directly.
  * The app will link against a thin C wrapper (blar_extract_wrapper.c)
  * that calls blar_extract_to_dir from blar_common.h. */
+/* Read xattrs and resource fork for a file */
+void blar_gui_read_xattrs(const char *path,
+                           blip_xattr_entry **out_xattrs, size_t *out_count,
+                           uint8_t **out_resource_fork, size_t *out_resource_fork_len);
+
+/* Free xattr data from blar_gui_read_xattrs */
+void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
+                            uint8_t *resource_fork);
+
 int blar_gui_extract(const uint8_t *buf, size_t buf_len,
                       const char *output_dir,
                       const blar_codec_t *codecs, size_t codec_count,
