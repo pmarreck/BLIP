@@ -79,11 +79,22 @@ libtool -static -o "$MERGED_LIB" \
     2>/dev/null
 echo "  Merged lib: $MERGED_LIB"
 
+# Compile the C extraction wrapper (uses blar_common.h)
+# -I for BlarArchive/ FIRST so our stub progrez.h is found before the real one
+echo "Compiling C wrapper..."
+WRAPPER_OBJ="$BUILD_DIR/blar_extract_wrapper.o"
+cc -c -O2 -std=c11 \
+    -I "$SCRIPT_DIR/BlarArchive" \
+    -I "$BLIP_ROOT/src" \
+    -o "$WRAPPER_OBJ" \
+    "$SCRIPT_DIR/BlarArchive/blar_extract_wrapper.c"
+
 SDKROOT= "$SYSTEM_SWIFTC" \
     -o "$APP_BUNDLE/Contents/MacOS/BlarArchive" \
     -import-objc-header "$SCRIPT_DIR/BlarArchive/BlarArchive-Bridging-Header.h" \
     -I "$BLIP_ROOT/src" \
     "$MERGED_LIB" \
+    "$WRAPPER_OBJ" \
     $LIB_SEARCH_FLAGS \
     -ljxl -ljxl_threads \
     -lz -lbrotlienc -lbrotlidec -lbrotlicommon -lhwy \

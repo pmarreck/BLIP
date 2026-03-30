@@ -215,9 +215,25 @@ class BlarBridge {
         DispatchQueue.main.async { progress(1.0) }
     }
 
-    /// Extract a blar archive to a directory.
-    /// For now, shells out to the blar CLI. Will be replaced with direct FFI
-    /// once extraction logic is factored into the Zig core.
+    /// Build a codec registry with just names (for extraction dispatch).
+    /// The extraction code only uses codec->name for strcmp dispatch,
+    /// not the expand/collapse function pointers.
+    private static var extractionCodecs: [blar_codec_t] = {
+        var codecs: [blar_codec_t] = []
+        // Static strings that live for the process lifetime
+        for name in ["jpeg", "pdf", "png", "zip"] {
+            var codec = blar_codec_t()
+            memset(&codec, 0, MemoryLayout<blar_codec_t>.size)
+            // name must be a C string pointer that outlives the codec
+            name.withCString { ptr in
+                codec.name = UnsafePointer(strdup(ptr))
+            }
+            codecs.append(codec)
+        }
+        return codecs
+    }()
+
+    /// Extract a blar archive to a directory via direct C FFI.
     static func extractArchive(
         archivePath: URL,
         outputDir: URL,
@@ -227,52 +243,102 @@ class BlarBridge {
         let fm = FileManager.default
         try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
-        // Use blar CLI for extraction (container reconstruction is complex)
-        // TODO: Replace with direct FFI call to blip_extract_archive()
-        let args = ["extract", archivePath.path, "-f", "-C", outputDir.path]
-        if let pw = password {
-            setenv("BLIP_PASSWORD", pw, 1)
+        // Read archive file
+        let archiveData = try Data(contentsOf: archivePath)
+
+        // Handle decryption if needed
+        var buf: UnsafeMutablePointer<UInt8>? = nil
+        var bufLen: Int = 0
+
+        let needsDecrypt = archiveData.withUnsafeBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            return blip_is_encrypted(base, archiveData.count)
         }
 
-        // Look for blar in bundle first, then PATH
-        let blarPath: String = Bundle.main.path(forResource: "blar", ofType: nil)
-            ?? {
-                if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
-                    for dir in pathEnv.split(separator: ":") {
-                        let p = "\(dir)/blar"
-                        if fm.isExecutableFile(atPath: p) { return p }
-                    }
-                }
-                return "/usr/local/bin/blar"
-            }()
+        let needsDecompress: Bool
+        var workingData = archiveData
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: blarPath)
-        process.arguments = args
-
-        let pipe = Pipe()
-        process.standardError = pipe
-
-        try process.run()
-
-        // Poll for completion (simple progress simulation)
-        DispatchQueue.global().async {
-            var tick = 0.0
-            while process.isRunning {
-                tick = min(tick + 0.02, 0.95)
-                DispatchQueue.main.async { progress(tick) }
-                Thread.sleep(forTimeInterval: 0.1)
+        if needsDecrypt {
+            guard let pw = password else {
+                throw BlarError.extractFailed("Archive is encrypted — password required")
             }
-            DispatchQueue.main.async { progress(1.0) }
+            var decBuf: UnsafeMutablePointer<UInt8>? = nil
+            var decLen: Int = 0
+            let rc = workingData.withUnsafeBytes { ptr -> Int32 in
+                let base = ptr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return pw.withCString { pwPtr in
+                    blip_decrypt_container(base, workingData.count, pwPtr, pw.utf8.count, &decBuf, &decLen)
+                }
+            }
+            if rc != 0 {
+                throw BlarError.extractFailed("Decryption failed: \(String(cString: blip_error_string(rc)))")
+            }
+            workingData = Data(bytes: decBuf!, count: decLen)
+            blip_free(decBuf, decLen)
         }
 
-        process.waitUntilExit()
-
-        if process.terminationStatus != 0 {
-            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
-            let errorStr = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-            throw BlarError.extractFailed(errorStr)
+        needsDecompress = workingData.withUnsafeBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            return blip_is_compressed(base, workingData.count)
         }
+
+        if needsDecompress {
+            var decBuf: UnsafeMutablePointer<UInt8>? = nil
+            var decLen: Int = 0
+            let rc = workingData.withUnsafeBytes { ptr -> Int32 in
+                let base = ptr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return blip_decompress_container(base, workingData.count, &decBuf, &decLen)
+            }
+            if rc != 0 {
+                throw BlarError.extractFailed("Decompression failed: \(String(cString: blip_error_string(rc)))")
+            }
+            workingData = Data(bytes: decBuf!, count: decLen)
+            blip_free(decBuf, decLen)
+        }
+
+        // Progress bridge
+        let progressBridge = ProgressBridge(callback: progress, totalBytes: UInt64(workingData.count))
+        let bridgePtr = Unmanaged.passRetained(progressBridge).toOpaque()
+
+        let extractProgressFn: @convention(c) (UInt64, UInt64, UInt64, UInt64, UnsafeMutableRawPointer?) -> Void = {
+            filesDone, _, totalFiles, _, ctx in
+            guard let ctx = ctx else { return }
+            let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
+            let fraction = totalFiles > 0 ? Double(filesDone) / Double(totalFiles) : 0
+            DispatchQueue.main.async {
+                bridge.callback(min(fraction, 1.0))
+            }
+        }
+
+        let extractLogFn: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = {
+            msg, _ in
+            if let msg = msg {
+                NSLog("BLAR Extract: %@", String(cString: msg))
+            }
+        }
+
+        // Call the C FFI extraction function with codec registry
+        let result = extractionCodecs.withUnsafeMutableBufferPointer { codecsBuf -> Int32 in
+            workingData.withUnsafeBytes { dataBuf -> Int32 in
+                let base = dataBuf.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return blar_gui_extract(
+                    base, workingData.count,
+                    outputDir.path,
+                    codecsBuf.baseAddress!, codecsBuf.count,
+                    extractProgressFn,
+                    extractLogFn,
+                    bridgePtr
+                )
+            }
+        }
+
+        Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
+
+        if result != 0 {
+            throw BlarError.extractFailed("Extraction failed with code \(result)")
+        }
+
+        DispatchQueue.main.async { progress(1.0) }
     }
 }
 
