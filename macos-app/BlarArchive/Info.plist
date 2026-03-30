@@ -34,7 +34,7 @@
 			<key>UTTypeIdentifier</key>
 			<string>com.mecha.blar-archive</string>
 			<key>UTTypeDescription</key>
-			<string>Blip Archiver</string>
+			<string>BLAR Archive</string>
 			<key>UTTypeConformsTo</key>
 			<array><string>public.data</string></array>
 			<key>UTTypeTagSpecification</key>
@@ -54,7 +54,7 @@
 	<array>
 		<dict>
 			<key>CFBundleTypeName</key>
-			<string>Blip Archiver</string>
+			<string>BLAR Archive</string>
 			<key>CFBundleTypeExtensions</key>
 			<array><string>blar</string></array>
 			<key>CFBundleTypeRole</key>
