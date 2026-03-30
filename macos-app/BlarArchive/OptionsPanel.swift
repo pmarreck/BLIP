@@ -59,7 +59,7 @@ class OptionsPanel: NSViewController {
         stack.addArrangedSubview(compLabel)
 
         compressionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        compressionPopup.addItems(withTitles: ["None", "LZMA2", "bzip2", "LZ4", "zstd"])
+        compressionPopup.addItems(withTitles: ["None", "7zip", "bzip2", "LZ4", "zstd"])
         compressionPopup.selectItem(at: 1) // Default: LZMA2
         compressionPopup.controlSize = .small
         compressionPopup.font = .systemFont(ofSize: 11)
