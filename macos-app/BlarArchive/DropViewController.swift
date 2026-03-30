@@ -155,6 +155,31 @@ class DropViewController: NSViewController {
             }
         }
 
+        // Validate settings before starting
+        do {
+            try optionsPanel.validateForCreate()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Cannot create archive"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
+        // Resolve password now (before background thread) so env var errors show immediately
+        let resolvedPassword: String?
+        do {
+            resolvedPassword = try optionsPanel.resolvePassword()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Password error"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
         let originalSize = totalSize(of: urls)
 
         statusLabel.stringValue = "Creating archive..."
@@ -170,7 +195,7 @@ class DropViewController: NSViewController {
                     compression: options.compression,
                     solid: options.solid,
                     encryption: options.encryption,
-                    password: options.password,
+                    password: resolvedPassword,
                     expandContainers: options.expandContainers,
                     threads: 0,
                     progress: { fraction in
@@ -208,12 +233,23 @@ class DropViewController: NSViewController {
     // MARK: - Extract archive
 
     private func extractFiles(_ urls: [URL]) {
+        // Resolve password before starting (env var errors show immediately)
+        let password: String?
+        do {
+            password = try optionsPanel.resolvePassword()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Password error"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
         statusLabel.stringValue = "Extracting..."
         progressBar.isHidden = false
         progressBar.doubleValue = 0
         dropZone.setEnabled(false)
-
-        let password = optionsPanel.currentOptions.password
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var successCount = 0

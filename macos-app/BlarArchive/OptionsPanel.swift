@@ -43,22 +43,66 @@ class OptionsPanel: NSViewController {
         )
     }
 
-    /// Resolve password: if it looks like $ENV_VAR_NAME, read from environment
-    private var resolvedPassword: String? {
-        let raw = isPasswordVisible ? passwordPlainField.stringValue : passwordField.stringValue
+    enum PasswordError: Error, LocalizedError {
+        case envVarNotSet(String)
+        case envVarEmpty(String)
+        case encryptionRequiresPassword
+
+        var errorDescription: String? {
+            switch self {
+            case .envVarNotSet(let name): return "Environment variable $\(name) is not set"
+            case .envVarEmpty(let name): return "Environment variable $\(name) is empty"
+            case .encryptionRequiresPassword: return "Encryption requires a password"
+            }
+        }
+    }
+
+    /// The raw password field text (may be $ENV_VAR or literal)
+    var rawPasswordText: String {
+        isPasswordVisible ? passwordPlainField.stringValue : passwordField.stringValue
+    }
+
+    /// Whether the password field contains an env var reference
+    var isEnvVarPassword: Bool {
+        let raw = rawPasswordText
+        guard raw.hasPrefix("$") else { return false }
+        let varName = String(raw.dropFirst())
+        return !varName.isEmpty && varName.allSatisfy({ $0.isUppercase || $0 == "_" || $0.isNumber })
+    }
+
+    /// Resolve password, throwing on env var errors
+    func resolvePassword() throws -> String? {
+        let raw = rawPasswordText
         if raw.isEmpty { return nil }
-        // Check for environment variable reference: $CAPS_AND_UNDERSCORES
         if raw.hasPrefix("$") {
             let varName = String(raw.dropFirst())
             if !varName.isEmpty && varName.allSatisfy({ $0.isUppercase || $0 == "_" || $0.isNumber }) {
-                if let envVal = ProcessInfo.processInfo.environment[varName] {
-                    return envVal
+                guard let envVal = ProcessInfo.processInfo.environment[varName] else {
+                    throw PasswordError.envVarNotSet(varName)
                 }
-                // Env var not set — return nil rather than using the literal "$VAR" as password
-                return nil
+                guard !envVal.isEmpty else {
+                    throw PasswordError.envVarEmpty(varName)
+                }
+                return envVal
             }
         }
         return raw
+    }
+
+    /// Validate settings for archive creation
+    func validateForCreate() throws {
+        let enc = EncryptionAlgo(rawValue: UInt8(encryptionPopup.indexOfSelectedItem)) ?? .none
+        if enc != .none {
+            let pw = try resolvePassword()
+            if pw == nil || pw!.isEmpty {
+                throw PasswordError.encryptionRequiresPassword
+            }
+        }
+    }
+
+    /// Resolve password silently (for currentOptions, returns nil on error)
+    private var resolvedPassword: String? {
+        return try? resolvePassword()
     }
 
     override func loadView() {
