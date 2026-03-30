@@ -1,15 +1,12 @@
 import Cocoa
 
-@main
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var dropViewController: DropViewController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Build the main menu
         setupMainMenu()
 
-        // Create the main window
         dropViewController = DropViewController()
 
         window = NSWindow(
@@ -23,7 +20,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.minSize = NSSize(width: 400, height: 300)
 
-        // Activate the app and show the window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -39,7 +35,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    // Handle files opened via Finder (double-click .blar, Open With, etc.)
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         let urls = filenames.map { URL(fileURLWithPath: $0) }
         dropViewController.handleDroppedURLs(urls)
@@ -95,3 +90,4 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 }
+
