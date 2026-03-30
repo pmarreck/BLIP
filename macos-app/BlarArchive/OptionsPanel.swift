@@ -67,12 +67,20 @@ class OptionsPanel: NSViewController {
         compressionPopup.selectItem(at: 3) // Default: Best (7zip/LZMA2)
         compressionPopup.controlSize = .small
         compressionPopup.font = .systemFont(ofSize: 11)
+
+        // Tooltips for compression options
+        compressionPopup.item(at: 0)?.toolTip = "No compression — fastest, largest files"
+        compressionPopup.item(at: 1)?.toolTip = "LZ4 — extremely fast compression and decompression, lower ratio. Good for temporary or local archives."
+        compressionPopup.item(at: 2)?.toolTip = "Zstandard — near-best compression ratio at much faster speed than 7zip. Great default for most use cases."
+        compressionPopup.item(at: 3)?.toolTip = "LZMA2 (7-Zip algorithm) — best compression ratio, slower to compress. Best for archival or sharing."
+
         stack.addArrangedSubview(compressionPopup)
 
         // Solid mode
         solidCheckbox = NSButton(checkboxWithTitle: "Solid mode", target: nil, action: nil)
         solidCheckbox.controlSize = .small
         solidCheckbox.font = .systemFont(ofSize: 11)
+        solidCheckbox.toolTip = "Compress the entire archive as one block instead of per-file. Better compression ratio for many similar files, but extracting any single file requires decompressing everything."
         stack.addArrangedSubview(solidCheckbox)
 
         // Separator
@@ -91,6 +99,12 @@ class OptionsPanel: NSViewController {
         encryptionPopup.selectItem(at: 0)
         encryptionPopup.controlSize = .small
         encryptionPopup.font = .systemFont(ofSize: 11)
+
+        // Tooltips for encryption options
+        encryptionPopup.item(at: 0)?.toolTip = "No encryption — anyone with the file can read it"
+        encryptionPopup.item(at: 1)?.toolTip = "AES-256-GCM — industry standard, hardware-accelerated on most CPUs. Uses Argon2id for key derivation."
+        encryptionPopup.item(at: 2)?.toolTip = "ChaCha20-Poly1305 — constant-time on all platforms, no hardware acceleration needed. Uses Argon2id for key derivation."
+
         stack.addArrangedSubview(encryptionPopup)
 
         let pwLabel = NSTextField(labelWithString: "Password:")
@@ -116,7 +130,7 @@ class OptionsPanel: NSViewController {
         expandCheckbox.state = .on
         expandCheckbox.controlSize = .small
         expandCheckbox.font = .systemFont(ofSize: 11)
-        expandCheckbox.toolTip = "Decompose PDF/PNG/JPEG/ZIP for better compression"
+        expandCheckbox.toolTip = "Decompose PDFs, JPEGs, PNGs, and ZIP-based files (Office docs, EPUBs) into their parts for significantly better compression. Files are perfectly reconstructed on extraction."
         stack.addArrangedSubview(expandCheckbox)
     }
 }
