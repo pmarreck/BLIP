@@ -3,6 +3,7 @@ import Cocoa
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var dropViewController: DropViewController!
+    var pendingURLs: [URL]?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
@@ -22,6 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+
+        // Process any files that were opened before the window was ready
+        if let urls = pendingURLs {
+            pendingURLs = nil
+            dropViewController.handleDroppedURLs(urls)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -37,7 +44,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         let urls = filenames.map { URL(fileURLWithPath: $0) }
-        dropViewController.handleDroppedURLs(urls)
+        // openFiles can fire before applicationDidFinishLaunching when
+        // a file is passed on the command line or via Finder double-click.
+        // Queue it until the UI is ready.
+        if dropViewController != nil {
+            dropViewController.handleDroppedURLs(urls)
+        } else {
+            pendingURLs = urls
+        }
         sender.reply(toOpenOrPrint: .success)
     }
 

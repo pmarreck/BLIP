@@ -18,6 +18,11 @@ int blar_gui_create(const char *const *paths, size_t path_count,
                      blar_extract_progress_fn progress_fn,
                      void *progress_ctx,
                      uint8_t **out_buf, size_t *out_len) {
+    fprintf(stderr, "[blar_gui_create] paths=%zu, per_file_comp=%u, expand=%d\n",
+            path_count, per_file_comp, expand_containers);
+    for (size_t i = 0; i < path_count; i++)
+        fprintf(stderr, "  path[%zu]: %s\n", i, paths[i]);
+
     entry_list_t el;
     entry_list_init(&el);
     el.expand_containers = expand_containers;
