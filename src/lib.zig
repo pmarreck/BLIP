@@ -1867,7 +1867,7 @@ export fn blip_gz_decompress(
     return 0;
 }
 
-/// Compress data to gzip format. Caller must free output with blip_free.
+/// Compress data to gzip format at default level. Caller must free output with blip_free.
 export fn blip_gz_compress(
     data: [*]const u8,
     data_len: usize,
@@ -1878,6 +1878,32 @@ export fn blip_gz_compress(
     out.* = result.ptr;
     out_len.* = result.len;
     return 0;
+}
+
+/// Compress data to gzip format at a specific compression level (1-9).
+/// Caller must free output with blip_free.
+export fn blip_gz_compress_level(
+    data: [*]const u8,
+    data_len: usize,
+    level: u8,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.gzipCompressLevel(page_allocator, data[0..data_len], @intCast(level)) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Guess the gzip compression level from original compressed + decompressed data.
+/// Returns the guessed level (2, 6, or 9).
+export fn blip_gz_guess_level(
+    compressed: [*]const u8,
+    compressed_len: usize,
+    decompressed: [*]const u8,
+    decompressed_len: usize,
+) callconv(.c) u8 {
+    return pdf_mod.gzipGuessLevel(page_allocator, compressed[0..compressed_len], decompressed[0..decompressed_len]);
 }
 
 /// Check if buffer starts with gzip magic bytes (0x1f 0x8b).

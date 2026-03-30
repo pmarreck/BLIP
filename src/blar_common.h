@@ -2220,6 +2220,7 @@ static int blar_extract_to_dir(
             uint8_t *body_data = NULL;
             size_t body_len = 0;
             bool found_body = false;
+            uint8_t gz_level = 6; /* default if not stored */
 
             for (uint64_t j = 0; j < count; j++) {
                 if (j == co_idx) continue;
@@ -2236,7 +2237,13 @@ static int blar_extract_to_dir(
 
                 if (inner_len == 8 && memcmp(inner, "__body__", 8) == 0) {
                     rc = blip_archive_file_content(buf, buf_len, j, &body_data, &body_len);
-                    if (rc == BLIP_OK) found_body = true;
+                    if (rc == BLIP_OK) {
+                        found_body = true;
+                        /* Read stored gz level from zip_compression_method field */
+                        uint16_t zc = 0xFFFF;
+                        blip_archive_entry_zip_comp(buf, buf_len, j, &zc);
+                        gz_level = (zc != 0xFFFF && zc >= 1 && zc <= 9) ? (uint8_t)zc : 6;
+                    }
                 }
             }
 
@@ -2249,7 +2256,7 @@ static int blar_extract_to_dir(
 
             uint8_t *gz_data = NULL;
             size_t gz_len = 0;
-            rc = blip_gz_compress(body_data, body_len, &gz_data, &gz_len);
+            rc = blip_gz_compress_level(body_data, body_len, gz_level, &gz_data, &gz_len);
             blip_free_content(body_data, body_len);
             if (rc != BLIP_OK) {
                 EXTRACT_LOG("\033[31mERROR: GZ container '%.*s': gzip compress failed\033[0m",
@@ -3703,6 +3710,10 @@ static bool expand_gz_container(entry_list_t *el,
     if (blip_gz_decompress(content, content_len, &decompressed, &decomp_len) != BLIP_OK)
         return false;
 
+    /* Guess original compression level for faithful reconstruction */
+    uint8_t gz_level = blip_gz_guess_level(content, content_len,
+                                            decompressed, decomp_len);
+
     /* Copy to malloc'd buffer */
     uint8_t *owned = malloc(decomp_len);
     if (!owned) { blip_free(decompressed, decomp_len); return false; }
@@ -3752,7 +3763,7 @@ static bool expand_gz_container(entry_list_t *el,
     body_entry.content_len = decomp_len;
     body_entry.is_dir = 0;
     body_entry.mode = file_entry->mode;
-    body_entry.zip_compression_method = 0xFFFF;
+    body_entry.zip_compression_method = (uint16_t)gz_level; /* store guessed gz level */
     body_entry.pdf_stream_offset = UINT64_MAX;
     body_entry.pdf_stream_length = UINT64_MAX;
     if (!entry_list_add(el, body_entry)) return false;

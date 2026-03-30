@@ -919,9 +919,8 @@ pub fn gzipDecompress(allocator: Allocator, compressed: []const u8) ![]u8 {
         return error.InvalidData;
 }
 
-/// Compress data to gzip format using C zlib (real deflate compression).
-pub fn gzipCompress(allocator: Allocator, data: []const u8) ![]u8 {
-    // compressBound gives upper bound; add 18 bytes for gzip header/trailer overhead
+/// Compress data to gzip format at the specified zlib compression level (1-9).
+pub fn gzipCompressLevel(allocator: Allocator, data: []const u8, level: c_int) ![]u8 {
     const bound = c_zlib.compressBound(@intCast(data.len)) + 18;
     const buf = try allocator.alloc(u8, bound);
     errdefer allocator.free(buf);
@@ -935,10 +934,10 @@ pub fn gzipCompress(allocator: Allocator, data: []const u8) ![]u8 {
     // windowBits = 15 + 16 = 31 for gzip format
     var rc = c_zlib.deflateInit2_(
         &stream,
-        c_zlib.Z_DEFAULT_COMPRESSION,
+        level,
         c_zlib.Z_DEFLATED,
-        15 + 16, // windowBits: 15 + 16 = gzip
-        8, // memLevel
+        15 + 16,
+        8,
         c_zlib.Z_DEFAULT_STRATEGY,
         c_zlib.ZLIB_VERSION,
         @sizeOf(c_zlib.z_stream),
@@ -950,11 +949,49 @@ pub fn gzipCompress(allocator: Allocator, data: []const u8) ![]u8 {
     if (rc != c_zlib.Z_STREAM_END) return error.InvalidData;
 
     const result_len: usize = @intCast(stream.total_out);
-    // Shrink allocation to actual size
     if (result_len < buf.len) {
         return allocator.realloc(buf, result_len) catch buf[0..result_len];
     }
     return buf[0..result_len];
+}
+
+/// Compress data to gzip format at default compression level.
+pub fn gzipCompress(allocator: Allocator, data: []const u8) ![]u8 {
+    return gzipCompressLevel(allocator, data, c_zlib.Z_DEFAULT_COMPRESSION);
+}
+
+/// Guess the gzip compression level from original compressed data.
+/// Heuristic:
+///   1. Check XFL byte: 2 -> level 9, 4 -> level 2
+///   2. If XFL=0: compress at level 6, compare to original size:
+///      - Within 1% -> level 6
+///      - Level 6 smaller than original -> level 2 (original less compressed)
+///      - Level 6 larger than original -> level 9 (original more compressed)
+pub fn gzipGuessLevel(allocator: Allocator, compressed: []const u8, decompressed: []const u8) u8 {
+    // Check XFL byte (offset 8 in gzip header)
+    if (compressed.len >= 10) {
+        const xfl = compressed[8];
+        if (xfl == 2) return 9;
+        if (xfl == 4) return 2;
+    }
+
+    // XFL=0 or absent: try level 6 and compare
+    const test_compressed = gzipCompressLevel(allocator, decompressed, 6) catch return 6;
+    defer allocator.free(test_compressed);
+
+    const orig_size = compressed.len;
+    const test_size = test_compressed.len;
+
+    // Within 1%?
+    const threshold = orig_size / 100;
+    const diff = if (test_size > orig_size) test_size - orig_size else orig_size - test_size;
+    if (diff <= threshold) return 6;
+
+    // Level 6 produced smaller output -> original was less compressed -> guess 2
+    if (test_size < orig_size) return 2;
+
+    // Level 6 produced larger output -> original was more compressed -> guess 9
+    return 9;
 }
 
 fn paethPredictor(a: i16, b: i16, c: i16) u8 {

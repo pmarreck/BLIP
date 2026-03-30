@@ -555,6 +555,15 @@ int32_t blip_gz_decompress(const uint8_t *data, size_t data_len,
 int32_t blip_gz_compress(const uint8_t *data, size_t data_len,
     uint8_t **out, size_t *out_len);
 
+/* Compress data to gzip format at a specific compression level (1-9). */
+int32_t blip_gz_compress_level(const uint8_t *data, size_t data_len,
+    uint8_t level, uint8_t **out, size_t *out_len);
+
+/* Guess the gzip compression level from original compressed + decompressed data.
+ * Returns 2, 6, or 9 based on XFL header byte and size comparison heuristic. */
+uint8_t blip_gz_guess_level(const uint8_t *compressed, size_t compressed_len,
+    const uint8_t *decompressed, size_t decompressed_len);
+
 /* Check if buffer starts with gzip magic bytes (0x1f 0x8b). */
 bool blip_is_gz(const uint8_t *buf, size_t buf_len);
 
