@@ -364,6 +364,51 @@ else
   fail "solid mode: container roundtrip differs (got: $SOLID_CONTENT)"
 fi
 
+
+# =============================================================================
+# Test 13: Gzip container expansion roundtrip
+# =============================================================================
+mkdir -p "$TMPDIR_TEST/t13/input"
+echo "hello world gzip test data with enough content to compress well hello hello hello" | gzip -9 > "$TMPDIR_TEST/t13/input/test.gz"
+ORIG_CONTENT=$(gunzip -c "$TMPDIR_TEST/t13/input/test.gz")
+
+(cd "$TMPDIR_TEST/t13" && "$BLAR" create -z -f -o "$TMPDIR_TEST/t13/archive.blar" input 2>/dev/null)
+
+GZ_LIST=$("$BLAR" list "$TMPDIR_TEST/t13/archive.blar" 2>/dev/null)
+if echo "$GZ_LIST" | grep -q "^g "; then
+  pass "gzip container: detected and expanded (g prefix)"
+else
+  fail "gzip container: not expanded (no g prefix). List: $GZ_LIST"
+fi
+
+mkdir -p "$TMPDIR_TEST/t13/out"
+"$BLAR" extract "$TMPDIR_TEST/t13/archive.blar" -f -C "$TMPDIR_TEST/t13/out" 2>/dev/null
+EXTRACTED_CONTENT=$(gunzip -c "$TMPDIR_TEST/t13/out/input/test.gz" 2>/dev/null)
+if [[ "$ORIG_CONTENT" == "$EXTRACTED_CONTENT" ]]; then
+  pass "gzip container: content roundtrip matches"
+else
+  fail "gzip container: content differs"
+fi
+
+# =============================================================================
+# Test 14: Gzip content preservation with different levels
+# =============================================================================
+mkdir -p "$TMPDIR_TEST/t14/input"
+python3 -c "import sys; sys.stdout.buffer.write(b'ABCDEFGHIJ' * 10000)" | gzip -2 > "$TMPDIR_TEST/t14/input/fast.gz"
+
+(cd "$TMPDIR_TEST/t14" && "$BLAR" create -z -f -o "$TMPDIR_TEST/t14/archive.blar" input 2>/dev/null)
+mkdir -p "$TMPDIR_TEST/t14/out"
+"$BLAR" extract "$TMPDIR_TEST/t14/archive.blar" -f -C "$TMPDIR_TEST/t14/out" 2>/dev/null
+
+ORIG_MD5=$(gunzip -c "$TMPDIR_TEST/t14/input/fast.gz" | md5)
+EXTRACTED_MD5=$(gunzip -c "$TMPDIR_TEST/t14/out/input/fast.gz" 2>/dev/null | md5)
+
+if [[ "$ORIG_MD5" == "$EXTRACTED_MD5" ]]; then
+  pass "gzip level: content identical after roundtrip"
+else
+  fail "gzip level: content differs"
+fi
+
 # =============================================================================
 # Results
 # =============================================================================
