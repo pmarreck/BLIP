@@ -15,9 +15,13 @@ class OptionsPanel: NSViewController {
     private var passwordField: NSSecureTextField!
     private var expandCheckbox: NSButton!
 
+    // Maps dropdown index to CompressionAlgo:
+    //   0 = None, 1 = LZ4, 2 = zstd, 3 = 7zip (LZMA2)
+    private static let compressionMap: [CompressionAlgo] = [.none, .lz4, .zstd, .lzma2]
+
     var currentOptions: ArchiveOptions {
         return ArchiveOptions(
-            compression: CompressionAlgo(rawValue: UInt8(compressionPopup.indexOfSelectedItem)) ?? .none,
+            compression: Self.compressionMap[compressionPopup.indexOfSelectedItem],
             solid: solidCheckbox.state == .on,
             encryption: EncryptionAlgo(rawValue: UInt8(encryptionPopup.indexOfSelectedItem)) ?? .none,
             password: passwordField.stringValue.isEmpty ? nil : passwordField.stringValue,
@@ -59,8 +63,8 @@ class OptionsPanel: NSViewController {
         stack.addArrangedSubview(compLabel)
 
         compressionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        compressionPopup.addItems(withTitles: ["None", "7zip", "bzip2", "LZ4", "zstd"])
-        compressionPopup.selectItem(at: 1) // Default: LZMA2
+        compressionPopup.addItems(withTitles: ["None", "Very Fast (LZ4)", "Fast (zstd)", "Best (7zip)"])
+        compressionPopup.selectItem(at: 3) // Default: Best (7zip/LZMA2)
         compressionPopup.controlSize = .small
         compressionPopup.font = .systemFont(ofSize: 11)
         stack.addArrangedSubview(compressionPopup)
