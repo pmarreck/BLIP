@@ -22,6 +22,9 @@ typedef struct {
 
 static void gui_create_progress_adapter(uint64_t entries_done, uint64_t bytes_done, void *ctx) {
     gui_create_progress_ctx_t *g = (gui_create_progress_ctx_t *)ctx;
+    fprintf(stderr, "[progress] entries=%llu/%zu bytes=%llu/%llu\n",
+            (unsigned long long)entries_done, g->total_files,
+            (unsigned long long)bytes_done, (unsigned long long)g->total_bytes);
     if (g->fn) g->fn(entries_done, bytes_done, (uint64_t)g->total_files, g->total_bytes, g->ctx);
 }
 
@@ -31,8 +34,8 @@ int blar_gui_create(const char *const *paths, size_t path_count,
                      blar_extract_progress_fn progress_fn,
                      void *progress_ctx,
                      uint8_t **out_buf, size_t *out_len) {
-    fprintf(stderr, "[blar_gui_create] paths=%zu, per_file_comp=%u, expand=%d\n",
-            path_count, per_file_comp, expand_containers);
+    fprintf(stderr, "[blar_gui_create] paths=%zu, per_file_comp=%u, expand=%d, threads=%u, progress_fn=%p\n",
+            path_count, per_file_comp, expand_containers, num_threads, (void*)progress_fn);
     for (size_t i = 0; i < path_count; i++)
         fprintf(stderr, "  path[%zu]: %s\n", i, paths[i]);
 
@@ -63,13 +66,26 @@ int blar_gui_create(const char *const *paths, size_t path_count,
 
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
+    /* Compute total bytes for progress reporting */
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < el.count; i++) {
+        if (!el.entries[i].is_dir)
+            total_bytes += el.entries[i].content_len;
+    }
+
     /* Adapt the 5-arg progress callback to the 3-arg one that
      * blip_archive_create_full expects. */
+    gui_create_progress_ctx_t progress_adapter = {
+        .fn = progress_fn,
+        .ctx = progress_ctx,
+        .total_files = el.count,
+        .total_bytes = total_bytes,
+    };
     int32_t rc = blip_archive_create_full(el.entries, el.count, 0,
                                            per_file_comp, num_threads,
                                            progress_fn ? gui_create_progress_adapter : NULL,
                                            NULL,
-                                           progress_fn ? &(gui_create_progress_ctx_t){progress_fn, progress_ctx, el.count, el.bytes_seen} : NULL,
+                                           progress_fn ? &progress_adapter : NULL,
                                            &archive_buf, &archive_len);
     entry_list_free(&el);
     if (rc != 0) return rc;

@@ -50,16 +50,23 @@ class BlarBridge {
         var archiveBuf: UnsafeMutablePointer<UInt8>? = nil
         var archiveLen: Int = 0
 
-        // Progress bridge for the C create function
+        // Progress callback — the C adapter provides (entriesDone, bytesDone, totalFiles, totalBytes, ctx)
         let progressBridge = ProgressBridge(callback: progress, totalBytes: 0)
         let bridgePtr = Unmanaged.passRetained(progressBridge).toOpaque()
 
         let createProgressFn: @convention(c) (UInt64, UInt64, UInt64, UInt64, UnsafeMutableRawPointer?) -> Void = {
-            entriesDone, bytesDone, _, _, ctx in
+            entriesDone, bytesDone, totalFiles, totalBytes, ctx in
             guard let ctx = ctx else { return }
             let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
-            // Use bytes as the more granular progress indicator
-            let fraction = bytesDone > 0 ? min(Double(bytesDone) / Double(max(bridge.totalBytes, bytesDone)), 1.0) : 0
+            // Use whichever metric gives smoother progress
+            let fraction: Double
+            if totalBytes > 0 {
+                fraction = min(Double(bytesDone) / Double(totalBytes), 1.0)
+            } else if totalFiles > 0 {
+                fraction = min(Double(entriesDone) / Double(totalFiles), 1.0)
+            } else {
+                fraction = 0
+            }
             DispatchQueue.main.async {
                 bridge.callback(fraction)
             }
