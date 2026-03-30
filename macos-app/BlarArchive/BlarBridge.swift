@@ -58,12 +58,16 @@ class BlarBridge {
             entriesDone, bytesDone, totalFiles, totalBytes, ctx in
             guard let ctx = ctx else { return }
             let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
-            // Use whichever metric gives smoother progress
+
             let fraction: Double
-            if totalBytes > 0 {
-                fraction = min(Double(bytesDone) / Double(totalBytes), 1.0)
-            } else if totalFiles > 0 {
-                fraction = min(Double(entriesDone) / Double(totalFiles), 1.0)
+            if totalBytes == 0 && totalFiles > 0 {
+                // Expansion phase (file-count based): maps to 0% - 25%
+                let phaseFraction = min(Double(entriesDone) / Double(totalFiles), 1.0)
+                fraction = phaseFraction * 0.25
+            } else if totalBytes > 0 {
+                // Serialization/compression phase (byte-based): maps to 25% - 100%
+                let phaseFraction = min(Double(bytesDone) / Double(totalBytes), 1.0)
+                fraction = 0.25 + phaseFraction * 0.75
             } else {
                 fraction = 0
             }
