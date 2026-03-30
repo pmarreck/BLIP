@@ -41,7 +41,8 @@ class BlarBridge {
         password: String? = nil,
         expandContainers: Bool = true,
         threads: UInt8 = 0,
-        progress: @escaping ProgressCallback
+        progress: @escaping ProgressCallback,
+        statusUpdate: ((String) -> Void)? = nil
     ) throws {
         // Convert URLs to C string paths
         let pathStrings = paths.map { $0.path }
@@ -52,6 +53,7 @@ class BlarBridge {
 
         // Progress callback — the C adapter provides (entriesDone, bytesDone, totalFiles, totalBytes, ctx)
         let progressBridge = ProgressBridge(callback: progress, totalBytes: 0)
+        progressBridge.statusCallback = statusUpdate
         let bridgePtr = Unmanaged.passRetained(progressBridge).toOpaque()
 
         let createProgressFn: @convention(c) (UInt64, UInt64, UInt64, UInt64, UnsafeMutableRawPointer?) -> Void = {
@@ -60,19 +62,52 @@ class BlarBridge {
             let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
 
             let fraction: Double
+            let phase: String
             if totalBytes == 0 && totalFiles > 0 {
                 // Expansion phase (file-count based): maps to 0% - 25%
+                bridge.hadExpansionPhase = true
                 let phaseFraction = min(Double(entriesDone) / Double(totalFiles), 1.0)
                 fraction = phaseFraction * 0.25
+                phase = "Expanding"
             } else if totalBytes > 0 {
-                // Serialization/compression phase (byte-based): maps to 25% - 100%
+                // Serialization/compression phase
                 let phaseFraction = min(Double(bytesDone) / Double(totalBytes), 1.0)
-                fraction = 0.25 + phaseFraction * 0.75
+                if bridge.hadExpansionPhase {
+                    // Two-phase: maps to 25% - 100%
+                    fraction = 0.25 + phaseFraction * 0.75
+                } else {
+                    // Single-phase (no expansion): maps to 0% - 100%
+                    fraction = phaseFraction
+                }
+                phase = "Compressing"
             } else {
                 fraction = 0
+                phase = "Creating"
             }
+
+            // Compute ETA
+            let elapsed = CFAbsoluteTimeGetCurrent() - bridge.startTime
+            let etaStr: String
+            if fraction > 0.01 && elapsed > 1.0 {
+                let totalEstimated = elapsed / fraction
+                let remaining = totalEstimated - elapsed
+                if remaining < 60 {
+                    etaStr = String(format: "ETA %ds", Int(remaining))
+                } else {
+                    etaStr = String(format: "ETA %dm%02ds", Int(remaining) / 60, Int(remaining) % 60)
+                }
+            } else {
+                etaStr = ""
+            }
+
+            let pct = Int(fraction * 100)
+            let statusText = etaStr.isEmpty
+                ? "\(phase)... \(pct)%"
+                : "\(phase)... \(pct)%, \(etaStr)"
+
             DispatchQueue.main.async {
                 bridge.callback(fraction)
+                bridge.statusCallback?(statusText)
             }
         }
 
@@ -289,10 +324,14 @@ extension Array where Element == String {
 /// Helper class to bridge C callbacks to Swift closures.
 class ProgressBridge {
     let callback: ProgressCallback
+    var statusCallback: ((String) -> Void)?
     let totalBytes: UInt64
+    let startTime: CFAbsoluteTime
+    var hadExpansionPhase: Bool = false  // set to true if expansion callbacks fire
 
     init(callback: @escaping ProgressCallback, totalBytes: UInt64) {
         self.callback = callback
+        self.startTime = CFAbsoluteTimeGetCurrent()
         self.totalBytes = totalBytes
     }
 }

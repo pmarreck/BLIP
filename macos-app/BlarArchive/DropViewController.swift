@@ -227,6 +227,9 @@ class DropViewController: NSViewController {
                     threads: 0,
                     progress: { fraction in
                         self?.progressBar.doubleValue = fraction * 100
+                    },
+                    statusUpdate: { text in
+                        self?.statusLabel.stringValue = text
                     }
                 )
 
