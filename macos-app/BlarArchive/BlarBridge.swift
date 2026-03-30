@@ -48,10 +48,16 @@ class BlarBridge {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
-                if let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey]) {
+                // Don't resolve aliases/symlinks — treat them as regular files
+                if let enumerator = fm.enumerator(
+                    at: url,
+                    includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .isAliasFileKey],
+                    options: [.producesRelativePathURLs]
+                ) {
                     while let fileURL = enumerator.nextObject() as? URL {
-                        let relPath = fileURL.path.replacingOccurrences(of: url.deletingLastPathComponent().path + "/", with: "")
-                        allFiles.append((relPath, fileURL))
+                        let fullURL = url.appendingPathComponent(fileURL.relativePath)
+                        let relPath = url.lastPathComponent + "/" + fileURL.relativePath
+                        allFiles.append((relPath, fullURL))
                     }
                 }
             } else {
@@ -95,7 +101,14 @@ class BlarBridge {
             } else {
                 let pathData = path.data(using: .utf8)!
                 contentBuffers.append(pathData)
-                let fileData = try Data(contentsOf: url)
+                // Read file data — skip files that can't be read (dead aliases, etc.)
+                let fileData: Data
+                do {
+                    fileData = try Data(contentsOf: url, options: .mappedIfSafe)
+                } catch {
+                    NSLog("Warning: skipping unreadable file '%@': %@", url.path, error.localizedDescription)
+                    continue
+                }
                 contentBuffers.append(fileData)
 
                 pathData.withUnsafeBytes { pathPtr in
