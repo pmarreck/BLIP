@@ -28,6 +28,13 @@ static void gui_create_progress_adapter(uint64_t entries_done, uint64_t bytes_do
     if (g->fn) g->fn(entries_done, bytes_done, (uint64_t)g->total_files, g->total_bytes, g->ctx);
 }
 
+/* Expansion phase progress: (done_files, total_files, ctx) → 5-arg GUI callback */
+static void gui_expansion_progress_adapter(uint64_t done, uint64_t total, void *ctx) {
+    gui_create_progress_ctx_t *g = (gui_create_progress_ctx_t *)ctx;
+    /* Report as file counts; set bytes to 0 so Swift uses file-based fraction */
+    if (g->fn) g->fn(done, 0, total, 0, g->ctx);
+}
+
 int blar_gui_create(const char *const *paths, size_t path_count,
                      uint8_t per_file_comp, uint8_t num_threads,
                      bool expand_containers, bool expand_all_zips,
@@ -44,6 +51,19 @@ int blar_gui_create(const char *const *paths, size_t path_count,
     el.expand_containers = expand_containers;
     el.expand_all_zips = expand_all_zips;
     el.num_threads = num_threads;
+
+    /* Wire expansion progress through to GUI callback.
+     * During expansion, done/total are file counts. */
+    gui_create_progress_ctx_t expansion_adapter = {
+        .fn = progress_fn,
+        .ctx = progress_ctx,
+        .total_files = 0,
+        .total_bytes = 0,
+    };
+    if (progress_fn) {
+        el.expansion_progress_fn = gui_expansion_progress_adapter;
+        el.expansion_progress_ctx = &expansion_adapter;
+    }
 
     for (size_t i = 0; i < path_count; i++) {
         if (!collect_entries_recurse(paths[i], &el)) {

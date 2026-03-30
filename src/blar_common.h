@@ -2728,6 +2728,9 @@ typedef struct {
     bool expand_containers; /* expand zip containers into DIR+FILE entries */
     bool expand_all_zips;   /* also expand .zip/.gz files (normally excluded) */
     uint8_t num_threads;    /* thread count for parallel work (0=auto) */
+    /* Generic progress callback (used by GUI — fires during expansion phase) */
+    void (*expansion_progress_fn)(uint64_t done, uint64_t total, void *ctx);
+    void *expansion_progress_ctx;
 } entry_list_t;
 
 static void entry_list_init(entry_list_t *el) {
@@ -2738,6 +2741,8 @@ static void entry_list_init(entry_list_t *el) {
     el->content_count = 0;
     el->content_capacity = 0;
     el->progress = NULL;
+    el->expansion_progress_fn = NULL;
+    el->expansion_progress_ctx = NULL;
     el->bytes_seen = 0;
     el->expand_containers = false;
     el->expand_all_zips = false;
@@ -4012,14 +4017,15 @@ typedef struct {
 typedef struct {
     expand_worker_ctx_t *workers;
     size_t total;
-    _Atomic size_t next_index;  /* atomic counter — each thread grabs the next available item */
+    _Atomic size_t next_index;   /* next item to grab */
+    _Atomic size_t done_count;   /* items completed (for progress) */
+    _Atomic uint64_t done_bytes; /* bytes completed (for progress) */
 } expand_work_queue_t;
 
 static void *expand_worker(void *arg) {
     expand_work_queue_t *queue = (expand_work_queue_t *)arg;
 
     while (1) {
-        /* Atomically grab the next work item */
         size_t idx = atomic_fetch_add(&queue->next_index, 1);
         if (idx >= queue->total) break;
 
@@ -4028,6 +4034,9 @@ static void *expand_worker(void *arg) {
         ctx->result.expand_all_zips = ctx->expand_all_zips;
         ctx->success = ((blar_expand_fn)ctx->codec->expand)(
             &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy);
+
+        atomic_fetch_add(&queue->done_count, 1);
+        atomic_fetch_add(&queue->done_bytes, ctx->content_len);
     }
     return NULL;
 }
@@ -4102,6 +4111,8 @@ static bool expand_containers_pass(entry_list_t *el) {
             .workers = workers,
             .total = expandable,
             .next_index = 0,
+            .done_count = 0,
+            .done_bytes = 0,
         };
 
         pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
@@ -4110,10 +4121,29 @@ static bool expand_containers_pass(entry_list_t *el) {
         for (size_t t = 0; t < num_threads; t++) {
             pthread_create(&threads[t], NULL, expand_worker, &queue);
         }
+
+        /* Poll progress while workers expand containers */
+        while (atomic_load(&queue.done_count) < expandable) {
+            size_t done = atomic_load(&queue.done_count);
+            uint64_t done_b = atomic_load(&queue.done_bytes);
+            if (el->progress)
+                progrez_update(el->progress, done, done_b);
+            if (el->expansion_progress_fn)
+                el->expansion_progress_fn(done, expandable, el->expansion_progress_ctx);
+
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
+            nanosleep(&ts, NULL);
+        }
+
         for (size_t t = 0; t < num_threads; t++) {
             pthread_join(threads[t], NULL);
         }
         free(threads);
+
+        if (el->progress)
+            progrez_update(el->progress, expandable, total_expandable_bytes);
+        if (el->expansion_progress_fn)
+            el->expansion_progress_fn(expandable, expandable, el->expansion_progress_ctx);
     } else {
         /* Sequential fallback */
         for (size_t w = 0; w < expandable; w++) {
@@ -4130,6 +4160,8 @@ static bool expand_containers_pass(entry_list_t *el) {
                 progrez_set_label(el->progress, label_buf);
                 progrez_update(el->progress, w + 1, 0);
             }
+            if (el->expansion_progress_fn)
+                el->expansion_progress_fn(w + 1, expandable, el->expansion_progress_ctx);
         }
     }
 

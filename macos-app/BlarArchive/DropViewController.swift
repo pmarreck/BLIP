@@ -382,6 +382,7 @@ class DropZoneView: NSView {
         iconView.image = NSImage(systemSymbolName: "arrow.down.doc", accessibilityDescription: "Drop files")
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 48, weight: .light)
         iconView.contentTintColor = .tertiaryLabelColor
+        iconView.unregisterDraggedTypes()  // let drags pass through to parent
         addSubview(iconView)
 
         label = NSTextField(labelWithString: "Drop files or folders here")
@@ -408,6 +409,11 @@ class DropZoneView: NSView {
         } else {
             unregisterDraggedTypes()
         }
+    }
+
+    // Ensure the drop zone captures all drag events, even over child views
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        return self.bounds.contains(point) ? self : nil
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
