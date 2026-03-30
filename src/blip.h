@@ -547,6 +547,17 @@ int32_t blip_zlib_decompress(const uint8_t *data, size_t data_len,
 int32_t blip_zlib_compress(const uint8_t *data, size_t data_len,
     uint8_t **out, size_t *out_len);
 
+/* Decompress gzip data. Caller must free output with blip_free(). */
+int32_t blip_gz_decompress(const uint8_t *data, size_t data_len,
+    uint8_t **out, size_t *out_len);
+
+/* Compress data to gzip format. Caller must free output with blip_free(). */
+int32_t blip_gz_compress(const uint8_t *data, size_t data_len,
+    uint8_t **out, size_t *out_len);
+
+/* Check if buffer starts with gzip magic bytes (0x1f 0x8b). */
+bool blip_is_gz(const uint8_t *buf, size_t buf_len);
+
 /* Remove PNG-style row filters from FlateDecode data.
  * Returns raw pixels. Caller must free with blip_free(). */
 int32_t blip_pdf_defilter(const uint8_t *data, size_t data_len,

@@ -684,6 +684,7 @@ static int cmd_list(int argc, char **argv) {
                     if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
                     else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
+                    else if (strcmp(codec->name, "gz") == 0) type_char = 'g';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
@@ -1111,6 +1112,7 @@ static int cmd_info(int argc, char **argv) {
                     if (strcmp(codec->name, "pdf") == 0) type_char = 'p';
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
                     else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
+                    else if (strcmp(codec->name, "gz") == 0) type_char = 'g';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */

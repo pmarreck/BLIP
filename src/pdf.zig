@@ -909,6 +909,54 @@ pub fn zlibCompress(allocator: Allocator, data: []const u8) ![]u8 {
     return buf[0..result_len];
 }
 
+/// Decompress gzip data. Caller owns returned slice.
+pub fn gzipDecompress(allocator: Allocator, compressed: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var source_reader = std.Io.Reader.fixed(compressed);
+    var empty_buf: [0]u8 = .{};
+    var decompress_state = flate.Decompress.init(&source_reader, .gzip, &empty_buf);
+    return decompress_state.reader.allocRemaining(allocator, .unlimited) catch
+        return error.InvalidData;
+}
+
+/// Compress data to gzip format using C zlib (real deflate compression).
+pub fn gzipCompress(allocator: Allocator, data: []const u8) ![]u8 {
+    // compressBound gives upper bound; add 18 bytes for gzip header/trailer overhead
+    const bound = c_zlib.compressBound(@intCast(data.len)) + 18;
+    const buf = try allocator.alloc(u8, bound);
+    errdefer allocator.free(buf);
+
+    var stream: c_zlib.z_stream = std.mem.zeroes(c_zlib.z_stream);
+    stream.next_in = @constCast(data.ptr);
+    stream.avail_in = @intCast(data.len);
+    stream.next_out = buf.ptr;
+    stream.avail_out = @intCast(buf.len);
+
+    // windowBits = 15 + 16 = 31 for gzip format
+    var rc = c_zlib.deflateInit2_(
+        &stream,
+        c_zlib.Z_DEFAULT_COMPRESSION,
+        c_zlib.Z_DEFLATED,
+        15 + 16, // windowBits: 15 + 16 = gzip
+        8, // memLevel
+        c_zlib.Z_DEFAULT_STRATEGY,
+        c_zlib.ZLIB_VERSION,
+        @sizeOf(c_zlib.z_stream),
+    );
+    if (rc != c_zlib.Z_OK) return error.InvalidData;
+
+    rc = c_zlib.deflate(&stream, c_zlib.Z_FINISH);
+    _ = c_zlib.deflateEnd(&stream);
+    if (rc != c_zlib.Z_STREAM_END) return error.InvalidData;
+
+    const result_len: usize = @intCast(stream.total_out);
+    // Shrink allocation to actual size
+    if (result_len < buf.len) {
+        return allocator.realloc(buf, result_len) catch buf[0..result_len];
+    }
+    return buf[0..result_len];
+}
+
 fn paethPredictor(a: i16, b: i16, c: i16) u8 {
     const p = a + b - c;
     const pa = @as(u16, @intCast(if (p > a) p - a else a - p));

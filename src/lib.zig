@@ -1854,6 +1854,38 @@ export fn blip_zlib_compress(
     return 0;
 }
 
+/// Decompress gzip data. Caller must free output with blip_free.
+export fn blip_gz_decompress(
+    data: [*]const u8,
+    data_len: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.gzipDecompress(page_allocator, data[0..data_len]) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Compress data to gzip format. Caller must free output with blip_free.
+export fn blip_gz_compress(
+    data: [*]const u8,
+    data_len: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    const result = pdf_mod.gzipCompress(page_allocator, data[0..data_len]) catch return -41;
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+/// Check if buffer starts with gzip magic bytes (0x1f 0x8b).
+export fn blip_is_gz(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return buf_len >= 2 and buf[0] == 0x1f and buf[1] == 0x8b;
+}
+
+
 /// Remove PNG-style row filters from FlateDecode data.
 /// Returns raw pixel data. Caller must free output with blip_free.
 export fn blip_pdf_defilter(
