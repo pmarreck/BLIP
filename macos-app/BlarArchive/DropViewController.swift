@@ -246,6 +246,34 @@ class DropViewController: NSViewController {
             return
         }
 
+        // Check if any output directories already exist and are non-empty
+        let fm = FileManager.default
+        var existingDirs: [String] = []
+        for url in urls {
+            let outputDir = url.deletingPathExtension()
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: outputDir.path, isDirectory: &isDir) && isDir.boolValue {
+                if let contents = try? fm.contentsOfDirectory(atPath: outputDir.path), !contents.isEmpty {
+                    existingDirs.append(outputDir.lastPathComponent)
+                }
+            }
+        }
+        if !existingDirs.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Overwrite existing files?"
+            if existingDirs.count == 1 {
+                alert.informativeText = "'\(existingDirs[0])' already exists and is not empty."
+            } else {
+                alert.informativeText = "\(existingDirs.count) output directories already exist and are not empty:\n\(existingDirs.prefix(5).joined(separator: ", "))\(existingDirs.count > 5 ? "..." : "")"
+            }
+            alert.addButton(withTitle: "Overwrite")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            if alert.runModal() != .alertFirstButtonReturn {
+                return
+            }
+        }
+
         statusLabel.stringValue = "Extracting..."
         progressBar.isHidden = false
         progressBar.doubleValue = 0
