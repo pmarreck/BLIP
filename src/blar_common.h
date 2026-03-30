@@ -4008,12 +4008,27 @@ typedef struct {
     bool expand_all_zips;
 } expand_worker_ctx_t;
 
+/* Shared state for work-stealing expansion threads */
+typedef struct {
+    expand_worker_ctx_t *workers;
+    size_t total;
+    _Atomic size_t next_index;  /* atomic counter — each thread grabs the next available item */
+} expand_work_queue_t;
+
 static void *expand_worker(void *arg) {
-    expand_worker_ctx_t *ctx = (expand_worker_ctx_t *)arg;
-    entry_list_init(&ctx->result);
-    ctx->result.expand_all_zips = ctx->expand_all_zips;
-    ctx->success = ((blar_expand_fn)ctx->codec->expand)(
-        &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy);
+    expand_work_queue_t *queue = (expand_work_queue_t *)arg;
+
+    while (1) {
+        /* Atomically grab the next work item */
+        size_t idx = atomic_fetch_add(&queue->next_index, 1);
+        if (idx >= queue->total) break;
+
+        expand_worker_ctx_t *ctx = &queue->workers[idx];
+        entry_list_init(&ctx->result);
+        ctx->result.expand_all_zips = ctx->expand_all_zips;
+        ctx->success = ((blar_expand_fn)ctx->codec->expand)(
+            &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy);
+    }
     return NULL;
 }
 
@@ -4080,30 +4095,25 @@ static bool expand_containers_pass(entry_list_t *el) {
     }
     if (num_threads > expandable) num_threads = expandable;
 
-    /* Parallel expansion: each worker gets its own entry_list */
+    /* Parallel expansion: work-stealing queue — each thread grabs the
+     * next available file when done, no waiting for batch boundaries. */
     if (num_threads > 1) {
-        /* Process in batches of num_threads */
-        for (size_t batch_start = 0; batch_start < expandable; batch_start += num_threads) {
-            size_t batch_end = batch_start + num_threads;
-            if (batch_end > expandable) batch_end = expandable;
-            size_t batch_size = batch_end - batch_start;
+        expand_work_queue_t queue = {
+            .workers = workers,
+            .total = expandable,
+            .next_index = 0,
+        };
 
-            pthread_t *threads = malloc(batch_size * sizeof(pthread_t));
-            if (!threads) { free(workers); return false; }
+        pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+        if (!threads) { free(workers); return false; }
 
-            for (size_t t = 0; t < batch_size; t++) {
-                pthread_create(&threads[t], NULL, expand_worker, &workers[batch_start + t]);
-            }
-            for (size_t t = 0; t < batch_size; t++) {
-                pthread_join(threads[t], NULL);
-            }
-            free(threads);
-
-            /* Update progress after each batch */
-            if (el->progress) {
-                progrez_update(el->progress, batch_end, 0);
-            }
+        for (size_t t = 0; t < num_threads; t++) {
+            pthread_create(&threads[t], NULL, expand_worker, &queue);
         }
+        for (size_t t = 0; t < num_threads; t++) {
+            pthread_join(threads[t], NULL);
+        }
+        free(threads);
     } else {
         /* Sequential fallback */
         for (size_t w = 0; w < expandable; w++) {
