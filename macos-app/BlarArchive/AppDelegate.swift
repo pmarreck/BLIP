@@ -14,7 +14,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "BLAR Archive"
+        window.title = "Blip Archiver"
         window.contentViewController = dropViewController
         window.center()
         window.makeKeyAndOrderFront(nil)

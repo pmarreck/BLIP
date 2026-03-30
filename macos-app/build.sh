@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build BLAR Archive macOS app
+# Build Blip Archiver macOS app
 # Must be run from the macos-app/ directory or BLIP root
 # Requires: nix develop shell (for libjxl, zlib, etc.)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BLIP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-APP_BUNDLE="$BUILD_DIR/BLAR Archive.app"
+APP_BUNDLE="$BUILD_DIR/Blip Archiver.app"
 
 SDK="$(xcrun --show-sdk-path)"
 ARCH="$(uname -m)"
 
-echo "=== Building BLAR Archive ==="
+echo "=== Building Blip Archiver ==="
 
 # Step 1: Build libblip.a via Zig
 echo "Building libblip.a..."
