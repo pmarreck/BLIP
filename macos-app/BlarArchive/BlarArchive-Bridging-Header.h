@@ -43,6 +43,14 @@ void blar_gui_read_xattrs(const char *path,
 void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
                             uint8_t *resource_fork);
 
+/* Create archive from paths with container expansion */
+int blar_gui_create(const char *const *paths, size_t path_count,
+                     uint8_t per_file_comp, uint8_t num_threads,
+                     _Bool expand_containers, _Bool expand_all_zips,
+                     blar_extract_progress_fn progress_fn,
+                     void *progress_ctx,
+                     uint8_t **out_buf, size_t *out_len);
+
 int blar_gui_extract(const uint8_t *buf, size_t buf_len,
                       const char *output_dir,
                       const blar_codec_t *codecs, size_t codec_count,

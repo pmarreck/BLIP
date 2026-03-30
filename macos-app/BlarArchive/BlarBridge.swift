@@ -30,6 +30,8 @@ typealias ProgressCallback = (Double) -> Void
 class BlarBridge {
 
     /// Create a blar archive from the given file/directory paths.
+    /// Uses blar_gui_create which handles file collection, container expansion,
+    /// metadata/xattr preservation, and archive serialization via the C layer.
     static func createArchive(
         paths: [URL],
         outputPath: URL,
@@ -41,180 +43,25 @@ class BlarBridge {
         threads: UInt8 = 0,
         progress: @escaping ProgressCallback
     ) throws {
-        // Collect all files (recursing directories)
-        var allFiles: [(path: String, url: URL)] = []
-        let fm = FileManager.default
-        for url in paths {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
-            if isDir.boolValue {
-                // Don't resolve aliases/symlinks — treat them as regular files
-                if let enumerator = fm.enumerator(
-                    at: url,
-                    includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .isAliasFileKey],
-                    options: [.producesRelativePathURLs]
-                ) {
-                    while let fileURL = enumerator.nextObject() as? URL {
-                        let fullURL = url.appendingPathComponent(fileURL.relativePath)
-                        let relPath = url.lastPathComponent + "/" + fileURL.relativePath
-                        allFiles.append((relPath, fullURL))
-                    }
-                }
-            } else {
-                allFiles.append((url.lastPathComponent, url))
-            }
-        }
-
-        // Build entry array
-        var entries: [blip_archive_entry] = []
-        var contentBuffers: [Data] = [] // keep data alive
-
-        for (path, url) in allFiles {
-            var isDir: ObjCBool = false
-            fm.fileExists(atPath: url.path, isDirectory: &isDir)
-
-            var entry = blip_archive_entry()
-            // Zero all fields
-            memset(&entry, 0, MemoryLayout<blip_archive_entry>.size)
-            entry.pdf_stream_offset = UInt64.max
-            entry.pdf_stream_length = UInt64.max
-            entry.zip_compression_method = 0xFFFF
-
-            if isDir.boolValue {
-                let dirPath = path.hasSuffix("/") ? path : path + "/"
-                let pathData = dirPath.data(using: .utf8)!
-                contentBuffers.append(pathData)
-                pathData.withUnsafeBytes { ptr in
-                    entry.path = ptr.baseAddress!.assumingMemoryBound(to: CChar.self)
-                    entry.path_len = pathData.count
-                }
-                entry.is_dir = 1
-
-                // Get directory metadata
-                if let attrs = try? fm.attributesOfItem(atPath: url.path) {
-                    entry.mode = UInt16((attrs[.posixPermissions] as? Int) ?? 0o755)
-                    if let mtime = attrs[.modificationDate] as? Date {
-                        entry.mtime_ns = Int64(mtime.timeIntervalSince1970 * 1_000_000_000)
-                    }
-                }
-                entries.append(entry)
-            } else {
-                let pathData = path.data(using: .utf8)!
-                contentBuffers.append(pathData)
-                // Read raw file data (don't resolve aliases — read the alias file itself)
-                let fileData: Data
-                do {
-                    // Use POSIX open to avoid alias resolution
-                    let fd = open(url.path, O_RDONLY | O_NOFOLLOW)
-                    if fd >= 0 {
-                        defer { close(fd) }
-                        var st = stat()
-                        fstat(fd, &st)
-                        let size = Int(st.st_size)
-                        if size > 0 {
-                            var buf = Data(count: size)
-                            let bytesRead = buf.withUnsafeMutableBytes { ptr in
-                                read(fd, ptr.baseAddress!, size)
-                            }
-                            fileData = bytesRead > 0 ? Data(buf.prefix(bytesRead)) : Data()
-                        } else {
-                            fileData = Data()
-                        }
-                    } else {
-                        // Fallback for files that can't be opened with O_NOFOLLOW
-                        fileData = try Data(contentsOf: url, options: .mappedIfSafe)
-                    }
-                } catch {
-                    NSLog("Warning: skipping unreadable file '%@': %@", url.path, error.localizedDescription)
-                    continue
-                }
-                contentBuffers.append(fileData)
-
-                pathData.withUnsafeBytes { pathPtr in
-                    entry.path = pathPtr.baseAddress!.assumingMemoryBound(to: CChar.self)
-                    entry.path_len = pathData.count
-                }
-                fileData.withUnsafeBytes { contentPtr in
-                    entry.content = contentPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                    entry.content_len = fileData.count
-                }
-                entry.is_dir = 0
-
-                if let attrs = try? fm.attributesOfItem(atPath: url.path) {
-                    entry.mode = UInt16((attrs[.posixPermissions] as? Int) ?? 0o644)
-                    if let mtime = attrs[.modificationDate] as? Date {
-                        entry.mtime_ns = Int64(mtime.timeIntervalSince1970 * 1_000_000_000)
-                    }
-                }
-
-                // Read xattrs and resource fork
-                var xattrs: UnsafeMutablePointer<blip_xattr_entry>? = nil
-                var xattrCount: Int = 0
-                var rfork: UnsafeMutablePointer<UInt8>? = nil
-                var rforkLen: Int = 0
-                blar_gui_read_xattrs(url.path, &xattrs, &xattrCount, &rfork, &rforkLen)
-                if xattrCount > 0 {
-                    entry.xattrs = UnsafePointer(xattrs)
-                    entry.xattr_count = xattrCount
-                }
-                if rforkLen > 0 {
-                    entry.resource_fork = UnsafePointer(rfork)
-                    entry.resource_fork_len = rforkLen
-                }
-
-                entries.append(entry)
-            }
-        }
-
-        // Progress bridge
-        let progressBridge = ProgressBridge(callback: progress, totalBytes: UInt64(allFiles.count))
-        let bridgePtr = Unmanaged.passRetained(progressBridge).toOpaque()
-
-        let progressFn: @convention(c) (UInt64, UInt64, UnsafeMutableRawPointer?) -> Void = { done, total, ctx in
-            guard let ctx = ctx else { return }
-            let bridge = Unmanaged<ProgressBridge>.fromOpaque(ctx).takeUnretainedValue()
-            let fraction = bridge.totalBytes > 0 ? Double(done) / Double(bridge.totalBytes) : 0
-            DispatchQueue.main.async {
-                bridge.callback(min(fraction, 1.0))
-            }
-        }
-
-        // Create archive
-        var archiveBuf: UnsafeMutablePointer<UInt8>? = nil
-        var archiveLen: Int = 0
+        // Convert URLs to C string paths
+        let pathStrings = paths.map { $0.path }
         let perFileComp = solid ? UInt8(0) : compression.rawValue
 
-        let flags: UInt32 = expandContainers ? 0 : 0x04 // BLIP_ARCHIVE_NO_EXPAND_CONTAINERS
+        var archiveBuf: UnsafeMutablePointer<UInt8>? = nil
+        var archiveLen: Int = 0
 
-        let entryCount = entries.count
-        let rc = entries.withUnsafeMutableBufferPointer { entriesPtr -> Int32 in
-            return blip_archive_create_full(
-                entriesPtr.baseAddress,
-                entryCount,
-                flags,
-                perFileComp,
-                threads,
-                progressFn,
-                nil,  // phase callback
-                bridgePtr,
-                &archiveBuf,
-                &archiveLen
+        // Call C layer which does: collect entries → expand containers → create archive
+        let rc: Int32 = pathStrings.withCStringArray { cPaths in
+            return blar_gui_create(
+                cPaths, paths.count,
+                perFileComp, threads,
+                expandContainers, false, // expand_all_zips = false
+                nil, nil, // progress (TODO: wire up)
+                &archiveBuf, &archiveLen
             )
         }
 
-        // Free xattr/resource fork data now that entries are serialized
-        for entry in entries {
-            if entry.xattr_count > 0 || entry.resource_fork_len > 0 {
-                blar_gui_free_xattrs(
-                    UnsafeMutablePointer(mutating: entry.xattrs),
-                    entry.xattr_count,
-                    UnsafeMutablePointer(mutating: entry.resource_fork)
-                )
-            }
-        }
-
-        if rc != 0 { // BLIP_OK = 0
-            Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
+        if rc != 0 {
             throw BlarError.createFailed(rc)
         }
 
@@ -227,12 +74,11 @@ class BlarBridge {
             let compRc = blip_compress_container(
                 archiveBuf, archiveLen,
                 compression.rawValue, threads,
-                progressFn, nil, bridgePtr,
+                nil, nil, nil,
                 &compBuf, &compLen
             )
             blip_free(archiveBuf, archiveLen)
             if compRc != 0 {
-                Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
                 throw BlarError.compressionFailed(compRc)
             }
             finalBuf = compBuf
@@ -254,7 +100,6 @@ class BlarBridge {
             }
             blip_free(finalBuf, finalLen)
             if encRc != 0 {
-                Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
                 throw BlarError.encryptionFailed(encRc)
             }
             finalBuf = encBuf
@@ -263,12 +108,10 @@ class BlarBridge {
 
         // Write to disk
         guard let data = finalBuf else {
-            Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
             throw BlarError.writeFailed("No archive data")
         }
         let archiveData = Data(bytes: data, count: finalLen)
         blip_free(finalBuf, finalLen)
-        Unmanaged<ProgressBridge>.fromOpaque(bridgePtr).release()
 
         try archiveData.write(to: outputPath)
         DispatchQueue.main.async { progress(1.0) }
@@ -398,6 +241,20 @@ class BlarBridge {
         }
 
         DispatchQueue.main.async { progress(1.0) }
+    }
+}
+
+/// Helper: convert [String] to C string array for FFI calls
+extension Array where Element == String {
+    func withCStringArray<R>(_ body: (UnsafePointer<UnsafePointer<CChar>?>) -> R) -> R {
+        let cStrings = self.map { strdup($0) }
+        defer { cStrings.forEach { free($0) } }
+        return cStrings.withUnsafeBufferPointer { buf in
+            // Cast UnsafeMutablePointer<CChar>? array to UnsafePointer<CChar>? array
+            buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: cStrings.count) { ptr in
+                body(ptr)
+            }
+        }
     }
 }
 

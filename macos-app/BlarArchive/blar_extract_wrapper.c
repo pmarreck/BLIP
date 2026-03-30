@@ -1,29 +1,64 @@
-/* Thin wrapper to expose blar_extract_to_dir() from blar_common.h
- * to the macOS GUI app. blar_common.h is a header-only library with
- * static functions — this compilation unit instantiates them and
- * provides an extern-linkage entry point for Swift.
+/* GUI wrapper — exposes blar_common.h functions to Swift.
  *
- * progrez.h is stubbed by a local progrez.h in this directory
- * (included via -I before the real one). The GUI app uses
- * NSProgressIndicator instead of terminal progress bars. */
+ * All archive creation (with container expansion) and extraction logic
+ * lives in blar_common.h. This file just provides extern-linkage entry
+ * points that Swift can call through the bridging header.
+ *
+ * progrez.h is stubbed by a local progrez.h in this directory — the GUI
+ * uses NSProgressIndicator instead of terminal progress bars. */
 
 #include "../../src/blip.h"
 #include "../../src/blar_common.h"
 
-/* Read xattrs and resource fork for a file — wraps blar_common.h static function */
-void blar_gui_read_xattrs(const char *path,
-                           blip_xattr_entry **out_xattrs, size_t *out_count,
-                           uint8_t **out_resource_fork, size_t *out_resource_fork_len) {
-    read_file_xattrs(path, out_xattrs, out_count, out_resource_fork, out_resource_fork_len);
+/* ── Archive creation ─────────────────────────────────────────────────── */
+
+int blar_gui_create(const char *const *paths, size_t path_count,
+                     uint8_t per_file_comp, uint8_t num_threads,
+                     bool expand_containers, bool expand_all_zips,
+                     blar_extract_progress_fn progress_fn,
+                     void *progress_ctx,
+                     uint8_t **out_buf, size_t *out_len) {
+    entry_list_t el;
+    entry_list_init(&el);
+    el.expand_containers = expand_containers;
+    el.expand_all_zips = expand_all_zips;
+    el.num_threads = num_threads;
+
+    for (size_t i = 0; i < path_count; i++) {
+        if (!collect_entries_recurse(paths[i], &el)) {
+            entry_list_free(&el);
+            return -1;
+        }
+    }
+
+    if (el.count == 0) {
+        entry_list_free(&el);
+        return -1;
+    }
+
+    if (el.expand_containers) {
+        if (!expand_containers_pass(&el)) {
+            entry_list_free(&el);
+            return -1;
+        }
+    }
+
+    uint8_t *archive_buf = NULL;
+    size_t archive_len = 0;
+    int32_t rc = blip_archive_create_full(el.entries, el.count, 0,
+                                           per_file_comp, num_threads,
+                                           NULL, NULL, NULL,
+                                           &archive_buf, &archive_len);
+    entry_list_free(&el);
+    if (rc != 0) return rc;
+
+    *out_buf = archive_buf;
+    *out_len = archive_len;
+    return 0;
 }
 
-/* Free xattr data */
-void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
-                            uint8_t *resource_fork) {
-    free_file_xattrs(xattrs, count, resource_fork);
-}
+/* ── Archive extraction ───────────────────────────────────────────────── */
 
-/* Extern-linkage wrapper callable from Swift */
 int blar_gui_extract(const uint8_t *buf, size_t buf_len,
                       const char *output_dir,
                       const blar_codec_t *codecs, size_t codec_count,
@@ -36,4 +71,17 @@ int blar_gui_extract(const uint8_t *buf, size_t buf_len,
     };
     return blar_extract_to_dir(buf, buf_len, output_dir, &registry,
                                 progress_fn, log_fn, callback_ctx);
+}
+
+/* ── Xattr helpers ────────────────────────────────────────────────────── */
+
+void blar_gui_read_xattrs(const char *path,
+                           blip_xattr_entry **out_xattrs, size_t *out_count,
+                           uint8_t **out_resource_fork, size_t *out_resource_fork_len) {
+    read_file_xattrs(path, out_xattrs, out_count, out_resource_fork, out_resource_fork_len);
+}
+
+void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
+                            uint8_t *resource_fork) {
+    free_file_xattrs(xattrs, count, resource_fork);
 }
