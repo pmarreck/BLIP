@@ -367,4 +367,21 @@ class OptionsPanel: NSViewController {
         }
         return nil
     }
+
+    // MARK: - Programmatic control (for CLI arguments)
+
+    /// Set all controls from CLI options and update the UI to reflect them
+    func applyOptions(_ opts: CLIOptions) {
+        // Compression: find the index in compressionMap
+        if let idx = Self.compressionMap.firstIndex(of: opts.compression) {
+            compressionPopup.selectItem(at: idx)
+        }
+        solidCheckbox.state = opts.solid ? .on : .off
+        encryptionPopup.selectItem(at: Int(opts.encryption.rawValue))
+        if let pw = opts.password {
+            passwordField.stringValue = pw
+            passwordPlainField.stringValue = pw
+        }
+        expandCheckbox.state = opts.expandContainers ? .on : .off
+    }
 }

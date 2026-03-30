@@ -6,6 +6,7 @@ class DropViewController: NSViewController {
     private var progressBar: NSProgressIndicator!
     private var optionsPanel: OptionsPanel!
     private var optionsContainer: NSView!
+    var autoQuit: Bool = false  // quit after processing (CLI mode)
 
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 420))
@@ -90,6 +91,28 @@ class DropViewController: NSViewController {
     }
 
     // MARK: - Drop handling
+
+    /// Apply CLI options: set the GUI controls and auto-quit flag
+    func applyCLIOptions(_ opts: CLIOptions) {
+        autoQuit = opts.autoQuit
+        optionsPanel.applyOptions(opts)
+    }
+
+    /// Report stats to stderr (for CLI/scripted usage)
+    private func reportStats(_ message: String) {
+        if autoQuit {
+            fputs("\(message)\n", stderr)
+        }
+    }
+
+    /// Quit the app if in auto-quit mode
+    private func autoQuitIfNeeded() {
+        if autoQuit {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                NSApp.terminate(nil)
+            }
+        }
+    }
 
     func handleDroppedURLs(_ urls: [URL]) {
         let blarFiles = urls.filter { $0.pathExtension == "blar" }
@@ -221,15 +244,21 @@ class DropViewController: NSViewController {
                     let pct = originalSize > 0 ? Double(archiveSize) / Double(originalSize) * 100.0 : 100.0
                     let mbPerSec = elapsed > 0 ? Double(originalSize) / 1024.0 / 1024.0 / elapsed : 0
                     let timeStr = elapsed < 60 ? String(format: "%.1fs", elapsed) : String(format: "%dm%02ds", Int(elapsed) / 60, Int(elapsed) % 60)
-                    self?.statusLabel.stringValue = "Created \(outputPath.lastPathComponent) (\(origStr) → \(archStr), \(String(format: "%.1f", pct))%) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
+                    let statusMsg = "Created \(outputPath.lastPathComponent) (\(origStr) → \(archStr), \(String(format: "%.1f", pct))%) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
+                    self?.statusLabel.stringValue = statusMsg
+                    self?.reportStats(statusMsg)
                     self?.progressBar.isHidden = true
                     self?.dropZone.setEnabled(true)
+                    self?.autoQuitIfNeeded()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.statusLabel.stringValue = "Error: \(error.localizedDescription)"
+                    let errMsg = "Error: \(error.localizedDescription)"
+                    self?.statusLabel.stringValue = errMsg
+                    self?.reportStats(errMsg)
                     self?.progressBar.isHidden = true
                     self?.dropZone.setEnabled(true)
+                    self?.autoQuitIfNeeded()
                 }
             }
         }
@@ -340,12 +369,16 @@ class DropViewController: NSViewController {
                     let label = successCount == 1 ? urls[0].deletingPathExtension().lastPathComponent : "\(successCount) archive(s)"
                     let mbPerSec = elapsed > 0 ? Double(totalExtractedSize) / 1024.0 / 1024.0 / elapsed : 0
                     let timeStr = elapsed < 60 ? String(format: "%.1fs", elapsed) : String(format: "%dm%02ds", Int(elapsed) / 60, Int(elapsed) % 60)
-                    self?.statusLabel.stringValue = "Extracted \(label) (\(archStr) → \(extStr)) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
+                    let statusMsg = "Extracted \(label) (\(archStr) → \(extStr)) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
+                    self?.statusLabel.stringValue = statusMsg
+                    self?.reportStats(statusMsg)
                 } else {
                     self?.statusLabel.stringValue = "Extraction failed"
+                    self?.reportStats("Extraction failed")
                 }
                 self?.progressBar.isHidden = true
                 self?.dropZone.setEnabled(true)
+                self?.autoQuitIfNeeded()
             }
         }
     }

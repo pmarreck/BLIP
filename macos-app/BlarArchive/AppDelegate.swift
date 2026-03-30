@@ -4,6 +4,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var dropViewController: DropViewController!
     var pendingURLs: [URL]?
+    var cliOptions: CLIOptions = CLIOptions()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
@@ -23,6 +24,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+
+        // Apply CLI options to the options panel if provided
+        if cliOptions.hasOptions {
+            dropViewController.applyCLIOptions(cliOptions)
+        }
 
         // Process any files that were opened before the window was ready
         if let urls = pendingURLs {
