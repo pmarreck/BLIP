@@ -554,6 +554,10 @@ PNGs use zlib compression internally, which LZMA2 can't improve on. `blar` decom
 
 ZIP files contain individually deflate-compressed entries that LZMA2 can't shrink further. `blar` decompresses ZIP entries and stores them as a directory tree, letting LZMA2 compress the raw content. The ZIP structure is preserved for byte-identical reconstruction.
 
+**Gzip container expansion:**
+
+Gzip (.gz) files contain a single deflate-compressed stream. `blar` decompresses the content so LZMA2 can compress the raw data far more effectively. On extraction, the content is recompressed to gzip. Note: extracted gzip files are content-identical (same decompressed output) but not byte-identical (the gzip compression level/strategy is not preserved in the format).
+
 **Controlling expansion:**
 
 ```bash
@@ -563,7 +567,7 @@ blar create -z -o archive.blar documents/
 # Disable expansion (store files as opaque blobs)
 blar create -z --no-expand-containers -o archive.blar documents/
 
-# List shows container types: p=PDF, n=PNG, z=ZIP, d=dir, -=file
+# List shows container types: p=PDF, n=PNG, j=JPEG, g=gzip, z=ZIP, d=dir, -=file
 blar list archive.blar
 ```
 

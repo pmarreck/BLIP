@@ -3687,6 +3687,11 @@ static bool expand_jpeg_container(entry_list_t *el,
     return true;
 }
 
+/* Gzip container expansion: decompress for better LZMA2 compression,
+ * recompress to gzip on extraction. NOTE: extraction produces
+ * content-identical but NOT byte-identical gzip output - the original
+ * compression level/strategy is not preserved in the gzip format.
+ * zcat on both files produces identical output. */
 static bool expand_gz_container(entry_list_t *el,
                                 const uint8_t *content, size_t content_len,
                                 const blip_archive_entry *file_entry) {
