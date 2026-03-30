@@ -3996,28 +3996,70 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
  * so we know the total count and can show determinate progress.
  * Expanded entries replace the original at its index (DIR entry) and
  * append child entries at the end of the list. */
+/* Worker context for parallel container expansion */
+typedef struct {
+    size_t index;                        /* index in main entry list */
+    blip_archive_entry entry_copy;       /* copy of the original entry */
+    const uint8_t *content;              /* pointer to file content */
+    size_t content_len;
+    const blar_codec_t *codec;           /* detected codec */
+    entry_list_t result;                 /* per-worker result list */
+    bool success;                        /* did expansion succeed? */
+    bool expand_all_zips;
+} expand_worker_ctx_t;
+
+static void *expand_worker(void *arg) {
+    expand_worker_ctx_t *ctx = (expand_worker_ctx_t *)arg;
+    entry_list_init(&ctx->result);
+    ctx->result.expand_all_zips = ctx->expand_all_zips;
+    ctx->success = ((blar_expand_fn)ctx->codec->expand)(
+        &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy);
+    return NULL;
+}
+
 static bool expand_containers_pass(entry_list_t *el) {
-    /* Count expandable files and their total bytes for progress */
+    /* First pass: identify expandable entries */
     size_t expandable = 0;
     uint64_t total_expandable_bytes = 0;
+
+    /* Collect indices and codecs of expandable entries */
+    size_t exp_cap = 64;
+    expand_worker_ctx_t *workers = malloc(exp_cap * sizeof(expand_worker_ctx_t));
+    if (!workers) return false;
+
     for (size_t i = 0; i < el->count; i++) {
         if (el->entries[i].is_dir) continue;
         const uint8_t *content = el->entries[i].content;
         size_t content_len = el->entries[i].content_len;
         const blar_codec_t *codec = blar_codec_detect(&builtin_registry, content, content_len);
         if (codec) {
-            /* ZIP special case: skip archives unless --expand-all-zips */
             if (strcmp(codec->name, "zip") == 0 &&
                 !el->expand_all_zips && is_archive_extension(el->entries[i].path)) {
                 codec = NULL;
             }
         }
         if (codec) {
+            if (expandable >= exp_cap) {
+                exp_cap *= 2;
+                workers = realloc(workers, exp_cap * sizeof(expand_worker_ctx_t));
+                if (!workers) return false;
+            }
+            workers[expandable].index = i;
+            workers[expandable].entry_copy = el->entries[i];
+            workers[expandable].content = content;
+            workers[expandable].content_len = content_len;
+            workers[expandable].codec = codec;
+            workers[expandable].success = false;
+            workers[expandable].expand_all_zips = el->expand_all_zips;
             expandable++;
             total_expandable_bytes += content_len;
         }
     }
-    if (expandable == 0) return true;
+
+    if (expandable == 0) {
+        free(workers);
+        return true;
+    }
 
     /* Set up progress for expansion phase */
     if (el->progress) {
@@ -4026,68 +4068,142 @@ static bool expand_containers_pass(entry_list_t *el) {
         progrez_update(el->progress, 0, 0);
     }
 
-    /* Iterate over the ORIGINAL count — expansion appends new entries
-     * beyond this range, so we won't re-process them. */
-    size_t original_count = el->count;
-    size_t done = 0;
-    uint64_t bytes_expanded = 0;
-    for (size_t i = 0; i < original_count; i++) {
-        if (el->entries[i].is_dir) continue;
-        const uint8_t *content = el->entries[i].content;
-        size_t content_len = el->entries[i].content_len;
+    /* Determine thread count */
+    size_t num_threads = el->num_threads;
+    if (num_threads == 0) {
+#ifdef _SC_NPROCESSORS_ONLN
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = n > 0 ? (size_t)n : 1;
+#else
+        num_threads = 4;
+#endif
+    }
+    if (num_threads > expandable) num_threads = expandable;
 
-        /* Copy the entry by value — expand_*_container() calls entry_list_add()
-         * which may realloc el->entries, invalidating any pointer into it. */
-        blip_archive_entry entry_copy = el->entries[i];
+    /* Parallel expansion: each worker gets its own entry_list */
+    if (num_threads > 1) {
+        /* Process in batches of num_threads */
+        for (size_t batch_start = 0; batch_start < expandable; batch_start += num_threads) {
+            size_t batch_end = batch_start + num_threads;
+            if (batch_end > expandable) batch_end = expandable;
+            size_t batch_size = batch_end - batch_start;
 
-        bool expanded = false;
+            pthread_t *threads = malloc(batch_size * sizeof(pthread_t));
+            if (!threads) { free(workers); return false; }
 
-        /* Update label with current filename */
-        if (el->progress) {
-            const char *basename = strrchr(entry_copy.path, '/');
-            basename = basename ? basename + 1 : entry_copy.path;
-            char label_buf[256];
-            snprintf(label_buf, sizeof(label_buf), "Expanding: %s", basename);
-            progrez_set_label(el->progress, label_buf);
-        }
+            for (size_t t = 0; t < batch_size; t++) {
+                pthread_create(&threads[t], NULL, expand_worker, &workers[batch_start + t]);
+            }
+            for (size_t t = 0; t < batch_size; t++) {
+                pthread_join(threads[t], NULL);
+            }
+            free(threads);
 
-        /* Detect and expand via codec registry */
-        {
-            const blar_codec_t *codec = blar_codec_detect(&builtin_registry, content, content_len);
-            if (codec) {
-                /* ZIP special case: skip archives unless --expand-all-zips */
-                if (strcmp(codec->name, "zip") == 0 &&
-                    !el->expand_all_zips && is_archive_extension(entry_copy.path)) {
-                    codec = NULL;
-                }
-                if (codec && ((blar_expand_fn)codec->expand)(el, content, content_len, &entry_copy)) {
-                    expanded = true;
-                }
+            /* Update progress after each batch */
+            if (el->progress) {
+                progrez_update(el->progress, batch_end, 0);
             }
         }
+    } else {
+        /* Sequential fallback */
+        for (size_t w = 0; w < expandable; w++) {
+            entry_list_init(&workers[w].result);
+            workers[w].result.expand_all_zips = workers[w].expand_all_zips;
+            workers[w].success = ((blar_expand_fn)workers[w].codec->expand)(
+                &workers[w].result, workers[w].content, workers[w].content_len, &workers[w].entry_copy);
 
-        if (expanded) {
-            /* The expand_*_container functions appended new entries to el.
-             * The original entry at index i was passed as file_entry
-             * (used for metadata). We need to remove the opaque entry at
-             * index i since the expanded DIR+children replaced it.
-             * The expand functions already added the DIR entry — we just
-             * need to mark this slot as consumed. Overwrite with the last
-             * original entry and adjust. Actually — the expand functions
-             * add entries at the end, including the DIR. So the original
-             * opaque entry at index i is now stale. Remove it by shifting. */
-            /* Shift remaining entries down */
-            memmove(&el->entries[i], &el->entries[i + 1],
-                    (el->count - i - 1) * sizeof(blip_archive_entry));
-            el->count--;
-            original_count--;
-            i--; /* re-examine this index */
-            done++;
-            bytes_expanded += content_len;
-            if (el->progress)
-                progrez_update(el->progress, done, bytes_expanded);
+            if (el->progress) {
+                const char *basename = strrchr(workers[w].entry_copy.path, '/');
+                basename = basename ? basename + 1 : workers[w].entry_copy.path;
+                char label_buf[256];
+                snprintf(label_buf, sizeof(label_buf), "Expanding: %s", basename);
+                progrez_set_label(el->progress, label_buf);
+                progrez_update(el->progress, w + 1, 0);
+            }
         }
     }
+
+    /* Merge results: remove successfully expanded originals, append expanded entries.
+     * Process in reverse order so indices remain valid during removal. */
+
+    /* First, collect all expanded entries from workers */
+    for (size_t w = 0; w < expandable; w++) {
+        if (!workers[w].success) {
+            /* Expansion failed — clean up the temp list, keep original */
+            entry_list_free(&workers[w].result);
+            continue;
+        }
+
+        /* Remove original entry at workers[w].index.
+         * Since we process forward and indices shift, we need to track offset. */
+    }
+
+    /* Build a new entry list: non-expanded entries in original order,
+     * then expanded entries (DIR + children) in place of originals. */
+    entry_list_t merged;
+    entry_list_init(&merged);
+    merged.progress = el->progress;
+    merged.expand_containers = el->expand_containers;
+    merged.expand_all_zips = el->expand_all_zips;
+    merged.num_threads = el->num_threads;
+    merged.bytes_seen = el->bytes_seen;
+
+    /* Build a set of successfully expanded indices for O(1) lookup */
+    bool *expanded_set = calloc(el->count, sizeof(bool));
+    if (!expanded_set) { free(workers); return false; }
+    for (size_t w = 0; w < expandable; w++) {
+        if (workers[w].success) expanded_set[workers[w].index] = true;
+    }
+
+    /* Walk original entries; for each expanded one, substitute the worker's results */
+    size_t next_worker = 0;
+    for (size_t i = 0; i < el->count; i++) {
+        if (expanded_set[i]) {
+            /* Find the worker for this index */
+            while (next_worker < expandable && workers[next_worker].index != i)
+                next_worker++;
+            if (next_worker < expandable && workers[next_worker].success) {
+                /* Append all entries from the worker's result list */
+                for (size_t j = 0; j < workers[next_worker].result.count; j++) {
+                    entry_list_add(&merged, workers[next_worker].result.entries[j]);
+                }
+                /* Transfer content ownership to merged list */
+                for (size_t j = 0; j < workers[next_worker].result.content_count; j++) {
+                    entry_list_add_content(&merged, workers[next_worker].result.content_bufs[j]);
+                }
+                /* Clear worker's content_bufs so entry_list_free doesn't double-free */
+                workers[next_worker].result.content_count = 0;
+                next_worker++;
+            }
+        } else {
+            entry_list_add(&merged, el->entries[i]);
+        }
+    }
+
+    /* Transfer content ownership from original list to merged */
+    for (size_t i = 0; i < el->content_count; i++) {
+        entry_list_add_content(&merged, el->content_bufs[i]);
+    }
+    /* Prevent original from freeing content (now owned by merged) */
+    el->content_count = 0;
+
+    /* Clean up workers */
+    for (size_t w = 0; w < expandable; w++) {
+        entry_list_free(&workers[w].result);
+    }
+    free(workers);
+    free(expanded_set);
+
+    /* Swap merged into el */
+    free(el->entries);
+    el->entries = merged.entries;
+    el->count = merged.count;
+    el->capacity = merged.capacity;
+    /* Content bufs were already transferred */
+    free(el->content_bufs);
+    el->content_bufs = merged.content_bufs;
+    el->content_count = merged.content_count;
+    el->content_capacity = merged.content_capacity;
 
     return true;
 }

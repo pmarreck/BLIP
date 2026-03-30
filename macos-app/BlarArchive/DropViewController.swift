@@ -187,6 +187,8 @@ class DropViewController: NSViewController {
         progressBar.doubleValue = 0
         dropZone.setEnabled(false)
 
+        let startTime = CFAbsoluteTimeGetCurrent()
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 try BlarBridge.createArchive(
@@ -213,10 +215,13 @@ class DropViewController: NSViewController {
                 }
 
                 DispatchQueue.main.async {
+                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                     let origStr = Self.formatSize(originalSize)
                     let archStr = Self.formatSize(archiveSize)
                     let pct = originalSize > 0 ? Double(archiveSize) / Double(originalSize) * 100.0 : 100.0
-                    self?.statusLabel.stringValue = "Created \(outputPath.lastPathComponent) (\(origStr) → \(archStr), \(String(format: "%.1f", pct))%)"
+                    let mbPerSec = elapsed > 0 ? Double(originalSize) / 1024.0 / 1024.0 / elapsed : 0
+                    let timeStr = elapsed < 60 ? String(format: "%.1fs", elapsed) : String(format: "%dm%02ds", Int(elapsed) / 60, Int(elapsed) % 60)
+                    self?.statusLabel.stringValue = "Created \(outputPath.lastPathComponent) (\(origStr) → \(archStr), \(String(format: "%.1f", pct))%) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
                     self?.progressBar.isHidden = true
                     self?.dropZone.setEnabled(true)
                 }
@@ -279,6 +284,8 @@ class DropViewController: NSViewController {
         progressBar.doubleValue = 0
         dropZone.setEnabled(false)
 
+        let startTime = CFAbsoluteTimeGetCurrent()
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var successCount = 0
             var totalArchiveSize: UInt64 = 0
@@ -327,10 +334,13 @@ class DropViewController: NSViewController {
 
             DispatchQueue.main.async {
                 if successCount > 0 {
+                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                     let archStr = Self.formatSize(totalArchiveSize)
                     let extStr = Self.formatSize(totalExtractedSize)
                     let label = successCount == 1 ? urls[0].deletingPathExtension().lastPathComponent : "\(successCount) archive(s)"
-                    self?.statusLabel.stringValue = "Extracted \(label) (\(archStr) → \(extStr))"
+                    let mbPerSec = elapsed > 0 ? Double(totalExtractedSize) / 1024.0 / 1024.0 / elapsed : 0
+                    let timeStr = elapsed < 60 ? String(format: "%.1fs", elapsed) : String(format: "%dm%02ds", Int(elapsed) / 60, Int(elapsed) % 60)
+                    self?.statusLabel.stringValue = "Extracted \(label) (\(archStr) → \(extStr)) in \(timeStr) (\(String(format: "%.1f", mbPerSec)) MB/s)"
                 } else {
                     self?.statusLabel.stringValue = "Extraction failed"
                 }
