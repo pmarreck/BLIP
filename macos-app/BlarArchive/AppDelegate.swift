@@ -84,7 +84,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Blip Archiver"
-        alert.informativeText = "A drag-and-drop archive tool for BLAR archives.\n\nDrop files to create an archive.\nDrop .blar files to extract.\n\nhttps://github.com/pmarreck/BLIP"
+        alert.informativeText = """
+        A next-generation archive tool built on the BLAR format.
+
+        Why BLAR?
+
+        \u{2022} Transparent container expansion — PDFs, JPEGs, PNGs, \
+        ZIPs (including Office docs and EPUBs) are automatically \
+        decomposed for dramatically better compression, then \
+        perfectly reconstructed on extraction.
+
+        \u{2022} Integrated BLAKE3 checksumming with Merkle hash trees \
+        for per-file and per-directory integrity verification.
+
+        \u{2022} Built-in encryption (AES-256-GCM or ChaCha20-Poly1305) \
+        with Argon2id key derivation — no external tools needed.
+
+        \u{2022} Full metadata preservation — permissions, timestamps, \
+        extended attributes, and macOS resource forks.
+
+        \u{2022} Multiple compression algorithms (LZMA2/7zip, zstd, LZ4) \
+        with per-file or solid-archive granularity.
+
+        \u{2022} Deterministic output — same inputs always produce \
+        byte-identical archives.
+
+        https://github.com/pmarreck/BLIP
+        """
         alert.alertStyle = .informational
         alert.icon = NSApp.applicationIconImage
         alert.runModal()
