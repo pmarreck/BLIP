@@ -106,9 +106,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         \u{2022} Multiple compression algorithms (LZMA2/7zip, zstd, LZ4) \
         with per-file or solid-archive granularity.
 
-        \u{2022} Deterministic output — same inputs always produce \
-        byte-identical archives.
-
         https://github.com/pmarreck/BLIP
         """
         alert.alertStyle = .informational
