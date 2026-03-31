@@ -1662,3 +1662,29 @@ test "enable_compression flag: build_options reflects correct state" {
         );
     }
 }
+test "createArchive preserves caller ordering" {
+    const alloc = testing.allocator;
+
+    // Create files in reverse alphabetical order
+    const files = [_]FileEntry{
+        .{ .path = "z_last.txt", .content = "last" },
+        .{ .path = "m_middle.txt", .content = "middle" },
+        .{ .path = "a_first.txt", .content = "first" },
+    };
+
+    const archive = try createArchive(alloc, &files);
+    defer alloc.free(archive);
+
+    // Read back and verify order is preserved (not sorted by path)
+    var reader = try ArchiveReader.init(archive);
+    try testing.expectEqual(@as(u64, 3), reader.fileCount());
+
+    const path0 = try reader.entryPathAt(0);
+    const path1 = try reader.entryPathAt(1);
+    const path2 = try reader.entryPathAt(2);
+
+    try testing.expectEqualStrings("z_last.txt", path0);
+    try testing.expectEqualStrings("m_middle.txt", path1);
+    try testing.expectEqualStrings("a_first.txt", path2);
+}
+
