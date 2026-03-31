@@ -23,15 +23,17 @@ zig build 2>&1 | grep -v "^warning: Unrecognized" || true
 # Step 2: Find Zig-built static libs for LZ4 and ZSTD
 LZ4_LIB="$(find .zig-cache -name 'liblz4.a' 2>/dev/null | head -1)"
 ZSTD_LIB="$(find .zig-cache -name 'libzstd.a' 2>/dev/null | head -1)"
+FLAC_LIB="$(find .zig-cache -name 'libflac.a' 2>/dev/null | head -1)"
 
 if [ -z "$LZ4_LIB" ] || [ -z "$ZSTD_LIB" ]; then
-    echo "ERROR: Cannot find liblz4.a or libzstd.a in .zig-cache"
+    echo "ERROR: Cannot find liblz4.a, libzstd.a, or libflac.a in .zig-cache"
     exit 1
 fi
 
 echo "  libblip.a: zig-out/lib/libblip.a"
 echo "  liblz4.a:  $LZ4_LIB"
 echo "  libzstd.a: $ZSTD_LIB"
+echo "  libflac.a: $FLAC_LIB"
 
 # Step 3: Create app bundle structure
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
@@ -72,11 +74,11 @@ echo "  swiftc: $SYSTEM_SWIFTC"
 # Zig-built .a files have 4-byte aligned members; Apple ld requires 8-byte.
 # Re-archive with libtool to fix alignment.
 MERGED_LIB="$BUILD_DIR/libblip_merged.a"
-libtool -static -o "$MERGED_LIB" \
-    "$BLIP_ROOT/zig-out/lib/libblip.a" \
-    "$BLIP_ROOT/$LZ4_LIB" \
-    "$BLIP_ROOT/$ZSTD_LIB" \
-    2>/dev/null
+MERGE_LIBS="$BLIP_ROOT/zig-out/lib/libblip.a $BLIP_ROOT/$LZ4_LIB $BLIP_ROOT/$ZSTD_LIB"
+if [ -n "$FLAC_LIB" ]; then
+    MERGE_LIBS="$MERGE_LIBS $BLIP_ROOT/$FLAC_LIB"
+fi
+libtool -static -o "$MERGED_LIB" $MERGE_LIBS 2>/dev/null
 echo "  Merged lib: $MERGED_LIB"
 
 # Compile the C extraction wrapper (uses blar_common.h)
