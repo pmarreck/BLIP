@@ -6613,11 +6613,35 @@ static bool expand_containers_pass(entry_list_t *el) {
         }
     }
 
-    /* Transfer content ownership from original list to merged */
-    for (size_t i = 0; i < el->content_count; i++) {
-        entry_list_add_content(&merged, el->content_bufs[i]);
+    /* Transfer content ownership from original list to merged —
+     * BUT free content that belonged to successfully expanded entries
+     * (their content has been replaced by JXL/FLAC children). */
+    {
+        /* Build a set of content pointers that belong to expanded entries */
+        size_t freed_bytes = 0;
+        for (size_t i = 0; i < el->content_count; i++) {
+            bool is_expanded_content = false;
+            /* Check if this content buffer is the .content of an expanded entry */
+            for (size_t w = 0; w < expandable; w++) {
+                if (!workers[w].success) continue;
+                size_t eidx = workers[w].index;
+                if (el->entries[eidx].content == el->content_bufs[i] &&
+                    el->entries[eidx].content_len > 0) {
+                    is_expanded_content = true;
+                    freed_bytes += el->entries[eidx].content_len;
+                    break;
+                }
+            }
+            if (is_expanded_content) {
+                /* Free the original content — it's been replaced by expanded children */
+                free(el->content_bufs[i]);
+            } else {
+                /* Keep non-expanded content (paths, metadata, non-expanded files) */
+                entry_list_add_content(&merged, el->content_bufs[i]);
+            }
+        }
     }
-    /* Prevent original from freeing content (now owned by merged) */
+    /* Prevent original from freeing content (transferred or freed above) */
     el->content_count = 0;
 
     /* Clean up workers */
