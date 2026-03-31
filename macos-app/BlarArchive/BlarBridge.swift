@@ -186,7 +186,7 @@ class BlarBridge {
     private static var extractionCodecs: [blar_codec_t] = {
         var codecs: [blar_codec_t] = []
         // Static strings that live for the process lifetime
-        for name in ["jpeg", "pdf", "png", "zip"] {
+        for name in ["jpeg", "pdf", "png", "bmp", "tga", "wav", "aiff", "fits", "dicom", "gif", "tiff", "tar", "zip"] {
             var codec = blar_codec_t()
             memset(&codec, 0, MemoryLayout<blar_codec_t>.size)
             // name must be a C string pointer that outlives the codec

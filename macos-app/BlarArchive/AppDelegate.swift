@@ -109,10 +109,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Why BLAR?
 
-        \u{2022} Transparent container expansion — PDFs, JPEGs, PNGs, \
-        ZIPs (including Office docs and EPUBs) are automatically \
-        decomposed for dramatically better compression, then \
-        perfectly reconstructed on extraction.
+        \u{2022} Transparent container expansion — PDFs, images \
+        (JPEG, PNG, BMP, TGA, TIFF, GIF), audio (WAV, AIFF \u{2192} FLAC), \
+        archives (ZIP, gzip, tar), scientific (FITS, DICOM), \
+        and Office/EPUB formats are automatically decomposed for \
+        dramatically better compression, then perfectly \
+        reconstructed on extraction.
 
         \u{2022} Integrated BLAKE3 checksumming with Merkle hash trees \
         for per-file and per-directory integrity verification.

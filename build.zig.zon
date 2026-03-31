@@ -32,6 +32,11 @@
             .url = "https://github.com/pmarreck/libmagic/archive/refs/tags/zig-0.15.0.tar.gz",
             .hash = "libmagic-5.46.0-RysxHD9fCACu5caBjXS-x3qQnQM3nRfosCyktdVRzv-R",
         },
+        .flac = .{
+            .url = "https://github.com/pmarreck/flac/archive/fe8c4fa.tar.gz",
+            .hash = "flac-0.0.0-AAAAAJsyAABQQemZIJmgQ1hrrY6Pd3304-6-dsNHy1GT",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

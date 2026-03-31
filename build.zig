@@ -16,9 +16,17 @@ pub fn build(b: *std.Build) void {
         "Enable compression support (requires z7z, bzip2z, lz4, zstd). Default: true.",
     ) orelse true;
 
+    // Build option: enable FLAC audio codec support (WAV/AIFF → FLAC container expansion).
+    const enable_flac = b.option(
+        bool,
+        "enable_flac",
+        "Enable FLAC audio codec support (WAV/AIFF container expansion). Default: true.",
+    ) orelse true;
+
     // Build options module — passed to Zig source files via @import("build_options")
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_compression", enable_compression);
+    build_options.addOption(bool, "enable_flac", enable_flac);
 
     // printable-binary module (vendored) — needed by static lib for peek FFI
     // NOTE: must be defined before blip_module so it can be imported
@@ -52,6 +60,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) else null;
     const zstdz_lib = if (zstdz_dep) |dep| dep.artifact("zstd") else null;
+
+    // FLAC dependency — lazy, only fetched when enable_flac is true
+    const flac_dep = if (enable_flac) b.lazyDependency("flac", .{
+        .target = target,
+        .optimize = optimize,
+    }) else null;
+    const flac_lib = if (flac_dep) |dep| dep.artifact("flac") else null;
 
     // progrez dependency — provides progress bar (C library)
     const progrez_dep = b.dependency("progrez", .{
@@ -96,6 +111,13 @@ pub fn build(b: *std.Build) void {
         }
     }.apply;
 
+    // Helper: add FLAC support to a module
+    const addFlacSupport = struct {
+        fn apply(module: *std.Build.Module, flac: ?*std.Build.Step.Compile) void {
+            if (flac) |lib| module.linkLibrary(lib);
+        }
+    }.apply;
+
     // Core BLIP module — shared by library, tests, and benchmarks
     const blip_module = b.createModule(.{
         .root_source_file = b.path("src/blip.zig"),
@@ -109,6 +131,9 @@ pub fn build(b: *std.Build) void {
     addJxlSupport(blip_module, jxl_include_path, jxl_lib_path);
     if (enable_compression) {
         addCompressionSupport(blip_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
+    if (enable_flac) {
+        addFlacSupport(blip_module, flac_lib);
     }
 
     // Expose named modules for downstream Zig consumers:
@@ -126,6 +151,9 @@ pub fn build(b: *std.Build) void {
     addJxlSupport(exposed_blip, jxl_include_path, jxl_lib_path);
     if (enable_compression) {
         addCompressionSupport(exposed_blip, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
+    if (enable_flac) {
+        addFlacSupport(exposed_blip, flac_lib);
     }
 
     const exposed_mini_blar = b.addModule("mini_blar", .{
@@ -160,6 +188,7 @@ pub fn build(b: *std.Build) void {
     static_lib.root_module.linkSystemLibrary("jxl", .{});
     static_lib.root_module.linkSystemLibrary("jxl_threads", .{});
     static_lib.root_module.linkSystemLibrary("z", .{});
+    if (enable_flac) addFlacSupport(static_lib.root_module, flac_lib);
     b.installArtifact(static_lib);
 
     // CLI executable — calls through C FFI (links static lib)
@@ -278,6 +307,9 @@ pub fn build(b: *std.Build) void {
     if (enable_compression) {
         addCompressionSupport(unit_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
     }
+    if (enable_flac) {
+        addFlacSupport(unit_test_module, flac_lib);
+    }
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -297,6 +329,9 @@ pub fn build(b: *std.Build) void {
     addJxlSupport(ffi_test_module, jxl_include_path, jxl_lib_path);
     if (enable_compression) {
         addCompressionSupport(ffi_test_module, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
+    }
+    if (enable_flac) {
+        addFlacSupport(ffi_test_module, flac_lib);
     }
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_module,

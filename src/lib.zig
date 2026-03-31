@@ -1475,6 +1475,17 @@ export fn blip_archive_entry_zip_comp(
 const pdf_mod = blip.pdf_mod;
 const jxl_mod = blip.jxl_mod;
 const png_mod = blip.png_mod;
+const bmp_mod = blip.bmp_mod;
+const tar_mod = blip.tar_mod;
+const tiff_mod = blip.tiff_mod;
+const gif_mod = blip.gif_mod;
+const tga_mod = blip.tga_mod;
+const wav_mod = blip.wav_mod;
+const flac_mod = blip.flac_mod;
+const dicom_mod = blip.dicom_mod;
+const expansion_mod = blip.expansion_mod;
+const fits_mod = blip.fits_mod;
+const aiff_mod = blip.aiff_mod;
 
 /// Check if buffer starts with PDF magic bytes (%PDF-).
 export fn blip_is_pdf(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
@@ -1754,6 +1765,848 @@ export fn blip_png_encode(
     out_png_len.* = png_data.len;
     return 0;
 }
+
+// --- BMP ---
+
+/// Check if buffer starts with BMP magic bytes (BM).
+export fn blip_is_bmp(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return bmp_mod.isBmpMagic(buf[0..buf_len]);
+}
+
+/// Parse a BMP into raw pixels + header metadata.
+/// Outputs pixels in top-to-bottom RGB(A) order.
+/// header_meta contains the original BMP header bytes for faithful reconstruction.
+export fn blip_bmp_parse(
+    bmp: [*]const u8,
+    bmp_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    var parsed = bmp_mod.parseBmp(page_allocator, bmp[0..bmp_len]) catch return -40;
+
+    // Build meta: [u8 top_down][u16_le bits_per_pixel][u32_le row_stride][header_bytes...]
+    const meta_prefix_len: usize = 1 + 2 + 4; // top_down + bpp + row_stride
+    const meta_len = meta_prefix_len + parsed.header.header_bytes.len;
+    const meta = page_allocator.alloc(u8, meta_len) catch {
+        parsed.deinit();
+        return -13;
+    };
+    meta[0] = if (parsed.header.top_down) 1 else 0;
+    std.mem.writeInt(u16, meta[1..3], parsed.header.bits_per_pixel, .little);
+    std.mem.writeInt(u32, meta[3..7], parsed.header.row_stride, .little);
+    @memcpy(meta[meta_prefix_len..], parsed.header.header_bytes);
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.header.width;
+    out_height.* = parsed.header.abs_height;
+    out_num_channels.* = @as(u32, parsed.header.channels);
+    out_bits_per_sample.* = 8; // BMP is always 8-bit per channel
+    out_meta.* = meta.ptr;
+    out_meta_len.* = meta.len;
+
+    // Free header_bytes (pixels ownership transfers to caller)
+    page_allocator.free(parsed.header.header_bytes);
+
+    return 0;
+}
+
+/// Encode raw pixels + BMP header metadata back to a BMP file.
+export fn blip_bmp_encode(
+    pixels: [*]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    meta: [*]const u8,
+    meta_len: usize,
+    out_bmp: *[*]u8,
+    out_bmp_len: *usize,
+) callconv(.c) i32 {
+    if (meta_len < 7) return -40; // Need at least prefix
+    const meta_buf = meta[0..meta_len];
+    const top_down = meta_buf[0] != 0;
+    const bits_per_pixel = std.mem.readInt(u16, meta_buf[1..3], .little);
+    const row_stride = std.mem.readInt(u32, meta_buf[3..7], .little);
+    const header_bytes_src = meta_buf[7..];
+
+    const header_bytes = page_allocator.alloc(u8, header_bytes_src.len) catch return -13;
+    @memcpy(header_bytes, header_bytes_src);
+
+    const channels: u8 = if (bits_per_pixel == 32) 4 else 3;
+
+    const header = bmp_mod.BmpHeader{
+        .header_bytes = header_bytes,
+        .width = width,
+        .height = height,
+        .abs_height = height,
+        .top_down = top_down,
+        .channels = channels,
+        .bits_per_pixel = bits_per_pixel,
+        .row_stride = row_stride,
+        .allocator = page_allocator,
+    };
+
+    const bmp_data = bmp_mod.encodeBmp(page_allocator, pixels[0..pixels_len], header) catch {
+        page_allocator.free(header_bytes);
+        return -40;
+    };
+    page_allocator.free(header_bytes);
+
+    out_bmp.* = bmp_data.ptr;
+    out_bmp_len.* = bmp_data.len;
+    return 0;
+}
+
+
+// --- TAR ---
+
+/// Check if buffer starts with a valid tar header (ustar magic or valid checksum).
+export fn blip_is_tar(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return tar_mod.isTarMagic(buf[0..buf_len]);
+}
+
+/// Parse a tar archive into individual entries.
+/// Returns entry count and parallel arrays of paths, contents, headers, and typeflags.
+/// Caller must free all output arrays with blip_free.
+export fn blip_tar_parse(
+    tar: [*]const u8,
+    tar_len: usize,
+    out_count: *usize,
+    out_paths: *[*][*]u8,
+    out_path_lens: *[*]usize,
+    out_contents: *[*][*]u8,
+    out_content_lens: *[*]usize,
+    out_headers: *[*][*]u8,
+    out_typeflags: *[*]u8,
+    out_trailer: *[*]u8,
+    out_trailer_len: *usize,
+) callconv(.c) i32 {
+    var parsed = tar_mod.parseTar(page_allocator, tar[0..tar_len]) catch return -40;
+
+    const count = parsed.entries.len;
+    const paths = page_allocator.alloc([*]u8, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+    const path_lens = page_allocator.alloc(usize, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+    const contents = page_allocator.alloc([*]u8, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+    const content_lens = page_allocator.alloc(usize, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+    const headers = page_allocator.alloc([*]u8, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+    const typeflags = page_allocator.alloc(u8, count) catch {
+        parsed.deinit();
+        return -13;
+    };
+
+    for (parsed.entries, 0..) |entry, i| {
+        // Copy path to owned buffer
+        const path_buf = page_allocator.alloc(u8, entry.path.len) catch {
+            parsed.deinit();
+            return -13;
+        };
+        @memcpy(path_buf, entry.path);
+        paths[i] = path_buf.ptr;
+        path_lens[i] = entry.path.len;
+
+        // Copy content
+        if (entry.content.len > 0) {
+            const content_buf = page_allocator.alloc(u8, entry.content.len) catch {
+                parsed.deinit();
+                return -13;
+            };
+            @memcpy(content_buf, entry.content);
+            contents[i] = content_buf.ptr;
+        } else {
+            contents[i] = @ptrFromInt(1); // non-null sentinel
+        }
+        content_lens[i] = entry.content.len;
+
+        // Copy header
+        const hdr_buf = page_allocator.alloc(u8, 512) catch {
+            parsed.deinit();
+            return -13;
+        };
+        @memcpy(hdr_buf, &entry.header);
+        headers[i] = hdr_buf.ptr;
+
+        typeflags[i] = entry.typeflag;
+    }
+
+    // Trailer
+    if (parsed.trailer.len > 0) {
+        const trailer_buf = page_allocator.alloc(u8, parsed.trailer.len) catch {
+            parsed.deinit();
+            return -13;
+        };
+        @memcpy(trailer_buf, parsed.trailer);
+        out_trailer.* = trailer_buf.ptr;
+        out_trailer_len.* = parsed.trailer.len;
+    } else {
+        out_trailer.* = @ptrFromInt(1);
+        out_trailer_len.* = 0;
+    }
+
+    out_count.* = count;
+    out_paths.* = paths.ptr;
+    out_path_lens.* = path_lens.ptr;
+    out_contents.* = contents.ptr;
+    out_content_lens.* = content_lens.ptr;
+    out_headers.* = headers.ptr;
+    out_typeflags.* = typeflags.ptr;
+
+    parsed.deinit();
+    return 0;
+}
+
+/// Reconstruct a tar archive from entries.
+export fn blip_tar_encode(
+    count: usize,
+    headers: [*]const [*]const u8,
+    contents: [*]const [*]const u8,
+    content_lens: [*]const usize,
+    trailer: [*]const u8,
+    trailer_len: usize,
+    out_tar: *[*]u8,
+    out_tar_len: *usize,
+) callconv(.c) i32 {
+    // Build TarEntry slice for encodeTar
+    const entries = page_allocator.alloc(tar_mod.TarEntry, count) catch return -13;
+    defer page_allocator.free(entries);
+
+    for (0..count) |i| {
+        entries[i].header = headers[i][0..512].*;
+        entries[i].content = if (content_lens[i] > 0) contents[i][0..content_lens[i]] else &.{};
+        entries[i].path = &.{}; // Not needed for encoding
+        entries[i].typeflag = entries[i].header[156];
+    }
+
+    const trailer_slice = if (trailer_len > 0) trailer[0..trailer_len] else &[_]u8{};
+    const tar_data = tar_mod.encodeTar(page_allocator, entries, trailer_slice) catch return -13;
+    out_tar.* = tar_data.ptr;
+    out_tar_len.* = tar_data.len;
+    return 0;
+}
+
+
+// --- TIFF ---
+
+/// Check if buffer starts with TIFF magic bytes (II*\0 or MM\0*).
+export fn blip_is_tiff(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return tiff_mod.isTiffMagic(buf[0..buf_len]);
+}
+
+/// Parse a TIFF into raw pixels + original file bytes (for reconstruction).
+/// Only handles uncompressed 8/16-bit TIFF. Returns error for compressed TIFF.
+export fn blip_tiff_parse(
+    tiff: [*]const u8,
+    tiff_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = tiff_mod.parseTiff(page_allocator, tiff[0..tiff_len]) catch return -40;
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.info.width;
+    out_height.* = parsed.info.height;
+    out_num_channels.* = @as(u32, parsed.info.samples_per_pixel);
+    out_bits_per_sample.* = @as(u32, parsed.info.bits_per_sample);
+    // Meta contains file template (pixel regions zeroed) + strip map
+    out_meta.* = parsed.meta.ptr;
+    out_meta_len.* = parsed.meta.len;
+
+    return 0;
+}
+
+
+// --- GIF ---
+
+/// Check if buffer starts with GIF magic bytes (GIF87a or GIF89a).
+export fn blip_is_gif(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return gif_mod.isGifMagic(buf[0..buf_len]);
+}
+
+/// Parse a static GIF into RGBA pixels + original file (for reconstruction).
+/// Returns error for animated GIFs.
+export fn blip_gif_parse(
+    gif: [*]const u8,
+    gif_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = gif_mod.parseGif(page_allocator, gif[0..gif_len]) catch return -40;
+
+    // Reject animated GIFs (too complex for simple container expansion)
+    if (parsed.is_animated) {
+        // Need to clean up — but parseGif allocated for us
+        var p = parsed;
+        p.deinit();
+        return -40;
+    }
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.width;
+    out_height.* = parsed.height;
+    out_num_channels.* = 4; // RGBA
+    out_bits_per_sample.* = 8;
+    out_meta.* = parsed.original.ptr;
+    out_meta_len.* = parsed.original.len;
+
+    return 0;
+}
+
+
+// --- TGA ---
+
+/// Check if buffer looks like an uncompressed true-color TGA.
+export fn blip_is_tga(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return tga_mod.isTgaMagic(buf[0..buf_len]);
+}
+
+/// Parse a TGA into raw pixels + header metadata.
+export fn blip_tga_parse(
+    tga: [*]const u8,
+    tga_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    var parsed = tga_mod.parseTga(page_allocator, tga[0..tga_len]) catch return -40;
+
+    // Meta format: [u8 top_down][u8 bpp][u16_le width][u16_le height]
+    //              [u32_le footer_len][header_bytes][footer_bytes]
+    const meta_prefix: usize = 1 + 1 + 2 + 2 + 4; // 10 bytes
+    const meta_len = meta_prefix + parsed.header.header_bytes.len + parsed.footer.len;
+    const meta = page_allocator.alloc(u8, meta_len) catch {
+        parsed.deinit();
+        return -13;
+    };
+    meta[0] = if (parsed.header.top_down) 1 else 0;
+    meta[1] = parsed.header.bits_per_pixel;
+    std.mem.writeInt(u16, meta[2..4], parsed.header.width, .little);
+    std.mem.writeInt(u16, meta[4..6], parsed.header.height, .little);
+    const footer_len: u32 = @intCast(parsed.footer.len);
+    std.mem.writeInt(u32, meta[6..10], footer_len, .little);
+    @memcpy(meta[meta_prefix..][0..parsed.header.header_bytes.len], parsed.header.header_bytes);
+    if (parsed.footer.len > 0) {
+        @memcpy(meta[meta_prefix + parsed.header.header_bytes.len ..], parsed.footer);
+    }
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = @as(u32, parsed.header.width);
+    out_height.* = @as(u32, parsed.header.height);
+    out_num_channels.* = @as(u32, parsed.header.channels);
+    out_bits_per_sample.* = 8;
+    out_meta.* = meta.ptr;
+    out_meta_len.* = meta.len;
+
+    page_allocator.free(parsed.header.header_bytes);
+    if (parsed.footer.len > 0) page_allocator.free(parsed.footer);
+
+    return 0;
+}
+
+/// Encode raw pixels + TGA metadata back to a TGA file.
+export fn blip_tga_encode(
+    pixels: [*]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    meta: [*]const u8,
+    meta_len: usize,
+    out_tga: *[*]u8,
+    out_tga_len: *usize,
+) callconv(.c) i32 {
+    if (meta_len < 10) return -40;
+    const meta_buf = meta[0..meta_len];
+    const top_down = meta_buf[0] != 0;
+    const bpp = meta_buf[1];
+    const w = std.mem.readInt(u16, meta_buf[2..4], .little);
+    const h = std.mem.readInt(u16, meta_buf[4..6], .little);
+    const footer_len = std.mem.readInt(u32, meta_buf[6..10], .little);
+    _ = w;
+    _ = h;
+
+    const header_bytes_len = meta_len - 10 - @as(usize, footer_len);
+    const header_bytes_src = meta_buf[10..][0..header_bytes_len];
+    const footer_src = if (footer_len > 0) meta_buf[10 + header_bytes_len ..] else &[_]u8{};
+
+    const header_bytes = page_allocator.alloc(u8, header_bytes_len) catch return -13;
+    @memcpy(header_bytes, header_bytes_src);
+
+    const channels: u8 = if (bpp == 32) 4 else 3;
+
+    const header = tga_mod.TgaHeader{
+        .header_bytes = header_bytes,
+        .width = @intCast(width),
+        .height = @intCast(height),
+        .channels = channels,
+        .bits_per_pixel = bpp,
+        .top_down = top_down,
+        .allocator = page_allocator,
+    };
+
+    const tga_data = tga_mod.encodeTga(page_allocator, pixels[0..pixels_len], header, footer_src) catch {
+        page_allocator.free(header_bytes);
+        return -40;
+    };
+    page_allocator.free(header_bytes);
+
+    out_tga.* = tga_data.ptr;
+    out_tga_len.* = tga_data.len;
+    return 0;
+}
+
+
+// --- WAV/FLAC ---
+
+/// Check if buffer starts with WAV magic (RIFF....WAVE).
+export fn blip_is_wav(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return wav_mod.isWavMagic(buf[0..buf_len]);
+}
+
+/// Parse WAV, encode PCM to FLAC, return FLAC data + WAV metadata.
+/// Meta format: [u32_le file_size][u32_le data_offset][u32_le data_size][pre_data][post_data]
+export fn blip_wav_to_flac(
+    wav: [*]const u8,
+    wav_len: usize,
+    out_flac: *[*]u8,
+    out_flac_len: *usize,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = wav_mod.parseWav(page_allocator, wav[0..wav_len]) catch return -40;
+
+    const flac_data = flac_mod.encodePcmToFlac(
+        page_allocator,
+        parsed.samples,
+        parsed.info.num_channels,
+        parsed.info.sample_rate,
+        parsed.info.bits_per_sample,
+        parsed.info.num_samples,
+    ) catch {
+        page_allocator.free(parsed.samples);
+        page_allocator.free(parsed.original);
+        return -41;
+    };
+
+    out_flac.* = flac_data.ptr;
+    out_flac_len.* = flac_data.len;
+    out_meta.* = parsed.original.ptr;
+    out_meta_len.* = parsed.original.len;
+
+    page_allocator.free(parsed.samples);
+    return 0;
+}
+
+/// Decode FLAC back to PCM, reconstruct WAV from metadata + PCM.
+export fn blip_flac_to_wav(
+    flac_data: [*]const u8,
+    flac_len: usize,
+    meta: [*]const u8,
+    meta_len: usize,
+    out_wav: *[*]u8,
+    out_wav_len: *usize,
+) callconv(.c) i32 {
+    if (meta_len < 12) return -40;
+
+    var channels: u32 = 0;
+    var sample_rate: u32 = 0;
+    var bps: u32 = 0;
+    var total_samples: u64 = 0;
+
+    const pcm = flac_mod.decodeFlacToPcm(
+        page_allocator, flac_data[0..flac_len],
+        &channels, &sample_rate, &bps, &total_samples,
+    ) catch return -41;
+    defer page_allocator.free(pcm);
+
+    // Reconstruct WAV from metadata template + decoded PCM
+    const meta_buf = meta[0..meta_len];
+    const file_size = std.mem.readInt(u32, meta_buf[0..4], .little);
+    const data_offset = std.mem.readInt(u32, meta_buf[4..8], .little);
+    const data_size = std.mem.readInt(u32, meta_buf[8..12], .little);
+    _ = data_size;
+
+    const pre_data_len: usize = data_offset;
+    const pre_data = meta_buf[12..][0..pre_data_len];
+    const post_data = if (12 + pre_data_len < meta_len) meta_buf[12 + pre_data_len ..] else &[_]u8{};
+
+    const wav_size: usize = file_size;
+    const wav = page_allocator.alloc(u8, wav_size) catch return -13;
+
+    // Copy pre-data (header)
+    if (pre_data_len > 0 and pre_data_len <= wav_size)
+        @memcpy(wav[0..pre_data_len], pre_data);
+
+    // Copy PCM data
+    const pcm_copy_len = @min(pcm.len, wav_size - @min(data_offset, wav_size));
+    if (data_offset + pcm_copy_len <= wav_size)
+        @memcpy(wav[data_offset..][0..pcm_copy_len], pcm[0..pcm_copy_len]);
+
+    // Copy post-data
+    const post_start = data_offset + pcm_copy_len;
+    if (post_data.len > 0 and post_start + post_data.len <= wav_size)
+        @memcpy(wav[post_start..][0..post_data.len], post_data);
+
+    out_wav.* = wav.ptr;
+    out_wav_len.* = wav_size;
+    return 0;
+}
+
+
+// --- AIFF ---
+
+/// Check if buffer starts with AIFF magic (FORM....AIFF).
+export fn blip_is_aiff(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return aiff_mod.isAiffMagic(buf[0..buf_len]);
+}
+
+/// Parse AIFF, encode PCM to FLAC, return FLAC data + AIFF metadata.
+export fn blip_aiff_to_flac(
+    aiff: [*]const u8,
+    aiff_len: usize,
+    out_flac: *[*]u8,
+    out_flac_len: *usize,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = aiff_mod.parseAiff(page_allocator, aiff[0..aiff_len]) catch return -40;
+
+    const flac_data = flac_mod.encodePcmToFlac(
+        page_allocator,
+        parsed.samples,
+        parsed.info.num_channels,
+        parsed.info.sample_rate,
+        parsed.info.bits_per_sample,
+        parsed.info.num_samples,
+    ) catch {
+        page_allocator.free(parsed.samples);
+        page_allocator.free(parsed.meta);
+        return -41;
+    };
+
+    out_flac.* = flac_data.ptr;
+    out_flac_len.* = flac_data.len;
+    out_meta.* = parsed.meta.ptr;
+    out_meta_len.* = parsed.meta.len;
+    page_allocator.free(parsed.samples);
+    return 0;
+}
+
+/// Decode FLAC back to PCM, reconstruct AIFF from metadata.
+export fn blip_flac_to_aiff(
+    flac_data: [*]const u8,
+    flac_len: usize,
+    meta: [*]const u8,
+    meta_len: usize,
+    out_aiff: *[*]u8,
+    out_aiff_len: *usize,
+) callconv(.c) i32 {
+    if (meta_len < 13) return -40;
+
+    var channels: u32 = 0;
+    var sample_rate: u32 = 0;
+    var bps: u32 = 0;
+    var total_samples: u64 = 0;
+
+    const pcm = flac_mod.decodeFlacToPcm(
+        page_allocator, flac_data[0..flac_len],
+        &channels, &sample_rate, &bps, &total_samples,
+    ) catch return -41;
+    defer page_allocator.free(pcm);
+
+    const meta_buf = meta[0..meta_len];
+    const file_size = std.mem.readInt(u32, meta_buf[0..4], .big);
+    const ssnd_offset = std.mem.readInt(u32, meta_buf[4..8], .big);
+    const ssnd_data_size = std.mem.readInt(u32, meta_buf[8..12], .big);
+    _ = ssnd_data_size;
+
+    const pre_ssnd_len: usize = ssnd_offset;
+    const pre_ssnd = meta_buf[13..][0..pre_ssnd_len];
+    const post_ssnd = if (13 + pre_ssnd_len < meta_len) meta_buf[13 + pre_ssnd_len ..] else &[_]u8{};
+
+    const aiff_size: usize = file_size;
+    const aiff = page_allocator.alloc(u8, aiff_size) catch return -13;
+    @memset(aiff, 0);
+
+    // Copy pre-SSND data (headers)
+    if (pre_ssnd_len > 0 and pre_ssnd_len <= aiff_size)
+        @memcpy(aiff[0..pre_ssnd_len], pre_ssnd);
+
+    // Convert PCM from LE back to BE and write into SSND position
+    const bytes_per_sample: usize = (@as(usize, bps) + 7) / 8;
+    const total_pcm_samples = @as(usize, total_samples) * @as(usize, channels);
+    var pcm_off: usize = ssnd_offset;
+    for (0..total_pcm_samples) |i| {
+        const src_off = i * bytes_per_sample;
+        if (src_off + bytes_per_sample > pcm.len or pcm_off + bytes_per_sample > aiff_size) break;
+        switch (bytes_per_sample) {
+            1 => aiff[pcm_off] = pcm[src_off],
+            2 => {
+                aiff[pcm_off] = pcm[src_off + 1]; // LE to BE
+                aiff[pcm_off + 1] = pcm[src_off];
+            },
+            3 => {
+                aiff[pcm_off] = pcm[src_off + 2];
+                aiff[pcm_off + 1] = pcm[src_off + 1];
+                aiff[pcm_off + 2] = pcm[src_off];
+            },
+            else => {},
+        }
+        pcm_off += bytes_per_sample;
+    }
+
+    // Copy post-SSND data
+    if (post_ssnd.len > 0 and pcm_off + post_ssnd.len <= aiff_size)
+        @memcpy(aiff[pcm_off..][0..post_ssnd.len], post_ssnd);
+
+    out_aiff.* = aiff.ptr;
+    out_aiff_len.* = aiff_size;
+    return 0;
+}
+
+
+// --- FITS ---
+
+/// Check if buffer starts with FITS magic (SIMPLE = T).
+export fn blip_is_fits(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return fits_mod.isFitsMagic(buf[0..buf_len]);
+}
+
+/// Parse FITS into raw pixels + header metadata.
+/// For 16-bit FITS, pixels are big-endian. Caller handles endian conversion for JXL.
+export fn blip_fits_parse(
+    fits: [*]const u8,
+    fits_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = fits_mod.parseFits(page_allocator, fits[0..fits_len]) catch return -40;
+
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.info.width;
+    out_height.* = parsed.info.height;
+    out_num_channels.* = parsed.info.channels;
+    out_bits_per_sample.* = @intCast(@abs(parsed.info.bitpix));
+    out_meta.* = parsed.meta.ptr;
+    out_meta_len.* = parsed.meta.len;
+    return 0;
+}
+
+
+// --- DICOM ---
+
+/// Check if buffer starts with DICOM magic (128-byte preamble + "DICM").
+export fn blip_is_dicom(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return dicom_mod.isDicomMagic(buf[0..buf_len]);
+}
+
+/// Parse DICOM into raw pixels + metadata (non-pixel bytes).
+export fn blip_dicom_parse(
+    dcm: [*]const u8,
+    dcm_len: usize,
+    out_pixels: *[*]u8,
+    out_pixels_len: *usize,
+    out_width: *u32,
+    out_height: *u32,
+    out_num_channels: *u32,
+    out_bits_per_sample: *u32,
+    out_meta: *[*]u8,
+    out_meta_len: *usize,
+) callconv(.c) i32 {
+    const parsed = dicom_mod.parseDicom(page_allocator, dcm[0..dcm_len]) catch return -40;
+    out_pixels.* = parsed.pixels.ptr;
+    out_pixels_len.* = parsed.pixels.len;
+    out_width.* = parsed.info.width;
+    out_height.* = parsed.info.height;
+    out_num_channels.* = @as(u32, parsed.info.samples_per_pixel);
+    out_bits_per_sample.* = @as(u32, parsed.info.bits_allocated);
+    out_meta.* = parsed.meta.ptr;
+    out_meta_len.* = parsed.meta.len;
+    return 0;
+}
+
+
+// --- Container Expansion/Collapse (unified entry point) ---
+
+/// Detect which codec matches content by magic bytes. Returns codec name or NULL.
+export fn blip_detect_codec(buf: [*]const u8, buf_len: usize, out_name: *[*]const u8, out_name_len: *usize) callconv(.c) bool {
+    if (expansion_mod.detectCodec(buf[0..buf_len])) |name| {
+        out_name.* = name.ptr;
+        out_name_len.* = name.len;
+        return true;
+    }
+    return false;
+}
+
+/// Expand a file into container entries. Returns 0 on success, -1 if not expandable.
+/// out_count entries are returned; each has path_suffix, content, content_len, is_dir, jxl_source.
+export fn blip_expand_file(
+    content: [*]const u8,
+    content_len: usize,
+    codec_name: [*]const u8,
+    codec_name_len: usize,
+    // Output: parallel arrays
+    out_count: *usize,
+    out_container_type: *[*]const u8,
+    out_container_type_len: *usize,
+    out_path_suffixes: *[*][*]const u8,
+    out_path_suffix_lens: *[*]usize,
+    out_contents: *[*][*]u8,
+    out_content_lens: *[*]usize,
+    out_is_dirs: *[*]u8,
+    out_jxl_sources: *[*][*]const u8,
+    out_jxl_source_lens: *[*]usize,
+    out_gz_levels: *[*]u8,
+    out_zip_comps: *[*]u16,
+    out_pdf_offsets: *[*]u64,
+    out_pdf_lengths: *[*]u64,
+) callconv(.c) i32 {
+    const codec = codec_name[0..codec_name_len];
+    const result = expansion_mod.expandFile(page_allocator, content[0..content_len], codec) catch return -1;
+    if (result == null) return -1;
+    var r = result.?;
+
+    const count = r.entries.len;
+    const suffixes = page_allocator.alloc([*]const u8, count) catch { r.deinit(); return -13; };
+    const suffix_lens = page_allocator.alloc(usize, count) catch { r.deinit(); return -13; };
+    const contents = page_allocator.alloc([*]u8, count) catch { r.deinit(); return -13; };
+    const content_lens_arr = page_allocator.alloc(usize, count) catch { r.deinit(); return -13; };
+    const is_dirs = page_allocator.alloc(u8, count) catch { r.deinit(); return -13; };
+    const jxl_srcs = page_allocator.alloc([*]const u8, count) catch { r.deinit(); return -13; };
+    const jxl_src_lens = page_allocator.alloc(usize, count) catch { r.deinit(); return -13; };
+    const gz_levels = page_allocator.alloc(u8, count) catch { r.deinit(); return -13; };
+    const zip_comps = page_allocator.alloc(u16, count) catch { r.deinit(); return -13; };
+    const pdf_offsets = page_allocator.alloc(u64, count) catch { r.deinit(); return -13; };
+    const pdf_lengths = page_allocator.alloc(u64, count) catch { r.deinit(); return -13; };
+
+    for (r.entries, 0..) |entry, i| {
+        suffixes[i] = entry.path_suffix.ptr;
+        suffix_lens[i] = entry.path_suffix.len;
+        contents[i] = if (entry.content.len > 0) entry.content.ptr else @ptrFromInt(1);
+        content_lens_arr[i] = entry.content.len;
+        is_dirs[i] = if (entry.is_dir) 1 else 0;
+        jxl_srcs[i] = if (entry.jxl_source_format.len > 0) entry.jxl_source_format.ptr else @ptrFromInt(1);
+        jxl_src_lens[i] = entry.jxl_source_format.len;
+        gz_levels[i] = entry.gz_level;
+        zip_comps[i] = entry.zip_comp;
+        pdf_offsets[i] = entry.pdf_offset;
+        pdf_lengths[i] = entry.pdf_length;
+    }
+
+    out_count.* = count;
+    out_container_type.* = r.container_type.ptr;
+    out_container_type_len.* = r.container_type.len;
+    out_path_suffixes.* = suffixes.ptr;
+    out_path_suffix_lens.* = suffix_lens.ptr;
+    out_contents.* = contents.ptr;
+    out_content_lens.* = content_lens_arr.ptr;
+    out_is_dirs.* = is_dirs.ptr;
+    out_jxl_sources.* = jxl_srcs.ptr;
+    out_jxl_source_lens.* = jxl_src_lens.ptr;
+    out_gz_levels.* = gz_levels.ptr;
+    out_zip_comps.* = zip_comps.ptr;
+    out_pdf_offsets.* = pdf_offsets.ptr;
+    out_pdf_lengths.* = pdf_lengths.ptr;
+
+    // Transfer ownership — don't deinit the entries, caller owns them now
+    // But free the entries array wrapper (not the contents)
+    page_allocator.free(r.entries);
+
+    return 0;
+}
+
+/// Collapse a container back to its original file.
+/// Takes codec name + array of (inner_path, content) children.
+/// Returns reconstructed file bytes.
+export fn blip_collapse_container(
+    codec_name: [*]const u8,
+    codec_name_len: usize,
+    child_count: usize,
+    child_paths: [*]const [*]const u8,
+    child_path_lens: [*]const usize,
+    child_contents: [*]const [*]const u8,
+    child_content_lens: [*]const usize,
+    child_pdf_offsets: ?[*]const u64,
+    child_pdf_lengths: ?[*]const u64,
+    child_zip_comps: ?[*]const u16,
+    child_jxl_sources: ?[*]const [*]const u8,
+    child_jxl_source_lens: ?[*]const usize,
+    out_data: *[*]u8,
+    out_data_len: *usize,
+) callconv(.c) i32 {
+    const codec = codec_name[0..codec_name_len];
+
+    const children = page_allocator.alloc(expansion_mod.CollapseChild, child_count) catch return -13;
+    defer page_allocator.free(children);
+
+    for (0..child_count) |i| {
+        children[i] = .{
+            .inner_path = child_paths[i][0..child_path_lens[i]],
+            .content = child_contents[i][0..child_content_lens[i]],
+            .pdf_offset = if (child_pdf_offsets) |po| po[i] else std.math.maxInt(u64),
+            .pdf_length = if (child_pdf_lengths) |pl| pl[i] else std.math.maxInt(u64),
+            .zip_comp = if (child_zip_comps) |zc| zc[i] else 0xFFFF,
+            .jxl_source = if (child_jxl_sources != null and child_jxl_source_lens != null)
+                child_jxl_sources.?[i][0..child_jxl_source_lens.?[i]]
+            else
+                &.{},
+        };
+    }
+
+    const result = expansion_mod.collapseContainer(page_allocator, codec, children) catch return -1;
+    if (result == null) return -1;
+    const data = result.?;
+
+    out_data.* = data.ptr;
+    out_data_len.* = data.len;
+    return 0;
+}
+
 
 // --- FlateDecode (PDF) ---
 

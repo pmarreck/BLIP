@@ -129,19 +129,50 @@
 ## Container Expansion Roadmap
 
 ### Audio lossless transcoding
-- [ ] WAV → FLAC container expansion — Uncompressed PCM → FLAC lossless (~50-60% savings). Bit-exact WAV reconstruction on extraction. Needs libFLAC or Zig FLAC encoder.
-- [ ] AIFF → FLAC container expansion — Same as WAV but Apple's format. Parse AIFF chunks, extract PCM, encode FLAC. Reconstruct AIFF with original chunk metadata.
+- [x] WAV → FLAC container expansion — Uncompressed PCM → FLAC lossless via libFLAC (zig-pkgs/flac, lazy dep). Compact WAV metadata stores only non-PCM bytes. Byte-identical WAV reconstruction on extraction. 50-60% savings on realistic audio.
+- [x] AIFF → FLAC container expansion — Parse AIFF chunks (big-endian PCM), encode to FLAC via libFLAC. BE/LE conversion for FLAC encoding. Byte-identical roundtrip.
 
 ### Image lossless transcoding
-- [ ] BMP → JXL container expansion — Uncompressed raster → JXL lossless (90%+ savings). Easy: parse BMP header, extract pixels, use existing blip_jxl_from_pixels. Store BMP header as metadata for faithful reconstruction.
-- [ ] TIFF → JXL container expansion — Uncompressed or LZW-compressed raster → JXL lossless (50-80% savings). Parse TIFF IFDs, extract pixel strips/tiles, JXL encode. Preserve EXIF/XMP metadata.
-- [ ] GIF → JXL container expansion — Static and animated GIF → JXL lossless. libjxl supports animated JXL natively. CAUTION: roundtrip animated GIF requires preserving frame timings, disposal methods, and palette. Verify animated roundtrip produces identical GIF.
+- [x] BMP → JXL container expansion — Uncompressed raster → JXL lossless (90%+ savings). Parse BMP header (24/32-bit uncompressed), extract pixels to RGB(A), JXL lossless encode. Store original BMP header as metadata for byte-identical reconstruction.
+- [x] TIFF → JXL container expansion — Uncompressed raster → JXL lossless (97%+ savings). Parse TIFF IFDs, extract pixel strips, JXL encode. Compact metadata stores only non-pixel bytes. Byte-identical reconstruction.
+- [x] GIF → JXL container expansion — Pure Zig GIF parser (LZW decompression), static GIF → RGBA pixels → JXL lossless. Original GIF stored as metadata for byte-identical reconstruction. Expansion typically skipped by size check since GIF is already compressed; value comes from LZMA2 compression of the JXL+palette. Animated GIF deferred (returns error, treated as opaque file).
 - [ ] DNG (Digital Negative) container expansion — Extract embedded JPEG preview (→ JXL transcode), decompress deflate-compressed raw sensor data for better LZMA2 compression, preserve TIFF structure for reconstruction. DNG files are large and common in photography workflows.
+
+### Uncompressed raster formats
+- [x] TGA → JXL container expansion — Raw pixels + 18-byte header → JXL lossless. Same pattern as BMP. 24/32-bit uncompressed true-color. Byte-identical roundtrip, ~90% savings.
+
+### Professional/scientific imaging
+- [x] DICOM → JXL container expansion — Medical imaging (.dcm). Parse DICOM tags (explicit VR), extract uncompressed pixel data (8/16-bit), JXL lossless encode. Compact metadata stores non-pixel DICOM tags. Byte-identical roundtrip. Encapsulated (JPEG/J2K) DICOM rejected as opaque.
+- [x] FITS → JXL container expansion — Astronomy imaging (.fits). 8/16-bit integer pixel arrays + text headers. BE→LE conversion for JXL encoding. Compact metadata stores only header blocks. Byte-identical roundtrip.
+- [ ] ICO/CUR → JXL container expansion — Deferred: icon files are typically very small, expansion overhead not justified.
 ### Archive decomposition
-- [ ] tar → expand — Decompose tar archives into individual files. Parse 512-byte headers, extract entries as a directory tree. With MIME sorting in solid mode, this lets LZMA2 group similar file types together.
+- [x] tar → expand — Decompose tar archives into individual files. Parse 512-byte headers, extract entries as a directory tree. With MIME sorting in solid mode, this lets LZMA2 group similar file types together. Byte-identical reconstruction on extraction.
 
 ### Additional ZIP-based formats to detect
-- [ ] Add all ZIP-based format extensions to codec detection: `.cbz` (comics), `.jar`/`.war`/`.ear` (Java), `.apk`/`.aab` (Android), `.ipa` (iOS), `.xpi` (Firefox), `.crx` (Chrome), `.3mf`/`.amf` (3D printing), `.sketch`, `.ott`/`.ots`/`.otp` (LibreOffice templates)
+- [x] Add all ZIP-based format extensions to codec detection: `.cbz` (comics), `.jar`/`.war`/`.ear` (Java), `.apk`/`.aab` (Android), `.ipa` (iOS), `.xpi` (Firefox), `.crx` (Chrome), `.3mf`/`.amf` (3D printing), `.sketch`, `.ott`/`.ots`/`.otp` (LibreOffice templates)
+
+
+### Formats using zlib/gzip/deflate internally
+- [ ] SWF (Flash) container expansion — Dead format but heavily archived. Contains zlib-compressed streams (shapes, bitmaps, ActionScript bytecode). Decompress streams for better LZMA2 compression. Byte-identical reconstruction.
+- [ ] WOFF → decompressed font expansion — Web Open Font Format uses zlib internally. Decompress tables, store glyph outlines for JXL (bitmap fonts) or better LZMA2 (outline fonts). Reconstruct WOFF with original zlib levels.
+- [ ] HDF5 container expansion — Hierarchical Data Format (.h5, .hdf5). Ubiquitous in science/ML. Datasets compressed with gzip, szip, or uncompressed. Decompose into individual datasets, re-compress each optimally. Image datasets → JXL.
+- [ ] NetCDF container expansion — Climate/weather data (.nc). Internally uses zlib on variables. Decompose variables, JXL for gridded image data, LZMA2 for numeric arrays.
+- [ ] MAT container expansion — MATLAB data files (.mat). v5+ uses zlib internally. Decompose variables, JXL for image arrays, LZMA2 for numeric data.
+- [ ] ROOT container expansion — CERN particle physics (.root). Uses zlib or LZ4 internally. Decompress TTree branches for better LZMA2 grouping.
+
+### Data engineering formats (Snappy/zlib internally)
+- [ ] Parquet container expansion — Columnar data format (.parquet). Uses Snappy, gzip, or LZO per column chunk. Decompress and re-group columns for LZMA2. High value for data archival.
+- [ ] Avro container expansion — Row-oriented data (.avro). Uses Snappy or deflate per block. Decompress blocks for LZMA2.
+- [ ] ORC container expansion — Columnar format (.orc). Uses zlib or Snappy per stripe. Same approach as Parquet.
+
+### Medical/financial imaging (high-security archival candidates)
+- [ ] NIfTI container expansion — Neuroimaging (.nii). Uncompressed 3D/4D voxel arrays + 348-byte header. Same approach as FITS but with 3D slicing. Hospitals and research institutions archive these long-term, often with encryption requirements (HIPAA).
+- [ ] DNG container expansion — Digital Negative (.dng). TIFF-based with embedded JPEG preview + raw sensor data. Extract JPEG preview → JXL transcode, decompress deflate-compressed raw data for better LZMA2. Photography studios archive large DNG collections.
+- [ ] PSD container expansion — Photoshop (.psd). Layer-based format with raw pixel data per layer. Extract layers, JXL-encode each. Professional photography/design archives.
+- [ ] MINC container expansion — HDF5-based neuroimaging (.mnc). Decomposes to HDF5 datasets. Medical data subject to privacy regulations.
+
+### Database archival
+- [ ] SQLite container expansion — Uncompressed B-tree pages (.sqlite, .db). Decompose into page-level entries for better LZMA2 grouping. Database backups are common archival targets, especially when encrypted for compliance.
 
 ## GUI Application Roadmap
 

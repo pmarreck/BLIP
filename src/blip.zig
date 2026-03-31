@@ -848,6 +848,17 @@ pub const zip_mod = @import("zip.zig");
 pub const jxl_mod = @import("jxl.zig");
 pub const pdf_mod = @import("pdf.zig");
 pub const png_mod = @import("png.zig");
+pub const bmp_mod = @import("bmp.zig");
+pub const tar_mod = @import("tar.zig");
+pub const tiff_mod = @import("tiff.zig");
+pub const gif_mod = @import("gif.zig");
+pub const tga_mod = @import("tga.zig");
+pub const wav_mod = @import("wav.zig");
+pub const flac_mod = @import("flac.zig");
+pub const dicom_mod = @import("dicom.zig");
+pub const expansion_mod = @import("expansion.zig");
+pub const fits_mod = @import("fits.zig");
+pub const aiff_mod = @import("aiff.zig");
 
 // ---------------------------------------------------------------------------
 // Pull in tests from other encoding modules
@@ -882,4 +893,15 @@ test {
     _ = @import("jxl.zig");
     _ = @import("pdf.zig");
     _ = @import("png.zig");
+    _ = @import("bmp.zig");
+    _ = @import("tar.zig");
+    _ = @import("tiff.zig");
+    _ = @import("gif.zig");
+    _ = @import("tga.zig");
+    _ = @import("wav.zig");
+    _ = @import("flac.zig");
+    _ = @import("aiff.zig");
+    _ = @import("fits.zig");
+    _ = @import("dicom.zig");
+    _ = @import("expansion.zig");
 }

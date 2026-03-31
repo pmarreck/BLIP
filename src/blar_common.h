@@ -1723,6 +1723,156 @@ static int blar_extract_to_dir(
             continue;
         }
 
+
+        /* Try Zig-based collapse for migrated formats */
+        {
+            static const char *zig_collapse_codecs[] = {
+                "bmp", "tga", "tiff", "png", "gif", "fits", "dicom", "wav", "aiff", "gz", "tar", "jpeg", "zip", NULL
+            };
+            bool is_zig_codec = false;
+            for (const char **zc = zig_collapse_codecs; *zc; zc++) {
+                if (co_type && strlen(*zc) == co_type_len && memcmp(*zc, co_type, co_type_len) == 0) {
+                    is_zig_codec = true; break;
+                }
+            }
+
+            if (is_zig_codec) {
+                /* Collect all child entries for this container */
+                size_t child_cap = 8;
+                size_t child_n = 0;
+                const char **child_paths_arr = malloc(child_cap * sizeof(const char *));
+                size_t *child_path_lens_arr = malloc(child_cap * sizeof(size_t));
+                const uint8_t **child_contents_arr = malloc(child_cap * sizeof(const uint8_t *));
+                size_t *child_content_lens_arr = malloc(child_cap * sizeof(size_t));
+                uint8_t **child_data_ptrs = malloc(child_cap * sizeof(uint8_t *));
+                uint64_t *child_pdf_offs = malloc(child_cap * sizeof(uint64_t));
+                uint64_t *child_pdf_lens = malloc(child_cap * sizeof(uint64_t));
+                uint16_t *child_zip_comps = malloc(child_cap * sizeof(uint16_t));
+                const char **child_jxl_srcs = malloc(child_cap * sizeof(const char *));
+                size_t *child_jxl_src_lens = malloc(child_cap * sizeof(size_t));
+
+                if (!child_paths_arr || !child_path_lens_arr || !child_contents_arr || !child_content_lens_arr || !child_data_ptrs || !child_pdf_offs || !child_pdf_lens) {
+                    free(child_paths_arr); free(child_path_lens_arr);
+                    free(child_contents_arr); free(child_content_lens_arr); free(child_data_ptrs);
+                    free(child_pdf_offs); free(child_pdf_lens); free(child_zip_comps);
+                    free(child_jxl_srcs); free(child_jxl_src_lens);
+                    failed++; continue;
+                }
+
+                for (uint64_t j = 0; j < count; j++) {
+                    if (j == co_idx) continue;
+                    const char *j_path = NULL; size_t j_path_len = 0;
+                    if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                    if (j_path_len <= co_path_len + 1 ||
+                        memcmp(j_path, co_path, co_path_len) != 0 ||
+                        j_path[co_path_len] != '/')
+                        continue;
+                    const char *inner = j_path + co_path_len + 1;
+                    size_t inner_len = j_path_len - co_path_len - 1;
+
+                    uint8_t *j_content = NULL; size_t j_content_len = 0;
+                    rc = blip_archive_file_content(buf, buf_len, j, &j_content, &j_content_len);
+                    if (rc != BLIP_OK) continue;
+
+                    if (child_n >= child_cap) {
+                        child_cap *= 2;
+                        child_paths_arr = realloc(child_paths_arr, child_cap * sizeof(const char *));
+                        child_path_lens_arr = realloc(child_path_lens_arr, child_cap * sizeof(size_t));
+                        child_contents_arr = realloc(child_contents_arr, child_cap * sizeof(const uint8_t *));
+                        child_content_lens_arr = realloc(child_content_lens_arr, child_cap * sizeof(size_t));
+                        child_data_ptrs = realloc(child_data_ptrs, child_cap * sizeof(uint8_t *));
+                        child_pdf_offs = realloc(child_pdf_offs, child_cap * sizeof(uint64_t));
+                        child_pdf_lens = realloc(child_pdf_lens, child_cap * sizeof(uint64_t));
+                        child_jxl_srcs = realloc(child_jxl_srcs, child_cap * sizeof(const char *));
+                        child_jxl_src_lens = realloc(child_jxl_src_lens, child_cap * sizeof(size_t));
+                        child_zip_comps = realloc(child_zip_comps, child_cap * sizeof(uint16_t));
+                    }
+                    child_paths_arr[child_n] = inner;
+                    child_path_lens_arr[child_n] = inner_len;
+                    child_contents_arr[child_n] = j_content;
+                    child_content_lens_arr[child_n] = j_content_len;
+                    child_data_ptrs[child_n] = j_content;
+                    /* Collect PDF/JXL metadata for this child */
+                    child_pdf_offs[child_n] = UINT64_MAX;
+                    child_pdf_lens[child_n] = UINT64_MAX;
+                    child_jxl_srcs[child_n] = "";
+                    child_jxl_src_lens[child_n] = 0;
+
+                    blip_archive_entry_pdf_offset(buf, buf_len, j, &child_pdf_offs[child_n]);
+                    blip_archive_entry_pdf_length(buf, buf_len, j, &child_pdf_lens[child_n]);
+                    {
+                        const char *js = NULL; size_t js_len = 0;
+                        blip_archive_entry_jxl_source(buf, buf_len, j, &js, &js_len);
+                        if (js) { child_jxl_srcs[child_n] = js; child_jxl_src_lens[child_n] = js_len; }
+                    }
+                    {
+                        uint16_t zc = 0xFFFF;
+                        blip_archive_entry_zip_comp(buf, buf_len, j, &zc);
+                        child_zip_comps[child_n] = zc;
+                    }
+                    child_n++;
+                }
+
+                uint8_t *result_data = NULL; size_t result_len = 0;
+                int collapse_rc = blip_collapse_container(
+                    co_type, co_type_len,
+                    child_n,
+                    child_paths_arr, child_path_lens_arr,
+                    child_contents_arr, child_content_lens_arr,
+                    child_pdf_offs, child_pdf_lens, child_zip_comps,
+                    child_jxl_srcs, child_jxl_src_lens,
+                    &result_data, &result_len
+                );
+
+                /* Free child content */
+                for (size_t ci = 0; ci < child_n; ci++)
+                    blip_free_content(child_data_ptrs[ci], child_content_lens_arr[ci]);
+                free(child_paths_arr); free(child_path_lens_arr);
+                free(child_contents_arr); free(child_content_lens_arr); free(child_data_ptrs);
+                free(child_pdf_offs); free(child_pdf_lens); free(child_zip_comps);
+                free(child_jxl_srcs); free(child_jxl_src_lens);
+
+                if (collapse_rc != 0) {
+                    EXTRACT_LOG("\033[31mERROR: container '%.*s' (%.*s): Zig collapse failed\033[0m",
+                            (int)co_path_len, co_path, (int)co_type_len, co_type);
+                    failed++; continue;
+                }
+
+                /* Write result */
+                char out_path[4096];
+                if (output_dir) {
+                    int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                    if (n < 0 || (size_t)n >= sizeof(out_path)) { blip_free(result_data, result_len); failed++; continue; }
+                } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+
+                if (!ensure_parent_dir(out_path) || !write_file(out_path, result_data, result_len)) {
+                    blip_free(result_data, result_len); failed++; continue;
+                }
+                blip_free(result_data, result_len);
+
+                /* Restore metadata */
+                uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+                const char *co_owner = NULL; size_t co_owner_len = 0;
+                blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+                if (co_mode != 0) chmod(out_path, co_mode);
+                if (co_mtime_ns != 0) {
+                    struct timespec times[2];
+                    times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                    times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                    utimensat(AT_FDCWD, out_path, times, 0);
+                }
+                blip_xattr_entry *co_xattrs = NULL; size_t co_xattr_count = 0;
+                uint8_t *co_rfork = NULL; size_t co_rfork_len = 0;
+                if (blip_archive_entry_xattrs(buf, buf_len, co_idx, &co_xattrs, &co_xattr_count, &co_rfork, &co_rfork_len) == BLIP_OK) {
+                    if (co_xattr_count > 0 || co_rfork_len > 0) write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                    blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                }
+                files_done++;
+                if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+                continue;
+            }
+        }
+
         /* PDF container re-assembly */
         if (codec && strcmp(codec->name, "pdf") == 0) {
             /* Find __body__ child -> read shell */
@@ -2440,6 +2590,949 @@ static int blar_extract_to_dir(
                 continue;
             }
             blip_free(png_data, png_len);
+
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+
+
+        /* TAR container re-assembly */
+        if (codec && strcmp(codec->name, "tar") == 0) {
+            /* Read __meta__ child — contains all tar headers + trailer */
+            uint8_t *meta_data = NULL;
+            size_t meta_data_len = 0;
+            bool found_meta = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len == co_path_len + 9 &&
+                    memcmp(j_path, co_path, co_path_len) == 0 &&
+                    memcmp(j_path + co_path_len, "/__meta__", 9) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                    break;
+                }
+            }
+
+            if (!found_meta || meta_data_len < 16) {
+                EXTRACT_LOG("\033[31mERROR: TAR container '%.*s': missing __meta__\033[0m",
+                        (int)co_path_len, co_path);
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Parse meta: [u64_le count][u64_le trailer_len][trailer][headers+typeflags] */
+            uint64_t entry_count = 0;
+            for (int b = 0; b < 8; b++) entry_count |= (uint64_t)meta_data[b] << (b * 8);
+            uint64_t tar_trailer_len = 0;
+            for (int b = 0; b < 8; b++) tar_trailer_len |= (uint64_t)meta_data[8 + b] << (b * 8);
+
+            const uint8_t *tar_trailer = meta_data + 16;
+            const uint8_t *hdr_start = meta_data + 16 + tar_trailer_len;
+
+            /* Collect child content in entry order */
+            /* Calculate total tar size */
+            size_t tar_size = 0;
+            for (uint64_t ei = 0; ei < entry_count; ei++) {
+                const uint8_t *hdr = hdr_start + ei * 513;
+                /* Read size from header field at offset 124..136 */
+                uint64_t sz = 0;
+                for (int k = 0; k < 11; k++) {
+                    uint8_t c = hdr[124 + k];
+                    if (c == 0 || c == ' ') break;
+                    if (c < '0' || c > '7') { sz = 0; break; }
+                    sz = sz * 8 + (c - '0');
+                }
+                tar_size += 512; /* header */
+                tar_size += (sz + 511) & ~(uint64_t)511; /* padded content */
+            }
+            tar_size += (tar_trailer_len > 0) ? tar_trailer_len : 1024;
+
+            uint8_t *tar_buf = calloc(1, tar_size);
+            if (!tar_buf) {
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            size_t toff = 0;
+            bool tar_ok = true;
+
+            for (uint64_t ei = 0; ei < entry_count && tar_ok; ei++) {
+                const uint8_t *hdr = hdr_start + ei * 513;
+                /* Write header */
+                memcpy(tar_buf + toff, hdr, 512);
+                toff += 512;
+
+                /* Read size */
+                uint64_t sz = 0;
+                for (int k = 0; k < 11; k++) {
+                    uint8_t c = hdr[124 + k];
+                    if (c == 0 || c == ' ') break;
+                    if (c < '0' || c > '7') { sz = 0; break; }
+                    sz = sz * 8 + (c - '0');
+                }
+
+                if (sz > 0) {
+                    /* Find child entry __entry_NNNN/... */
+                    char prefix[64];
+                    int plen = snprintf(prefix, sizeof(prefix), "/__entry_%04llu/", (unsigned long long)ei);
+                    bool found_child = false;
+
+                    for (uint64_t j = 0; j < count; j++) {
+                        if (j == co_idx) continue;
+                        const char *j_path = NULL;
+                        size_t j_path_len = 0;
+                        if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                            continue;
+                        if (j_path_len > co_path_len + (size_t)plen &&
+                            memcmp(j_path, co_path, co_path_len) == 0 &&
+                            memcmp(j_path + co_path_len, prefix, (size_t)plen) == 0) {
+                            uint8_t *child_data = NULL;
+                            size_t child_len = 0;
+                            rc = blip_archive_file_content(buf, buf_len, j, &child_data, &child_len);
+                            if (rc == BLIP_OK && child_len == sz) {
+                                memcpy(tar_buf + toff, child_data, child_len);
+                                blip_free_content(child_data, child_len);
+                                found_child = true;
+                            } else {
+                                if (child_data) blip_free_content(child_data, child_len);
+                            }
+                            break;
+                        }
+                    }
+                    if (!found_child) {
+                        EXTRACT_LOG("\033[31mERROR: TAR container '%.*s': missing entry %llu content\033[0m",
+                                (int)co_path_len, co_path, (unsigned long long)ei);
+                        tar_ok = false;
+                    }
+                    toff += ((size_t)sz + 511) & ~(size_t)511;
+                }
+            }
+
+            if (tar_ok) {
+                /* Write trailer */
+                if (tar_trailer_len > 0)
+                    memcpy(tar_buf + toff, tar_trailer, tar_trailer_len);
+
+                char out_path[4096];
+                if (output_dir) {
+                    int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                     output_dir, (int)co_path_len, co_path);
+                    if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                        free(tar_buf);
+                        blip_free_content(meta_data, meta_data_len);
+                        failed++;
+                        continue;
+                    }
+                } else {
+                    memcpy(out_path, co_path, co_path_len);
+                    out_path[co_path_len] = '\0';
+                }
+
+                if (!ensure_parent_dir(out_path)) {
+                    EXTRACT_LOG("\033[31mERROR: TAR container '%.*s': cannot create parent dir\033[0m",
+                            (int)co_path_len, co_path);
+                    free(tar_buf);
+                    blip_free_content(meta_data, meta_data_len);
+                    failed++;
+                    continue;
+                }
+
+                if (!write_file(out_path, (uint8_t *)tar_buf, tar_size)) {
+                    EXTRACT_LOG("\033[31mERROR: TAR container '%.*s': cannot write\033[0m",
+                            (int)co_path_len, co_path);
+                    free(tar_buf);
+                    blip_free_content(meta_data, meta_data_len);
+                    failed++;
+                    continue;
+                }
+
+                /* Restore metadata */
+                uint16_t co_mode = 0;
+                int64_t co_mtime_ns = 0;
+                const char *co_owner = NULL;
+                size_t co_owner_len = 0;
+                blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+                if (co_mode != 0) chmod(out_path, co_mode);
+                if (co_mtime_ns != 0) {
+                    struct timespec times[2];
+                    times[0].tv_sec = 0;
+                    times[0].tv_nsec = UTIME_OMIT;
+                    times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                    times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                    utimensat(AT_FDCWD, out_path, times, 0);
+                }
+
+                files_done++;
+                if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            } else {
+                failed++;
+            }
+
+            free(tar_buf);
+            blip_free_content(meta_data, meta_data_len);
+            continue;
+        }
+
+
+
+
+
+
+
+
+        /* DICOM container re-assembly */
+        if (codec && strcmp(codec->name, "dicom") == 0) {
+            uint8_t *meta_data = NULL; size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL; size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL; size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                if (j_path_len <= co_path_len + 1 || memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/') continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+            if (!found_meta || !found_pixels || meta_data_len < 12) {
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++; continue;
+            }
+            uint8_t *pixels = NULL; size_t pixels_len = 0;
+            uint32_t pw = 0, ph = 0, pch = 0, pbps = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len, &pixels, &pixels_len, &pw, &ph, &pch, &pbps);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) { blip_free_content(meta_data, meta_data_len); failed++; continue; }
+
+            /* Reconstruct from template */
+            uint32_t file_size = meta_data[0] | (meta_data[1] << 8) | (meta_data[2] << 16) | ((uint32_t)meta_data[3] << 24);
+            uint32_t pixel_offset = meta_data[4] | (meta_data[5] << 8) | (meta_data[6] << 16) | ((uint32_t)meta_data[7] << 24);
+            uint32_t pixel_size = meta_data[8] | (meta_data[9] << 8) | (meta_data[10] << 16) | ((uint32_t)meta_data[11] << 24);
+            uint8_t *dcm_buf = calloc(1, file_size);
+            if (!dcm_buf) { blip_free(pixels, pixels_len); blip_free_content(meta_data, meta_data_len); failed++; continue; }
+
+            if (pixel_offset <= file_size && 12 + pixel_offset <= meta_data_len)
+                memcpy(dcm_buf, meta_data + 12, pixel_offset);
+            size_t copy_len = pixel_size < pixels_len ? pixel_size : pixels_len;
+            if (pixel_offset + copy_len <= file_size)
+                memcpy(dcm_buf + pixel_offset, pixels, copy_len);
+            blip_free(pixels, pixels_len);
+            size_t post_off = 12 + pixel_offset;
+            if (post_off < meta_data_len) {
+                size_t post_len = meta_data_len - post_off;
+                size_t post_start = pixel_offset + pixel_size;
+                if (post_start + post_len <= file_size)
+                    memcpy(dcm_buf + post_start, meta_data + post_off, post_len);
+            }
+            blip_free_content(meta_data, meta_data_len);
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) { free(dcm_buf); failed++; continue; }
+            } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, dcm_buf, file_size)) {
+                free(dcm_buf); failed++; continue;
+            }
+            free(dcm_buf);
+            uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL; size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* FITS container re-assembly */
+        if (codec && strcmp(codec->name, "fits") == 0) {
+            uint8_t *meta_data = NULL; size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL; size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL; size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                if (j_path_len <= co_path_len + 1 || memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/') continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+            if (!found_meta || !found_pixels || meta_data_len < 12) {
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++; continue;
+            }
+
+            uint8_t *pixels = NULL; size_t pixels_len = 0;
+            uint32_t pw = 0, ph = 0, pch = 0, pbps = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len, &pixels, &pixels_len, &pw, &ph, &pch, &pbps);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) { blip_free_content(meta_data, meta_data_len); failed++; continue; }
+
+            /* Convert LE pixels back to BE for FITS */
+            if (pbps == 16) {
+                for (size_t i = 0; i + 1 < pixels_len; i += 2) {
+                    uint8_t tmp = pixels[i]; pixels[i] = pixels[i+1]; pixels[i+1] = tmp;
+                }
+            }
+
+            /* Reconstruct from template */
+            uint32_t file_size = (uint32_t)meta_data[0] << 24 | (uint32_t)meta_data[1] << 16 |
+                                 (uint32_t)meta_data[2] << 8 | (uint32_t)meta_data[3];
+            uint32_t pixel_offset = (uint32_t)meta_data[4] << 24 | (uint32_t)meta_data[5] << 16 |
+                                    (uint32_t)meta_data[6] << 8 | (uint32_t)meta_data[7];
+            uint32_t pixel_size = (uint32_t)meta_data[8] << 24 | (uint32_t)meta_data[9] << 16 |
+                                  (uint32_t)meta_data[10] << 8 | (uint32_t)meta_data[11];
+
+            uint8_t *fits_buf = calloc(1, file_size);
+            if (!fits_buf) { blip_free(pixels, pixels_len); blip_free_content(meta_data, meta_data_len); failed++; continue; }
+
+            /* Copy header from meta */
+            if (pixel_offset <= file_size && 12 + pixel_offset <= meta_data_len)
+                memcpy(fits_buf, meta_data + 12, pixel_offset);
+            /* Copy pixels */
+            size_t copy_len = pixel_size < pixels_len ? pixel_size : pixels_len;
+            if (pixel_offset + copy_len <= file_size)
+                memcpy(fits_buf + pixel_offset, pixels, copy_len);
+            blip_free(pixels, pixels_len);
+            /* Copy post-pixel data */
+            size_t post_meta_off = 12 + pixel_offset;
+            if (post_meta_off < meta_data_len) {
+                size_t post_len = meta_data_len - post_meta_off;
+                size_t post_start = pixel_offset + pixel_size;
+                if (post_start + post_len <= file_size)
+                    memcpy(fits_buf + post_start, meta_data + post_meta_off, post_len);
+            }
+            blip_free_content(meta_data, meta_data_len);
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) { free(fits_buf); failed++; continue; }
+            } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, fits_buf, file_size)) {
+                free(fits_buf); failed++; continue;
+            }
+            free(fits_buf);
+            uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL; size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* AIFF container re-assembly (FLAC → PCM → AIFF) */
+        if (codec && strcmp(codec->name, "aiff") == 0) {
+            uint8_t *meta_data = NULL; size_t meta_data_len = 0;
+            uint8_t *flac_data = NULL; size_t flac_data_len = 0;
+            bool found_meta = false, found_audio = false;
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL; size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                if (j_path_len <= co_path_len + 1 || memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/') continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__audio__.flac", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &flac_data, &flac_data_len);
+                    if (rc == BLIP_OK) found_audio = true;
+                }
+            }
+            if (!found_meta || !found_audio) {
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (flac_data) blip_free_content(flac_data, flac_data_len);
+                failed++; continue;
+            }
+            uint8_t *aiff_data = NULL; size_t aiff_len = 0;
+            rc = blip_flac_to_aiff(flac_data, flac_data_len, meta_data, meta_data_len, &aiff_data, &aiff_len);
+            blip_free_content(flac_data, flac_data_len);
+            blip_free_content(meta_data, meta_data_len);
+            if (rc != BLIP_OK) { failed++; continue; }
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) { blip_free(aiff_data, aiff_len); failed++; continue; }
+            } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, aiff_data, aiff_len)) {
+                blip_free(aiff_data, aiff_len); failed++; continue;
+            }
+            blip_free(aiff_data, aiff_len);
+            uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL; size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* WAV container re-assembly (FLAC → PCM → WAV) */
+        if (codec && strcmp(codec->name, "wav") == 0) {
+            uint8_t *meta_data = NULL; size_t meta_data_len = 0;
+            uint8_t *flac_data = NULL; size_t flac_data_len = 0;
+            bool found_meta = false, found_audio = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL; size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                if (j_path_len <= co_path_len + 1 || memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/') continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__audio__.flac", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &flac_data, &flac_data_len);
+                    if (rc == BLIP_OK) found_audio = true;
+                }
+            }
+            if (!found_meta || !found_audio) {
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (flac_data) blip_free_content(flac_data, flac_data_len);
+                failed++; continue;
+            }
+
+            uint8_t *wav_data = NULL; size_t wav_len = 0;
+            rc = blip_flac_to_wav(flac_data, flac_data_len, meta_data, meta_data_len, &wav_data, &wav_len);
+            blip_free_content(flac_data, flac_data_len);
+            blip_free_content(meta_data, meta_data_len);
+            if (rc != BLIP_OK) { failed++; continue; }
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) { blip_free(wav_data, wav_len); failed++; continue; }
+            } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, wav_data, wav_len)) {
+                blip_free(wav_data, wav_len); failed++; continue;
+            }
+            blip_free(wav_data, wav_len);
+
+            uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL; size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* TGA container re-assembly */
+        if (codec && strcmp(codec->name, "tga") == 0) {
+            uint8_t *meta_data = NULL; size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL; size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL; size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK) continue;
+                if (j_path_len <= co_path_len + 1 || memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/') continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+            if (!found_meta || !found_pixels) {
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++; continue;
+            }
+
+            uint8_t *pixels = NULL; size_t pixels_len = 0;
+            uint32_t pw = 0, ph = 0, pch = 0, pbps = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len, &pixels, &pixels_len, &pw, &ph, &pch, &pbps);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) { blip_free_content(meta_data, meta_data_len); failed++; continue; }
+
+            uint8_t *tga_data = NULL; size_t tga_len = 0;
+            rc = blip_tga_encode(pixels, pixels_len, pw, ph, meta_data, meta_data_len, &tga_data, &tga_len);
+            blip_free(pixels, pixels_len);
+            blip_free_content(meta_data, meta_data_len);
+            if (rc != BLIP_OK) { failed++; continue; }
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s", output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) { blip_free(tga_data, tga_len); failed++; continue; }
+            } else { memcpy(out_path, co_path, co_path_len); out_path[co_path_len] = '\0'; }
+
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, tga_data, tga_len)) {
+                blip_free(tga_data, tga_len); failed++; continue;
+            }
+            blip_free(tga_data, tga_len);
+
+            uint16_t co_mode = 0; int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL; size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL; times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+            blip_xattr_entry *co_xattrs = NULL; size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL; size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx, &co_xattrs, &co_xattr_count, &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0) write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* GIF container re-assembly — __meta__ is the original GIF file */
+        if (codec && strcmp(codec->name, "gif") == 0) {
+            uint8_t *meta_data = NULL;
+            size_t meta_data_len = 0;
+            bool found_meta = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len == co_path_len + 9 &&
+                    memcmp(j_path, co_path, co_path_len) == 0 &&
+                    memcmp(j_path + co_path_len, "/__meta__", 9) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                    break;
+                }
+            }
+
+            if (!found_meta) {
+                EXTRACT_LOG("\033[31mERROR: GIF container '%.*s': missing __meta__\033[0m",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    blip_free_content(meta_data, meta_data_len);
+                    failed++;
+                    continue;
+                }
+            } else {
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path) || !write_file(out_path, meta_data, meta_data_len)) {
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+            blip_free_content(meta_data, meta_data_len);
+
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* TIFF container re-assembly — reconstruct from template + JXL pixels */
+        if (codec && strcmp(codec->name, "tiff") == 0) {
+            uint8_t *meta_data = NULL;
+            size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL;
+            size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len <= co_path_len + 1 ||
+                    memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/')
+                    continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+
+            if (!found_meta || !found_pixels || meta_data_len < 8) {
+                EXTRACT_LOG("\033[31mERROR: TIFF container '%.*s': missing %s%s%s\033[0m",
+                        (int)co_path_len, co_path,
+                        found_meta ? "" : "__meta__",
+                        (!found_meta && !found_pixels) ? " and " : "",
+                        found_pixels ? "" : "__pixels__.jxl");
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Decode JXL back to pixels */
+            uint8_t *pixels = NULL;
+            size_t pixels_len = 0;
+            uint32_t px_w = 0, px_h = 0, px_ch = 0, px_bps = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len,
+                    &pixels, &pixels_len, &px_w, &px_h, &px_ch, &px_bps);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) {
+                EXTRACT_LOG("\033[31mERROR: TIFF container '%.*s': JXL decode failed\033[0m",
+                        (int)co_path_len, co_path);
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Parse meta: [u32 file_size][u32 num_strips][u32 first_pixel][u32 pre_len][u32 post_len]
+             *             [strip_map][pre_pixel_bytes][post_pixel_bytes] */
+            uint32_t file_size = meta_data[0] | (meta_data[1] << 8) |
+                                 (meta_data[2] << 16) | ((uint32_t)meta_data[3] << 24);
+            uint32_t num_strips = meta_data[4] | (meta_data[5] << 8) |
+                                  (meta_data[6] << 16) | ((uint32_t)meta_data[7] << 24);
+            uint32_t first_pixel = meta_data[8] | (meta_data[9] << 8) |
+                                   (meta_data[10] << 16) | ((uint32_t)meta_data[11] << 24);
+            uint32_t pre_len = meta_data[12] | (meta_data[13] << 8) |
+                               (meta_data[14] << 16) | ((uint32_t)meta_data[15] << 24);
+            uint32_t post_len = meta_data[16] | (meta_data[17] << 8) |
+                                (meta_data[18] << 16) | ((uint32_t)meta_data[19] << 24);
+            (void)first_pixel;
+
+            size_t strip_map_start = 20;
+            size_t data_start = strip_map_start + (size_t)num_strips * 8;
+
+            /* Reconstruct full TIFF file */
+            uint8_t *tiff_buf = calloc(1, file_size);
+            if (!tiff_buf) {
+                blip_free(pixels, pixels_len);
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            /* Copy pre-pixel bytes (header + IFD) */
+            if (pre_len > 0 && data_start + pre_len <= meta_data_len)
+                memcpy(tiff_buf, meta_data + data_start, pre_len);
+
+            /* Copy post-pixel bytes (anything after last strip) */
+            if (post_len > 0 && data_start + pre_len + post_len <= meta_data_len) {
+                size_t post_offset = file_size - post_len;
+                memcpy(tiff_buf + post_offset, meta_data + data_start + pre_len, post_len);
+            }
+
+            /* Write pixel data into strip regions */
+            size_t pix_off = 0;
+            for (uint32_t si = 0; si < num_strips; si++) {
+                size_t sm = strip_map_start + si * 8;
+                uint32_t strip_offset = meta_data[sm] | (meta_data[sm+1] << 8) |
+                                       (meta_data[sm+2] << 16) | ((uint32_t)meta_data[sm+3] << 24);
+                uint32_t strip_size = meta_data[sm+4] | (meta_data[sm+5] << 8) |
+                                     (meta_data[sm+6] << 16) | ((uint32_t)meta_data[sm+7] << 24);
+                size_t copy_len = strip_size;
+                if (pix_off + copy_len > pixels_len) copy_len = pixels_len - pix_off;
+                if (strip_offset + copy_len <= file_size)
+                    memcpy(tiff_buf + strip_offset, pixels + pix_off, copy_len);
+                pix_off += strip_size;
+            }
+            blip_free(pixels, pixels_len);
+            blip_free_content(meta_data, meta_data_len);
+
+            /* Write reconstructed TIFF */
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    free(tiff_buf);
+                    failed++;
+                    continue;
+                }
+            } else {
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path)) {
+                free(tiff_buf);
+                failed++;
+                continue;
+            }
+
+            if (!write_file(out_path, tiff_buf, file_size)) {
+                free(tiff_buf);
+                failed++;
+                continue;
+            }
+            free(tiff_buf);
+
+            uint16_t co_mode = 0;
+            int64_t co_mtime_ns = 0;
+            const char *co_owner = NULL;
+            size_t co_owner_len = 0;
+            blip_archive_entry_metadata(buf, buf_len, co_idx, &co_mode, &co_mtime_ns, &co_owner, &co_owner_len);
+            if (co_mode != 0) chmod(out_path, co_mode);
+            if (co_mtime_ns != 0) {
+                struct timespec times[2];
+                times[0].tv_sec = 0;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = co_mtime_ns / 1000000000LL;
+                times[1].tv_nsec = co_mtime_ns % 1000000000LL;
+                utimensat(AT_FDCWD, out_path, times, 0);
+            }
+
+            blip_xattr_entry *co_xattrs = NULL;
+            size_t co_xattr_count = 0;
+            uint8_t *co_rfork = NULL;
+            size_t co_rfork_len = 0;
+            if (blip_archive_entry_xattrs(buf, buf_len, co_idx,
+                    &co_xattrs, &co_xattr_count,
+                    &co_rfork, &co_rfork_len) == BLIP_OK) {
+                if (co_xattr_count > 0 || co_rfork_len > 0)
+                    write_file_xattrs(out_path, co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+                blip_free_xattrs(co_xattrs, co_xattr_count, co_rfork, co_rfork_len);
+            }
+
+            files_done++;
+            if (progress_fn) progress_fn(files_done, bytes_done, file_entries, total_bytes, callback_ctx);
+            continue;
+        }
+
+        /* BMP container re-assembly */
+        if (codec && strcmp(codec->name, "bmp") == 0) {
+            uint8_t *meta_data = NULL;
+            size_t meta_data_len = 0;
+            uint8_t *jxl_data = NULL;
+            size_t jxl_data_len = 0;
+            bool found_meta = false, found_pixels = false;
+
+            for (uint64_t j = 0; j < count; j++) {
+                if (j == co_idx) continue;
+                const char *j_path = NULL;
+                size_t j_path_len = 0;
+                if (blip_archive_file_path(buf, buf_len, j, &j_path, &j_path_len) != BLIP_OK)
+                    continue;
+                if (j_path_len <= co_path_len + 1 ||
+                    memcmp(j_path, co_path, co_path_len) != 0 ||
+                    j_path[co_path_len] != '/')
+                    continue;
+                const char *inner = j_path + co_path_len + 1;
+                size_t inner_len = j_path_len - co_path_len - 1;
+
+                if (inner_len == 8 && memcmp(inner, "__meta__", 8) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &meta_data, &meta_data_len);
+                    if (rc == BLIP_OK) found_meta = true;
+                } else if (inner_len == 14 && memcmp(inner, "__pixels__.jxl", 14) == 0) {
+                    rc = blip_archive_file_content(buf, buf_len, j, &jxl_data, &jxl_data_len);
+                    if (rc == BLIP_OK) found_pixels = true;
+                }
+            }
+
+            if (!found_meta || !found_pixels) {
+                EXTRACT_LOG("\033[31mERROR: BMP container '%.*s': missing %s%s%s\033[0m",
+                        (int)co_path_len, co_path,
+                        found_meta ? "" : "__meta__",
+                        (!found_meta && !found_pixels) ? " and " : "",
+                        found_pixels ? "" : "__pixels__.jxl");
+                if (meta_data) blip_free_content(meta_data, meta_data_len);
+                if (jxl_data) blip_free_content(jxl_data, jxl_data_len);
+                failed++;
+                continue;
+            }
+
+            uint8_t *pixels = NULL;
+            size_t pixels_len = 0;
+            uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+            rc = blip_jxl_to_pixels(jxl_data, jxl_data_len,
+                    &pixels, &pixels_len, &width, &height,
+                    &num_channels, &bits_per_sample);
+            blip_free_content(jxl_data, jxl_data_len);
+            if (rc != BLIP_OK) {
+                EXTRACT_LOG("\033[31mERROR: BMP container '%.*s': JXL decode failed\033[0m",
+                        (int)co_path_len, co_path);
+                blip_free_content(meta_data, meta_data_len);
+                failed++;
+                continue;
+            }
+
+            uint8_t *bmp_data = NULL;
+            size_t bmp_len = 0;
+            rc = blip_bmp_encode(pixels, pixels_len,
+                    width, height,
+                    meta_data, meta_data_len,
+                    &bmp_data, &bmp_len);
+            blip_free(pixels, pixels_len);
+            blip_free_content(meta_data, meta_data_len);
+            if (rc != BLIP_OK) {
+                EXTRACT_LOG("\033[31mERROR: BMP container '%.*s': BMP encode failed\033[0m",
+                        (int)co_path_len, co_path);
+                failed++;
+                continue;
+            }
+
+            char out_path[4096];
+            if (output_dir) {
+                int n = snprintf(out_path, sizeof(out_path), "%s/%.*s",
+                                 output_dir, (int)co_path_len, co_path);
+                if (n < 0 || (size_t)n >= sizeof(out_path)) {
+                    blip_free(bmp_data, bmp_len);
+                    failed++;
+                    continue;
+                }
+            } else {
+                if (co_path_len >= sizeof(out_path)) {
+                    blip_free(bmp_data, bmp_len);
+                    failed++;
+                    continue;
+                }
+                memcpy(out_path, co_path, co_path_len);
+                out_path[co_path_len] = '\0';
+            }
+
+            if (!ensure_parent_dir(out_path)) {
+                EXTRACT_LOG("\033[31mERROR: BMP container '%.*s': cannot create parent dir: %s\033[0m",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(bmp_data, bmp_len);
+                failed++;
+                continue;
+            }
+
+            if (!write_file(out_path, bmp_data, bmp_len)) {
+                EXTRACT_LOG("\033[31mERROR: BMP container '%.*s': cannot write: %s\033[0m",
+                        (int)co_path_len, co_path, strerror(errno));
+                blip_free(bmp_data, bmp_len);
+                failed++;
+                continue;
+            }
+            blip_free(bmp_data, bmp_len);
 
             uint16_t co_mode = 0;
             int64_t co_mtime_ns = 0;
@@ -3608,6 +4701,1086 @@ static bool expand_png_container(entry_list_t *el,
     return true;
 }
 
+
+
+/* ── TAR container expansion ─────────────────────────────────────────── */
+
+static bool expand_tar_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    /* Skip tiny tars */
+    if (content_len < 1024) return false;
+
+    /* Parse tar into entries */
+    size_t count = 0;
+    uint8_t **paths = NULL, **contents = NULL, **headers = NULL;
+    size_t *path_lens = NULL, *content_lens = NULL;
+    uint8_t *typeflags = NULL;
+    uint8_t *trailer = NULL;
+    size_t trailer_len = 0;
+
+    if (blip_tar_parse(content, content_len,
+            &count, &paths, &path_lens,
+            &contents, &content_lens,
+            &headers, &typeflags,
+            &trailer, &trailer_len) != BLIP_OK)
+        return false;
+
+    if (count == 0) {
+        blip_free((uint8_t *)paths, count * sizeof(uint8_t *));
+        blip_free((uint8_t *)path_lens, count * sizeof(size_t));
+        blip_free((uint8_t *)contents, count * sizeof(uint8_t *));
+        blip_free((uint8_t *)content_lens, count * sizeof(size_t));
+        blip_free((uint8_t *)headers, count * sizeof(uint8_t *));
+        blip_free((uint8_t *)typeflags, count);
+        if (trailer_len > 0) blip_free(trailer, trailer_len);
+        return false;
+    }
+
+    /* Build metadata: [u64_le entry_count][trailer_len_u64][trailer_bytes]
+     *                 then for each entry: [512-byte header][u8 typeflag] */
+    size_t meta_len = 8 + 8 + trailer_len + count * (512 + 1);
+    uint8_t *meta = malloc(meta_len);
+    if (!meta) goto cleanup;
+
+    /* Write count */
+    for (int b = 0; b < 8; b++) meta[b] = (uint8_t)((count >> (b * 8)) & 0xFF);
+    /* Write trailer length */
+    for (int b = 0; b < 8; b++) meta[8 + b] = (uint8_t)((trailer_len >> (b * 8)) & 0xFF);
+    /* Write trailer */
+    if (trailer_len > 0)
+        memcpy(meta + 16, trailer, trailer_len);
+    /* Write headers + typeflags */
+    size_t moff = 16 + trailer_len;
+    for (size_t i = 0; i < count; i++) {
+        memcpy(meta + moff, headers[i], 512);
+        moff += 512;
+        meta[moff] = typeflags[i];
+        moff += 1;
+    }
+
+    if (!entry_list_add_content(el, meta)) { free(meta); goto cleanup; }
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "tar";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) goto cleanup;
+
+    /* Add __meta__ FILE entry (contains all tar headers + trailer for reconstruction) */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) goto cleanup;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) { free(meta_path); goto cleanup; }
+
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path;
+        meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta;
+        meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0;
+        meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX;
+        meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) goto cleanup;
+    }
+
+    /* Add each tar entry as a child FILE */
+    size_t total_content = meta_len;
+    for (size_t i = 0; i < count; i++) {
+        /* Build child path: container_path/__entry_NNN/original_path */
+        char idx_str[32];
+        int idx_len = snprintf(idx_str, sizeof(idx_str), "/__entry_%04zu/", i);
+        size_t child_path_len = file_entry->path_len + (size_t)idx_len + path_lens[i];
+        char *child_path = malloc(child_path_len + 1);
+        if (!child_path) goto cleanup;
+        memcpy(child_path, file_entry->path, file_entry->path_len);
+        memcpy(child_path + file_entry->path_len, idx_str, (size_t)idx_len);
+        memcpy(child_path + file_entry->path_len + (size_t)idx_len, paths[i], path_lens[i]);
+        child_path[child_path_len] = '\0';
+        if (!entry_list_add_content(el, (uint8_t *)child_path)) { free(child_path); goto cleanup; }
+
+        /* Copy content to malloc'd buffer */
+        uint8_t *child_content = NULL;
+        if (content_lens[i] > 0) {
+            child_content = malloc(content_lens[i]);
+            if (!child_content) goto cleanup;
+            memcpy(child_content, contents[i], content_lens[i]);
+            if (!entry_list_add_content(el, child_content)) goto cleanup;
+        }
+
+        blip_archive_entry child_ent;
+        memset(&child_ent, 0, sizeof(child_ent));
+        child_ent.path = child_path;
+        child_ent.path_len = child_path_len;
+        child_ent.content = child_content;
+        child_ent.content_len = content_lens[i];
+        child_ent.is_dir = (typeflags[i] == '5') ? 1 : 0;
+        child_ent.mode = file_entry->mode;
+        child_ent.mtime_ns = file_entry->mtime_ns;
+        child_ent.zip_compression_method = 0xFFFF;
+        child_ent.pdf_stream_offset = UINT64_MAX;
+        child_ent.pdf_stream_length = UINT64_MAX;
+        memset(child_ent.xh64, 0, 8);
+        if (!entry_list_add(el, child_ent)) goto cleanup;
+        total_content += content_lens[i];
+    }
+
+    el->bytes_seen += total_content;
+
+    /* Free parsed tar data */
+    for (size_t i = 0; i < count; i++) {
+        blip_free((uint8_t *)paths[i], path_lens[i]);
+        if (content_lens[i] > 0) blip_free((uint8_t *)contents[i], content_lens[i]);
+        blip_free((uint8_t *)headers[i], 512);
+    }
+    blip_free((uint8_t *)paths, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)path_lens, count * sizeof(size_t));
+    blip_free((uint8_t *)contents, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)content_lens, count * sizeof(size_t));
+    blip_free((uint8_t *)headers, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)typeflags, count);
+    if (trailer_len > 0) blip_free(trailer, trailer_len);
+    return true;
+
+cleanup:
+    for (size_t i = 0; i < count; i++) {
+        blip_free((uint8_t *)paths[i], path_lens[i]);
+        if (content_lens[i] > 0) blip_free((uint8_t *)contents[i], content_lens[i]);
+        blip_free((uint8_t *)headers[i], 512);
+    }
+    blip_free((uint8_t *)paths, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)path_lens, count * sizeof(size_t));
+    blip_free((uint8_t *)contents, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)content_lens, count * sizeof(size_t));
+    blip_free((uint8_t *)headers, count * sizeof(uint8_t *));
+    blip_free((uint8_t *)typeflags, count);
+    if (trailer_len > 0) blip_free(trailer, trailer_len);
+    return false;
+}
+
+
+
+
+
+
+
+
+/* ── DICOM container expansion ───────────────────────────────────────── */
+
+static bool expand_dicom_container(entry_list_t *el,
+                                    const uint8_t *content, size_t content_len,
+                                    const blip_archive_entry *file_entry) {
+    if (content_len < 1024) return false;
+    uint8_t *pixels = NULL; size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL; size_t meta_len = 0;
+    if (blip_dicom_parse(content, content_len, &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample, &meta, &meta_len) != BLIP_OK)
+        return false;
+    uint8_t *jxl_data = NULL; size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len, width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len); blip_free(meta, meta_len); return false;
+    }
+    blip_free(pixels, pixels_len);
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false;
+    }
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) { blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false; }
+    memcpy(jxl_owned, jxl_data, jxl_len); blip_free(jxl_data, jxl_len);
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(jxl_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len); blip_free(meta, meta_len);
+    if (!entry_list_add_content(el, jxl_owned) || !entry_list_add_content(el, meta_owned)) return false;
+
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path; dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1; dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns; dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid; dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner; dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname; dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs; dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "dicom"; dir_entry.container_type_len = 5;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX; dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    { size_t p_len = file_entry->path_len + 9;
+      char *p = malloc(p_len + 1); if (!p) return false;
+      memcpy(p, file_entry->path, file_entry->path_len);
+      memcpy(p + file_entry->path_len, "/__meta__", 10);
+      if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+      blip_archive_entry e; memset(&e, 0, sizeof(e));
+      e.path = p; e.path_len = p_len; e.content = meta_owned; e.content_len = meta_len;
+      e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+      e.zip_compression_method = 0xFFFF;
+      e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+      memset(e.xh64, 0, 8);
+      if (!entry_list_add(el, e)) return false;
+    }
+    { size_t p_len = file_entry->path_len + 15;
+      char *p = malloc(p_len + 1); if (!p) return false;
+      memcpy(p, file_entry->path, file_entry->path_len);
+      memcpy(p + file_entry->path_len, "/__pixels__.jxl", 16);
+      if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+      blip_archive_entry e; memset(&e, 0, sizeof(e));
+      e.path = p; e.path_len = p_len; e.content = jxl_owned; e.content_len = jxl_len;
+      e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+      e.zip_compression_method = 0xFFFF;
+      e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+      e.jxl_source_format = "dicom"; e.jxl_source_format_len = 5;
+      memset(e.xh64, 0, 8);
+      if (!entry_list_add(el, e)) return false;
+    }
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
+/* ── FITS container expansion ────────────────────────────────────────── */
+
+static bool expand_fits_container(entry_list_t *el,
+                                   const uint8_t *content, size_t content_len,
+                                   const blip_archive_entry *file_entry) {
+    if (content_len < 2880) return false;
+
+    uint8_t *pixels = NULL; size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL; size_t meta_len = 0;
+
+    if (blip_fits_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    /* FITS stores data big-endian. For 16-bit, convert to LE for JXL. */
+    if (bits_per_sample == 16) {
+        for (size_t i = 0; i + 1 < pixels_len; i += 2) {
+            uint8_t tmp = pixels[i];
+            pixels[i] = pixels[i + 1];
+            pixels[i + 1] = tmp;
+        }
+    }
+
+    uint8_t *jxl_data = NULL; size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len); blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len); blip_free(meta, meta_len);
+        return false;
+    }
+
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) { blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false; }
+    memcpy(jxl_owned, jxl_data, jxl_len); blip_free(jxl_data, jxl_len);
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(jxl_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len); blip_free(meta, meta_len);
+    if (!entry_list_add_content(el, jxl_owned) || !entry_list_add_content(el, meta_owned)) return false;
+
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path; dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1; dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns; dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid; dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner; dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname; dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs; dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "fits"; dir_entry.container_type_len = 4;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX; dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    { size_t p_len = file_entry->path_len + 9;
+      char *p = malloc(p_len + 1); if (!p) return false;
+      memcpy(p, file_entry->path, file_entry->path_len);
+      memcpy(p + file_entry->path_len, "/__meta__", 10);
+      if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+      blip_archive_entry e; memset(&e, 0, sizeof(e));
+      e.path = p; e.path_len = p_len; e.content = meta_owned; e.content_len = meta_len;
+      e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+      e.zip_compression_method = 0xFFFF;
+      e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+      memset(e.xh64, 0, 8);
+      if (!entry_list_add(el, e)) return false;
+    }
+    { size_t p_len = file_entry->path_len + 15;
+      char *p = malloc(p_len + 1); if (!p) return false;
+      memcpy(p, file_entry->path, file_entry->path_len);
+      memcpy(p + file_entry->path_len, "/__pixels__.jxl", 16);
+      if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+      blip_archive_entry e; memset(&e, 0, sizeof(e));
+      e.path = p; e.path_len = p_len; e.content = jxl_owned; e.content_len = jxl_len;
+      e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+      e.zip_compression_method = 0xFFFF;
+      e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+      e.jxl_source_format = "fits"; e.jxl_source_format_len = 4;
+      memset(e.xh64, 0, 8);
+      if (!entry_list_add(el, e)) return false;
+    }
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
+/* ── AIFF container expansion (AIFF → FLAC) ─────────────────────────── */
+
+static bool expand_aiff_container(entry_list_t *el,
+                                   const uint8_t *content, size_t content_len,
+                                   const blip_archive_entry *file_entry) {
+    if (content_len < 1024) return false;
+    uint8_t *flac_data = NULL; size_t flac_len = 0;
+    uint8_t *meta = NULL; size_t meta_len = 0;
+    if (blip_aiff_to_flac(content, content_len, &flac_data, &flac_len, &meta, &meta_len) != BLIP_OK)
+        return false;
+    if (flac_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(flac_data, flac_len); blip_free(meta, meta_len); return false;
+    }
+    uint8_t *flac_owned = malloc(flac_len);
+    if (!flac_owned) { blip_free(flac_data, flac_len); blip_free(meta, meta_len); return false; }
+    memcpy(flac_owned, flac_data, flac_len); blip_free(flac_data, flac_len);
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(flac_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len); blip_free(meta, meta_len);
+    if (!entry_list_add_content(el, flac_owned) || !entry_list_add_content(el, meta_owned)) return false;
+
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path; dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1; dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns; dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid; dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner; dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname; dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs; dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "aiff"; dir_entry.container_type_len = 4;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX; dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    { /* __meta__ */
+        size_t p_len = file_entry->path_len + 9;
+        char *p = malloc(p_len + 1);
+        if (!p) return false;
+        memcpy(p, file_entry->path, file_entry->path_len);
+        memcpy(p + file_entry->path_len, "/__meta__", 10);
+        if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+        blip_archive_entry e; memset(&e, 0, sizeof(e));
+        e.path = p; e.path_len = p_len; e.content = meta_owned; e.content_len = meta_len;
+        e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+        e.zip_compression_method = 0xFFFF;
+        e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+        memset(e.xh64, 0, 8);
+        if (!entry_list_add(el, e)) return false;
+    }
+    { /* __audio__.flac */
+        size_t p_len = file_entry->path_len + 15;
+        char *p = malloc(p_len + 1);
+        if (!p) return false;
+        memcpy(p, file_entry->path, file_entry->path_len);
+        memcpy(p + file_entry->path_len, "/__audio__.flac", 16);
+        if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+        blip_archive_entry e; memset(&e, 0, sizeof(e));
+        e.path = p; e.path_len = p_len; e.content = flac_owned; e.content_len = flac_len;
+        e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+        e.zip_compression_method = 0xFFFF;
+        e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+        memset(e.xh64, 0, 8);
+        if (!entry_list_add(el, e)) return false;
+    }
+    el->bytes_seen += flac_len + meta_len;
+    return true;
+}
+
+/* ── WAV container expansion (WAV → FLAC) ────────────────────────────── */
+
+static bool expand_wav_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    if (content_len < 1024) return false;
+
+    uint8_t *flac_data = NULL;
+    size_t flac_len = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_wav_to_flac(content, content_len,
+            &flac_data, &flac_len,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    /* Size check */
+    if (flac_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(flac_data, flac_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    uint8_t *flac_owned = malloc(flac_len);
+    if (!flac_owned) { blip_free(flac_data, flac_len); blip_free(meta, meta_len); return false; }
+    memcpy(flac_owned, flac_data, flac_len);
+    blip_free(flac_data, flac_len);
+
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(flac_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, flac_owned) || !entry_list_add_content(el, meta_owned))
+        return false;
+
+    /* Container DIR */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "wav";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* __meta__ */
+    {
+        size_t p_len = file_entry->path_len + 9;
+        char *p = malloc(p_len + 1);
+        if (!p) return false;
+        memcpy(p, file_entry->path, file_entry->path_len);
+        memcpy(p + file_entry->path_len, "/__meta__", 10);
+        if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+        blip_archive_entry e;
+        memset(&e, 0, sizeof(e));
+        e.path = p; e.path_len = p_len;
+        e.content = meta_owned; e.content_len = meta_len;
+        e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+        e.zip_compression_method = 0xFFFF;
+        e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+        memset(e.xh64, 0, 8);
+        if (!entry_list_add(el, e)) return false;
+    }
+
+    /* __audio__.flac */
+    {
+        size_t p_len = file_entry->path_len + 15;
+        char *p = malloc(p_len + 1);
+        if (!p) return false;
+        memcpy(p, file_entry->path, file_entry->path_len);
+        memcpy(p + file_entry->path_len, "/__audio__.flac", 16);
+        if (!entry_list_add_content(el, (uint8_t *)p)) { free(p); return false; }
+        blip_archive_entry e;
+        memset(&e, 0, sizeof(e));
+        e.path = p; e.path_len = p_len;
+        e.content = flac_owned; e.content_len = flac_len;
+        e.mode = file_entry->mode; e.mtime_ns = file_entry->mtime_ns;
+        e.zip_compression_method = 0xFFFF;
+        e.pdf_stream_offset = UINT64_MAX; e.pdf_stream_length = UINT64_MAX;
+        memset(e.xh64, 0, 8);
+        if (!entry_list_add(el, e)) return false;
+    }
+
+    el->bytes_seen += flac_len + meta_len;
+    return true;
+}
+
+/* ── TGA container expansion ─────────────────────────────────────────── */
+
+static bool expand_tga_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    if (content_len < 1024) return false;
+
+    uint8_t *pixels = NULL;
+    size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_tga_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) { blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false; }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(jxl_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, jxl_owned) || !entry_list_add_content(el, meta_owned))
+        return false;
+
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "tga";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* __meta__ */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) return false;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) { free(meta_path); return false; }
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path; meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta_owned; meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0; meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX; meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) return false;
+    }
+
+    /* __pixels__.jxl */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__pixels__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__pixels__.jxl", strlen("/__pixels__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path)) { free(jxl_path); return false; }
+        blip_archive_entry jxl_ent;
+        memset(&jxl_ent, 0, sizeof(jxl_ent));
+        jxl_ent.path = jxl_path; jxl_ent.path_len = jxl_path_len;
+        jxl_ent.content = jxl_owned; jxl_ent.content_len = jxl_len;
+        jxl_ent.is_dir = 0; jxl_ent.mode = file_entry->mode;
+        jxl_ent.mtime_ns = file_entry->mtime_ns;
+        jxl_ent.zip_compression_method = 0xFFFF;
+        jxl_ent.pdf_stream_offset = UINT64_MAX; jxl_ent.pdf_stream_length = UINT64_MAX;
+        jxl_ent.jxl_source_format = "tga"; jxl_ent.jxl_source_format_len = 3;
+        memset(jxl_ent.xh64, 0, 8);
+        if (!entry_list_add(el, jxl_ent)) return false;
+    }
+
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
+/* ── GIF container expansion ─────────────────────────────────────────── */
+
+static bool expand_gif_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    if (content_len < 1024) return false;
+
+    uint8_t *pixels = NULL;
+    size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_gif_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) { blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false; }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(jxl_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, jxl_owned) ||
+        !entry_list_add_content(el, meta_owned))
+        return false;
+
+    /* Container DIR */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "gif";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* __meta__ = original GIF file (for reconstruction) */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) return false;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) { free(meta_path); return false; }
+
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path;
+        meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta_owned;
+        meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0;
+        meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX;
+        meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) return false;
+    }
+
+    /* __pixels__.jxl */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__pixels__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__pixels__.jxl", strlen("/__pixels__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path)) { free(jxl_path); return false; }
+
+        blip_archive_entry jxl_ent;
+        memset(&jxl_ent, 0, sizeof(jxl_ent));
+        jxl_ent.path = jxl_path;
+        jxl_ent.path_len = jxl_path_len;
+        jxl_ent.content = jxl_owned;
+        jxl_ent.content_len = jxl_len;
+        jxl_ent.is_dir = 0;
+        jxl_ent.mode = file_entry->mode;
+        jxl_ent.mtime_ns = file_entry->mtime_ns;
+        jxl_ent.zip_compression_method = 0xFFFF;
+        jxl_ent.pdf_stream_offset = UINT64_MAX;
+        jxl_ent.pdf_stream_length = UINT64_MAX;
+        jxl_ent.jxl_source_format = "gif";
+        jxl_ent.jxl_source_format_len = 3;
+        memset(jxl_ent.xh64, 0, 8);
+        if (!entry_list_add(el, jxl_ent)) return false;
+    }
+
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
+/* ── TIFF container expansion ────────────────────────────────────────── */
+
+static bool expand_tiff_container(entry_list_t *el,
+                                   const uint8_t *content, size_t content_len,
+                                   const blip_archive_entry *file_entry) {
+    /* Skip tiny TIFFs */
+    if (content_len < 1024) return false;
+
+    /* Parse TIFF into pixels + original file (as metadata) */
+    uint8_t *pixels = NULL;
+    size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_tiff_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    /* Encode pixels to JXL lossless */
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    /* Size check: if JXL+meta >= 90% of original, not worth expanding */
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    /* Copy to malloc'd buffers */
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) { blip_free(jxl_data, jxl_len); blip_free(meta, meta_len); return false; }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) { free(jxl_owned); blip_free(meta, meta_len); return false; }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, jxl_owned) ||
+        !entry_list_add_content(el, meta_owned))
+        return false;
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "tiff";
+    dir_entry.container_type_len = 4;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* Add __meta__ FILE entry (entire original TIFF for reconstruction) */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) return false;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) { free(meta_path); return false; }
+
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path;
+        meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta_owned;
+        meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0;
+        meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX;
+        meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) return false;
+    }
+
+    /* Add __pixels__.jxl FILE entry */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__pixels__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__pixels__.jxl", strlen("/__pixels__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path)) { free(jxl_path); return false; }
+
+        blip_archive_entry jxl_ent;
+        memset(&jxl_ent, 0, sizeof(jxl_ent));
+        jxl_ent.path = jxl_path;
+        jxl_ent.path_len = jxl_path_len;
+        jxl_ent.content = jxl_owned;
+        jxl_ent.content_len = jxl_len;
+        jxl_ent.is_dir = 0;
+        jxl_ent.mode = file_entry->mode;
+        jxl_ent.mtime_ns = file_entry->mtime_ns;
+        jxl_ent.zip_compression_method = 0xFFFF;
+        jxl_ent.pdf_stream_offset = UINT64_MAX;
+        jxl_ent.pdf_stream_length = UINT64_MAX;
+        jxl_ent.jxl_source_format = "tiff";
+        jxl_ent.jxl_source_format_len = 4;
+        memset(jxl_ent.xh64, 0, 8);
+        if (!entry_list_add(el, jxl_ent)) return false;
+    }
+
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
+/* ── BMP container expansion ─────────────────────────────────────────── */
+
+static bool expand_bmp_container(entry_list_t *el,
+                                  const uint8_t *content, size_t content_len,
+                                  const blip_archive_entry *file_entry) {
+    /* Skip tiny BMPs — overhead not worth it */
+    if (content_len < 1024) return false;
+
+    /* Parse BMP into pixels + metadata */
+    uint8_t *pixels = NULL;
+    size_t pixels_len = 0;
+    uint32_t width = 0, height = 0, num_channels = 0, bits_per_sample = 0;
+    uint8_t *meta = NULL;
+    size_t meta_len = 0;
+
+    if (blip_bmp_parse(content, content_len,
+            &pixels, &pixels_len, &width, &height,
+            &num_channels, &bits_per_sample,
+            &meta, &meta_len) != BLIP_OK)
+        return false;
+
+    /* Encode pixels to JXL lossless */
+    uint8_t *jxl_data = NULL;
+    size_t jxl_len = 0;
+    if (blip_jxl_from_pixels(pixels, pixels_len,
+            width, height, num_channels, bits_per_sample,
+            &jxl_data, &jxl_len) != BLIP_OK) {
+        blip_free(pixels, pixels_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    blip_free(pixels, pixels_len);
+
+    /* Size check: if JXL+meta >= 90% of original, not worth expanding */
+    if (jxl_len + meta_len >= (size_t)(content_len * 9 / 10)) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+
+    /* Copy JXL data to malloc'd buffer */
+    uint8_t *jxl_owned = malloc(jxl_len);
+    if (!jxl_owned) {
+        blip_free(jxl_data, jxl_len);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    memcpy(jxl_owned, jxl_data, jxl_len);
+    blip_free(jxl_data, jxl_len);
+
+    /* Copy meta to malloc'd buffer */
+    uint8_t *meta_owned = malloc(meta_len);
+    if (!meta_owned) {
+        free(jxl_owned);
+        blip_free(meta, meta_len);
+        return false;
+    }
+    memcpy(meta_owned, meta, meta_len);
+    blip_free(meta, meta_len);
+
+    if (!entry_list_add_content(el, jxl_owned) ||
+        !entry_list_add_content(el, meta_owned)) {
+        return false;
+    }
+
+    /* Create container DIR entry */
+    blip_archive_entry dir_entry;
+    memset(&dir_entry, 0, sizeof(dir_entry));
+    dir_entry.path = file_entry->path;
+    dir_entry.path_len = file_entry->path_len;
+    dir_entry.is_dir = 1;
+    dir_entry.mode = file_entry->mode;
+    dir_entry.mtime_ns = file_entry->mtime_ns;
+    dir_entry.ctime_ns = file_entry->ctime_ns;
+    dir_entry.birthtime_ns = file_entry->birthtime_ns;
+    dir_entry.uid = file_entry->uid;
+    dir_entry.gid = file_entry->gid;
+    dir_entry.owner = file_entry->owner;
+    dir_entry.owner_len = file_entry->owner_len;
+    dir_entry.groupname = file_entry->groupname;
+    dir_entry.groupname_len = file_entry->groupname_len;
+    dir_entry.xattrs = file_entry->xattrs;
+    dir_entry.xattr_count = file_entry->xattr_count;
+    dir_entry.container_type = "bmp";
+    dir_entry.container_type_len = 3;
+    dir_entry.zip_compression_method = 0xFFFF;
+    dir_entry.pdf_stream_offset = UINT64_MAX;
+    dir_entry.pdf_stream_length = UINT64_MAX;
+    memset(dir_entry.xh64, 0, 8);
+    if (!entry_list_add(el, dir_entry)) return false;
+
+    /* Add __meta__ FILE entry */
+    {
+        size_t meta_path_len = file_entry->path_len + strlen("/__meta__");
+        char *meta_path = malloc(meta_path_len + 1);
+        if (!meta_path) return false;
+        memcpy(meta_path, file_entry->path, file_entry->path_len);
+        memcpy(meta_path + file_entry->path_len, "/__meta__", strlen("/__meta__") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)meta_path)) {
+            free(meta_path);
+            return false;
+        }
+
+        blip_archive_entry meta_ent;
+        memset(&meta_ent, 0, sizeof(meta_ent));
+        meta_ent.path = meta_path;
+        meta_ent.path_len = meta_path_len;
+        meta_ent.content = meta_owned;
+        meta_ent.content_len = meta_len;
+        meta_ent.is_dir = 0;
+        meta_ent.mode = file_entry->mode;
+        meta_ent.mtime_ns = file_entry->mtime_ns;
+        meta_ent.zip_compression_method = 0xFFFF;
+        meta_ent.pdf_stream_offset = UINT64_MAX;
+        meta_ent.pdf_stream_length = UINT64_MAX;
+        memset(meta_ent.xh64, 0, 8);
+        if (!entry_list_add(el, meta_ent)) return false;
+    }
+
+    /* Add __pixels__.jxl FILE entry */
+    {
+        size_t jxl_path_len = file_entry->path_len + strlen("/__pixels__.jxl");
+        char *jxl_path = malloc(jxl_path_len + 1);
+        if (!jxl_path) return false;
+        memcpy(jxl_path, file_entry->path, file_entry->path_len);
+        memcpy(jxl_path + file_entry->path_len, "/__pixels__.jxl", strlen("/__pixels__.jxl") + 1);
+        if (!entry_list_add_content(el, (uint8_t *)jxl_path)) {
+            free(jxl_path);
+            return false;
+        }
+
+        blip_archive_entry jxl_ent;
+        memset(&jxl_ent, 0, sizeof(jxl_ent));
+        jxl_ent.path = jxl_path;
+        jxl_ent.path_len = jxl_path_len;
+        jxl_ent.content = jxl_owned;
+        jxl_ent.content_len = jxl_len;
+        jxl_ent.is_dir = 0;
+        jxl_ent.mode = file_entry->mode;
+        jxl_ent.mtime_ns = file_entry->mtime_ns;
+        jxl_ent.zip_compression_method = 0xFFFF;
+        jxl_ent.pdf_stream_offset = UINT64_MAX;
+        jxl_ent.pdf_stream_length = UINT64_MAX;
+        jxl_ent.jxl_source_format = "bmp";
+        jxl_ent.jxl_source_format_len = 3;
+        memset(jxl_ent.xh64, 0, 8);
+        if (!entry_list_add(el, jxl_ent)) return false;
+    }
+
+    el->bytes_seen += jxl_len + meta_len;
+    return true;
+}
+
 /* ── JPEG container expansion ────────────────────────────────────────── */
 
 static bool is_jpeg(const uint8_t *buf, size_t len) {
@@ -3785,10 +5958,22 @@ typedef bool (*blar_expand_fn)(entry_list_t *el, const uint8_t *content, size_t 
 static const char *const jpeg_extensions[] = { ".jpg", ".jpeg", ".jpe", NULL };
 static const char *const pdf_extensions[] = { ".pdf", NULL };
 static const char *const png_extensions[] = { ".png", NULL };
+static const char *const dicom_extensions[] = { ".dcm", ".dicom", ".dic", NULL };
+static const char *const fits_extensions[] = { ".fits", ".fit", ".fts", NULL };
+static const char *const aiff_extensions[] = { ".aiff", ".aif", ".aifc", NULL };
+static const char *const wav_extensions[] = { ".wav", ".wave", NULL };
+static const char *const tga_extensions[] = { ".tga", ".tpic", NULL };
+static const char *const gif_extensions[] = { ".gif", NULL };
+static const char *const tiff_extensions[] = { ".tiff", ".tif", NULL };
+static const char *const tar_extensions[] = { ".tar", NULL };
+static const char *const bmp_extensions[] = { ".bmp", ".dib", NULL };
 static const char *const gz_extensions[] = { ".gz", ".gzip", NULL };
-static const char *const zip_extensions[] = { ".zip", ".jar", ".war", ".ear", ".apk", ".ipa",
+static const char *const zip_extensions[] = { ".zip", ".jar", ".war", ".ear", ".apk", ".aab",
+                                              ".ipa", ".xpi", ".crx",
                                               ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
-                                              ".epub", ".cbz", NULL };
+                                              ".ott", ".ots", ".otp",
+                                              ".epub", ".cbz",
+                                              ".3mf", ".amf", ".sketch", NULL };
 
 static const blar_codec_t builtin_codecs[] = {
     {
@@ -3813,6 +5998,69 @@ static const blar_codec_t builtin_codecs[] = {
         .collapse   = NULL,
     },
     {
+        .name       = "dicom",
+        .extensions = dicom_extensions,
+        .detect     = blip_is_dicom,
+        .expand     = (void *)expand_dicom_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "fits",
+        .extensions = fits_extensions,
+        .detect     = blip_is_fits,
+        .expand     = (void *)expand_fits_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "aiff",
+        .extensions = aiff_extensions,
+        .detect     = blip_is_aiff,
+        .expand     = (void *)expand_aiff_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "wav",
+        .extensions = wav_extensions,
+        .detect     = blip_is_wav,
+        .expand     = (void *)expand_wav_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "tga",
+        .extensions = tga_extensions,
+        .detect     = blip_is_tga,
+        .expand     = (void *)expand_tga_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "gif",
+        .extensions = gif_extensions,
+        .detect     = blip_is_gif,
+        .expand     = (void *)expand_gif_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "tiff",
+        .extensions = tiff_extensions,
+        .detect     = blip_is_tiff,
+        .expand     = (void *)expand_tiff_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "tar",
+        .extensions = tar_extensions,
+        .detect     = blip_is_tar,
+        .expand     = (void *)expand_tar_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "bmp",
+        .extensions = bmp_extensions,
+        .detect     = blip_is_bmp,
+        .expand     = (void *)expand_bmp_container,
+        .collapse   = NULL,
+    },
+    {
         .name       = "gz",
         .extensions = gz_extensions,
         .detect     = blip_is_gz,
@@ -3832,6 +6080,8 @@ static const blar_codec_registry_t builtin_registry = {
     .codecs = builtin_codecs,
     .count  = sizeof(builtin_codecs) / sizeof(builtin_codecs[0]),
 };
+
+static bool expand_via_zig(entry_list_t *el, const uint8_t *content, size_t content_len, const blip_archive_entry *file_entry, const blar_codec_t *codec);
 
 static bool collect_entries_recurse(const char *path, entry_list_t *el);
 
@@ -4032,13 +6282,145 @@ static void *expand_worker(void *arg) {
         expand_worker_ctx_t *ctx = &queue->workers[idx];
         entry_list_init(&ctx->result);
         ctx->result.expand_all_zips = ctx->expand_all_zips;
-        ctx->success = ((blar_expand_fn)ctx->codec->expand)(
-            &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy);
+        ctx->success = expand_via_zig(
+            &ctx->result, ctx->content, ctx->content_len, &ctx->entry_copy, ctx->codec);
 
         atomic_fetch_add(&queue->done_count, 1);
         atomic_fetch_add(&queue->done_bytes, ctx->content_len);
     }
     return NULL;
+}
+
+
+/* Bridge: try Zig expansion first, fall back to C expand function.
+ * This is the transition layer — formats migrated to expansion.zig go through
+ * blip_expand_file(), others still use their C expand_*_container() function. */
+static bool expand_via_zig(entry_list_t *el,
+                                 const uint8_t *content, size_t content_len,
+                                 const blip_archive_entry *file_entry,
+                                 const blar_codec_t *codec) {
+    /* ALL formats go through Zig core expansion */
+    {
+        size_t count = 0;
+        const char *container_type = NULL;
+        size_t container_type_len = 0;
+        const char **path_suffixes = NULL;
+        size_t *path_suffix_lens = NULL;
+        uint8_t **contents = NULL;
+        size_t *content_lens_arr = NULL;
+        uint8_t *is_dirs = NULL;
+        const char **jxl_sources = NULL;
+        size_t *jxl_source_lens = NULL;
+        uint8_t *gz_levels = NULL;
+        uint16_t *zip_comps = NULL;
+        uint64_t *pdf_offsets = NULL;
+        uint64_t *pdf_lengths = NULL;
+
+        int rc = blip_expand_file(
+            content, content_len,
+            codec->name, strlen(codec->name),
+            &count,
+            &container_type, &container_type_len,
+            &path_suffixes, &path_suffix_lens,
+            &contents, &content_lens_arr,
+            &is_dirs,
+            &jxl_sources, &jxl_source_lens,
+            &gz_levels,
+            &zip_comps, &pdf_offsets, &pdf_lengths
+        );
+
+        if (rc != 0) return false;
+
+        /* Build entry list from Zig expansion results */
+        /* Container DIR entry */
+        blip_archive_entry dir_entry;
+        memset(&dir_entry, 0, sizeof(dir_entry));
+        dir_entry.path = file_entry->path;
+        dir_entry.path_len = file_entry->path_len;
+        dir_entry.is_dir = 1;
+        dir_entry.mode = file_entry->mode;
+        dir_entry.mtime_ns = file_entry->mtime_ns;
+        dir_entry.ctime_ns = file_entry->ctime_ns;
+        dir_entry.birthtime_ns = file_entry->birthtime_ns;
+        dir_entry.uid = file_entry->uid;
+        dir_entry.gid = file_entry->gid;
+        dir_entry.owner = file_entry->owner;
+        dir_entry.owner_len = file_entry->owner_len;
+        dir_entry.groupname = file_entry->groupname;
+        dir_entry.groupname_len = file_entry->groupname_len;
+        dir_entry.xattrs = file_entry->xattrs;
+        dir_entry.xattr_count = file_entry->xattr_count;
+        dir_entry.container_type = container_type;
+        dir_entry.container_type_len = container_type_len;
+        dir_entry.zip_compression_method = 0xFFFF;
+        dir_entry.pdf_stream_offset = UINT64_MAX;
+        dir_entry.pdf_stream_length = UINT64_MAX;
+        memset(dir_entry.xh64, 0, 8);
+        if (!entry_list_add(el, dir_entry)) return false;
+
+        /* Add child entries */
+        for (size_t i = 0; i < count; i++) {
+            /* Build full path: file_entry->path / suffix */
+            size_t suffix_len = path_suffix_lens[i];
+            size_t child_path_len = file_entry->path_len + 1 + suffix_len;
+            char *child_path = malloc(child_path_len + 1);
+            if (!child_path) return false;
+            memcpy(child_path, file_entry->path, file_entry->path_len);
+            child_path[file_entry->path_len] = '/';
+            memcpy(child_path + file_entry->path_len + 1, path_suffixes[i], suffix_len);
+            child_path[child_path_len] = '\0';
+            if (!entry_list_add_content(el, (uint8_t *)child_path)) { free(child_path); return false; }
+
+            /* Copy content to malloc'd buffer (Zig allocated with page_allocator) */
+            uint8_t *child_content = NULL;
+            size_t child_content_len = content_lens_arr[i];
+            if (child_content_len > 0) {
+                child_content = malloc(child_content_len);
+                if (!child_content) return false;
+                memcpy(child_content, contents[i], child_content_len);
+                blip_free((uint8_t *)contents[i], child_content_len);
+                if (!entry_list_add_content(el, child_content)) return false;
+            }
+
+            blip_archive_entry child_ent;
+            memset(&child_ent, 0, sizeof(child_ent));
+            child_ent.path = child_path;
+            child_ent.path_len = child_path_len;
+            child_ent.content = child_content;
+            child_ent.content_len = child_content_len;
+            child_ent.is_dir = is_dirs[i] ? 1 : 0;
+            child_ent.mode = file_entry->mode;
+            child_ent.mtime_ns = file_entry->mtime_ns;
+            child_ent.zip_compression_method = (zip_comps && zip_comps[i] != 0xFFFF) ? zip_comps[i]
+                                             : (gz_levels && gz_levels[i] > 0) ? (uint16_t)gz_levels[i] : 0xFFFF;
+            child_ent.pdf_stream_offset = (pdf_offsets) ? pdf_offsets[i] : UINT64_MAX;
+            child_ent.pdf_stream_length = (pdf_lengths) ? pdf_lengths[i] : UINT64_MAX;
+            if (jxl_source_lens[i] > 0) {
+                child_ent.jxl_source_format = jxl_sources[i];
+                child_ent.jxl_source_format_len = jxl_source_lens[i];
+            }
+            memset(child_ent.xh64, 0, 8);
+            if (!entry_list_add(el, child_ent)) return false;
+        }
+
+        /* Free Zig-allocated arrays */
+        blip_free((uint8_t *)path_suffixes, count * sizeof(const char *));
+        blip_free((uint8_t *)path_suffix_lens, count * sizeof(size_t));
+        blip_free((uint8_t *)contents, count * sizeof(uint8_t *));
+        blip_free((uint8_t *)content_lens_arr, count * sizeof(size_t));
+        blip_free((uint8_t *)is_dirs, count);
+        blip_free((uint8_t *)jxl_sources, count * sizeof(const char *));
+        blip_free((uint8_t *)jxl_source_lens, count * sizeof(size_t));
+        if (gz_levels) blip_free((uint8_t *)gz_levels, count);
+        if (zip_comps) blip_free((uint8_t *)zip_comps, count * sizeof(uint16_t));
+        if (pdf_offsets) blip_free((uint8_t *)pdf_offsets, count * sizeof(uint64_t));
+        if (pdf_lengths) blip_free((uint8_t *)pdf_lengths, count * sizeof(uint64_t));
+
+        el->bytes_seen += content_len;
+        return true;
+    }
+
+    return false;
 }
 
 static bool expand_containers_pass(entry_list_t *el) {
@@ -4149,8 +6531,9 @@ static bool expand_containers_pass(entry_list_t *el) {
         for (size_t w = 0; w < expandable; w++) {
             entry_list_init(&workers[w].result);
             workers[w].result.expand_all_zips = workers[w].expand_all_zips;
-            workers[w].success = ((blar_expand_fn)workers[w].codec->expand)(
-                &workers[w].result, workers[w].content, workers[w].content_len, &workers[w].entry_copy);
+            workers[w].success = expand_via_zig(
+                &workers[w].result, workers[w].content, workers[w].content_len, &workers[w].entry_copy,
+                workers[w].codec);
 
             if (el->progress) {
                 const char *basename = strrchr(workers[w].entry_copy.path, '/');

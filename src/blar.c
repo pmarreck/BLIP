@@ -210,7 +210,8 @@ static void print_usage(FILE *out) {
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "                   Password: BLIP_PASSWORD env var, or interactive prompt\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
-        "  --no-expand-containers  Don't expand zip containers (with -z)\n"
+        "  --no-expand-containers  Don't expand containers (PDF/JPEG/PNG/BMP/TGA/\n"
+        "                         TIFF/GIF/ZIP/gzip/tar/WAV/AIFF/FITS/DICOM)\n"
         "  --expand-all-zips      Also expand .zip files (normally opaque)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
@@ -685,6 +686,15 @@ static int cmd_list(int argc, char **argv) {
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
                     else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
                     else if (strcmp(codec->name, "gz") == 0) type_char = 'g';
+                    else if (strcmp(codec->name, "bmp") == 0) type_char = 'b';
+                    else if (strcmp(codec->name, "tar") == 0) type_char = 't';
+                    else if (strcmp(codec->name, "tiff") == 0) type_char = 'i';
+                    else if (strcmp(codec->name, "gif") == 0) type_char = 'f';
+                    else if (strcmp(codec->name, "tga") == 0) type_char = 'a';
+                    else if (strcmp(codec->name, "wav") == 0) type_char = 'w';
+                    else if (strcmp(codec->name, "aiff") == 0) type_char = 'w';
+                    else if (strcmp(codec->name, "fits") == 0) type_char = 's';
+                    else if (strcmp(codec->name, "dicom") == 0) type_char = 'm';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
@@ -1113,6 +1123,15 @@ static int cmd_info(int argc, char **argv) {
                     else if (strcmp(codec->name, "png") == 0) type_char = 'n';
                     else if (strcmp(codec->name, "jpeg") == 0) type_char = 'j';
                     else if (strcmp(codec->name, "gz") == 0) type_char = 'g';
+                    else if (strcmp(codec->name, "bmp") == 0) type_char = 'b';
+                    else if (strcmp(codec->name, "tar") == 0) type_char = 't';
+                    else if (strcmp(codec->name, "tiff") == 0) type_char = 'i';
+                    else if (strcmp(codec->name, "gif") == 0) type_char = 'f';
+                    else if (strcmp(codec->name, "tga") == 0) type_char = 'a';
+                    else if (strcmp(codec->name, "wav") == 0) type_char = 'w';
+                    else if (strcmp(codec->name, "aiff") == 0) type_char = 'w';
+                    else if (strcmp(codec->name, "fits") == 0) type_char = 's';
+                    else if (strcmp(codec->name, "dicom") == 0) type_char = 'm';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
@@ -2752,3 +2771,4 @@ static int cmd_implode(int argc, char **argv) {
     blip_free(archive_buf, archive_len);
     return EXIT_OK;
 }
+/* rebuild 1774972745 */

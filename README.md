@@ -558,6 +558,27 @@ ZIP files contain individually deflate-compressed entries that LZMA2 can't shrin
 
 Gzip (.gz) files contain a single deflate-compressed stream. `blar` decompresses the content so LZMA2 can compress the raw data far more effectively. On extraction, the content is recompressed to gzip. Note: extracted gzip files are content-identical (same decompressed output) but not byte-identical (the gzip compression level/strategy is not preserved in the format).
 
+
+**Image container expansion (BMP, TGA, TIFF):**
+
+Uncompressed raster images are parsed into raw pixels, losslessly encoded to JPEG XL, and stored with compact header metadata. On extraction, the original file is reconstructed byte-identically. BMP and TGA achieve ~90% savings; uncompressed TIFF achieves ~97%.
+
+**GIF container expansion:**
+
+Static GIFs are parsed (pure Zig LZW decoder), pixels encoded to JXL. The original GIF is stored as metadata for byte-identical reconstruction. Since GIF is already LZW-compressed, expansion is only applied when the JXL representation saves space.
+
+**Audio container expansion (WAV, AIFF → FLAC):**
+
+Uncompressed PCM audio in WAV and AIFF formats is losslessly encoded to FLAC via libFLAC. Non-PCM metadata (headers, extra chunks) is stored compactly for byte-identical reconstruction. AIFF's big-endian samples are automatically converted. Typical savings: 50-60% on real audio.
+
+**tar container expansion:**
+
+tar archives are decomposed into their constituent files with original tar headers preserved as metadata. This lets LZMA2 group similar file types together across the tar boundary for significantly better compression. The tar is reconstructed byte-identically on extraction.
+
+**Scientific/medical container expansion (FITS, DICOM):**
+
+FITS astronomy images (8/16-bit) have their pixel data extracted and JXL-encoded, with the text header blocks stored as compact metadata. DICOM medical images have their uncompressed pixel data (8/16-bit grayscale/RGB) JXL-encoded with DICOM tags preserved. Both achieve byte-identical reconstruction. Compressed/encapsulated DICOM is left as-is.
+
 **Controlling expansion:**
 
 ```bash
@@ -567,7 +588,10 @@ blar create -z -o archive.blar documents/
 # Disable expansion (store files as opaque blobs)
 blar create -z --no-expand-containers -o archive.blar documents/
 
-# List shows container types: p=PDF, n=PNG, j=JPEG, g=gzip, z=ZIP, d=dir, -=file
+# List shows container types:
+# p=PDF, n=PNG, j=JPEG, b=BMP, a=TGA, i=TIFF, f=GIF
+# w=WAV/AIFF, s=FITS, m=DICOM, g=gzip, t=tar, z=ZIP
+# d=dir, -=file
 blar list archive.blar
 ```
 

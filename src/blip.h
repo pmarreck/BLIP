@@ -525,6 +525,181 @@ int32_t blip_png_encode(
     const uint8_t *meta, size_t meta_len,
     uint8_t **out_png, size_t *out_png_len);
 
+/* --- BMP operations --- */
+
+/* Check if buffer starts with BMP magic (BM). */
+bool blip_is_bmp(const uint8_t *buf, size_t buf_len);
+
+/* Parse a BMP into raw pixels and header metadata.
+ * Pixels are output in top-to-bottom RGB(A) order, 8 bits per sample.
+ * Metadata format: [u8 top_down][u16_le bpp][u32_le row_stride][header_bytes...]
+ * Caller must free out_pixels and out_meta with blip_free(). */
+int32_t blip_bmp_parse(const uint8_t *bmp, size_t bmp_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* Encode raw pixels + BMP header metadata back to a BMP file.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_bmp_encode(
+    const uint8_t *pixels, size_t pixels_len,
+    uint32_t width, uint32_t height,
+    const uint8_t *meta, size_t meta_len,
+    uint8_t **out_bmp, size_t *out_bmp_len);
+
+/* --- TAR operations --- */
+
+/* Check if buffer contains a valid tar header. */
+bool blip_is_tar(const uint8_t *buf, size_t buf_len);
+
+/* Parse a tar archive into parallel arrays of entries.
+ * Each entry has: path, content, 512-byte header, typeflag.
+ * Also returns the trailing bytes (EOF blocks).
+ * Caller must free all output arrays with blip_free(). */
+int32_t blip_tar_parse(const uint8_t *tar, size_t tar_len,
+    size_t *out_count,
+    uint8_t ***out_paths, size_t **out_path_lens,
+    uint8_t ***out_contents, size_t **out_content_lens,
+    uint8_t ***out_headers, uint8_t **out_typeflags,
+    uint8_t **out_trailer, size_t *out_trailer_len);
+
+/* Reconstruct a tar archive from entries.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_tar_encode(size_t count,
+    const uint8_t *const *headers,
+    const uint8_t *const *contents, const size_t *content_lens,
+    const uint8_t *trailer, size_t trailer_len,
+    uint8_t **out_tar, size_t *out_tar_len);
+
+/* --- TIFF operations --- */
+
+/* Check if buffer starts with TIFF magic (II*\0 or MM\0*). */
+bool blip_is_tiff(const uint8_t *buf, size_t buf_len);
+
+/* Parse uncompressed TIFF into raw pixels + original file metadata.
+ * out_meta contains the entire original TIFF file for faithful reconstruction.
+ * Only handles uncompressed 8/16-bit TIFF; returns error for compressed.
+ * Caller must free out_pixels and out_meta with blip_free(). */
+int32_t blip_tiff_parse(const uint8_t *tiff, size_t tiff_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* --- GIF operations --- */
+
+/* Check if buffer starts with GIF magic (GIF87a or GIF89a). */
+bool blip_is_gif(const uint8_t *buf, size_t buf_len);
+
+/* Parse a static GIF into RGBA pixels + original file metadata.
+ * Returns error for animated GIFs.
+ * Caller must free out_pixels and out_meta with blip_free(). */
+int32_t blip_gif_parse(const uint8_t *gif, size_t gif_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* --- TGA operations --- */
+
+/* Check if buffer looks like uncompressed true-color TGA. */
+bool blip_is_tga(const uint8_t *buf, size_t buf_len);
+
+/* Parse TGA into raw pixels + header metadata.
+ * Caller must free out_pixels and out_meta with blip_free(). */
+int32_t blip_tga_parse(const uint8_t *tga, size_t tga_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* Encode raw pixels + TGA metadata back to a TGA file.
+ * Caller must free returned buffer with blip_free(). */
+int32_t blip_tga_encode(
+    const uint8_t *pixels, size_t pixels_len,
+    uint32_t width, uint32_t height,
+    const uint8_t *meta, size_t meta_len,
+    uint8_t **out_tga, size_t *out_tga_len);
+
+/* --- WAV/FLAC operations --- */
+
+/* Check if buffer starts with WAV magic (RIFF....WAVE). */
+bool blip_is_wav(const uint8_t *buf, size_t buf_len);
+
+/* Parse WAV and encode PCM to FLAC. Returns FLAC data + WAV metadata.
+ * Caller must free out_flac and out_meta with blip_free(). */
+int32_t blip_wav_to_flac(const uint8_t *wav, size_t wav_len,
+    uint8_t **out_flac, size_t *out_flac_len,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* Decode FLAC and reconstruct WAV from metadata.
+ * Caller must free out_wav with blip_free(). */
+int32_t blip_flac_to_wav(const uint8_t *flac_data, size_t flac_len,
+    const uint8_t *meta, size_t meta_len,
+    uint8_t **out_wav, size_t *out_wav_len);
+
+/* --- AIFF/FLAC operations --- */
+bool blip_is_aiff(const uint8_t *buf, size_t buf_len);
+int32_t blip_aiff_to_flac(const uint8_t *aiff, size_t aiff_len,
+    uint8_t **out_flac, size_t *out_flac_len,
+    uint8_t **out_meta, size_t *out_meta_len);
+int32_t blip_flac_to_aiff(const uint8_t *flac_data, size_t flac_len,
+    const uint8_t *meta, size_t meta_len,
+    uint8_t **out_aiff, size_t *out_aiff_len);
+
+/* --- FITS operations --- */
+bool blip_is_fits(const uint8_t *buf, size_t buf_len);
+int32_t blip_fits_parse(const uint8_t *fits, size_t fits_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* --- DICOM operations --- */
+bool blip_is_dicom(const uint8_t *buf, size_t buf_len);
+int32_t blip_dicom_parse(const uint8_t *dcm, size_t dcm_len,
+    uint8_t **out_pixels, size_t *out_pixels_len,
+    uint32_t *out_width, uint32_t *out_height,
+    uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
+    uint8_t **out_meta, size_t *out_meta_len);
+
+/* --- Container Expansion/Collapse (unified entry point) --- */
+
+/* Detect which codec matches content by magic bytes. Returns true if found. */
+bool blip_detect_codec(const uint8_t *buf, size_t buf_len,
+    const char **out_name, size_t *out_name_len);
+
+/* Expand a file into container entries. Returns 0 on success, -1 if not expandable.
+ * Output arrays are parallel: each index i has path_suffix[i], content[i], etc.
+ * Caller must free all output arrays with blip_free(). */
+int32_t blip_expand_file(
+    const uint8_t *content, size_t content_len,
+    const char *codec_name, size_t codec_name_len,
+    size_t *out_count,
+    const char **out_container_type, size_t *out_container_type_len,
+    const char ***out_path_suffixes, size_t **out_path_suffix_lens,
+    uint8_t ***out_contents, size_t **out_content_lens,
+    uint8_t **out_is_dirs,
+    const char ***out_jxl_sources, size_t **out_jxl_source_lens,
+    uint8_t **out_gz_levels,
+    uint16_t **out_zip_comps,
+    uint64_t **out_pdf_offsets, uint64_t **out_pdf_lengths);
+
+/* Collapse a container back to its original file bytes.
+ * Takes codec name + arrays of (inner_path, content) children.
+ * Returns 0 and the reconstructed file, or -1 on failure. */
+int32_t blip_collapse_container(
+    const char *codec_name, size_t codec_name_len,
+    size_t child_count,
+    const char *const *child_paths, const size_t *child_path_lens,
+    const uint8_t *const *child_contents, const size_t *child_content_lens,
+    const uint64_t *child_pdf_offsets,   /* NULL if not applicable */
+    const uint64_t *child_pdf_lengths,   /* NULL if not applicable */
+    const uint16_t *child_zip_comps,     /* NULL if not applicable */
+    const char *const *child_jxl_sources, const size_t *child_jxl_source_lens,  /* NULL if N/A */
+    uint8_t **out_data, size_t *out_data_len);
+
 /* --- FlateDecode (PDF) operations --- */
 
 #define BLIP_ERR_FLATE -41
