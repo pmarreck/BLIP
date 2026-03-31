@@ -128,6 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         \u{2022} Multiple compression algorithms (LZMA2/7zip, zstd, LZ4) \
         with per-file or solid-archive granularity.
 
+        By Peter Marreck / Mecha, LLC
         https://github.com/pmarreck/BLIP
         """
         alert.alertStyle = .informational
