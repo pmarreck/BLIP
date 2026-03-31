@@ -164,10 +164,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "printable_binary", .module = pb_module },
         },
     });
-    exposed_mini_blar.addOptions("build_options", build_options);
-    if (enable_compression) {
-        addCompressionSupport(exposed_mini_blar, z7z_module, bzip2z_module, lz4_lib, zstdz_lib);
-    }
+    // Exported mini_blar gets its own build_options with compression DISABLED.
+    // This prevents module conflicts: consumers don't need compression, and
+    // each BLIP dep gets its own build_options without conflicting.
+    const mini_blar_options = b.addOptions();
+    mini_blar_options.addOption(bool, "enable_compression", false);
+    mini_blar_options.addOption(bool, "enable_flac", false);
+    exposed_mini_blar.addOptions("build_options", mini_blar_options);
 
     // Static library (C FFI surface)
     const static_lib = b.addLibrary(.{
