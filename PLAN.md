@@ -166,7 +166,7 @@
 - [ ] ORC container expansion — Columnar format (.orc). Uses zlib or Snappy per stripe. Same approach as Parquet.
 
 ### Medical/financial imaging (high-security archival candidates)
-- [ ] NIfTI container expansion — Neuroimaging (.nii). Uncompressed 3D/4D voxel arrays + 348-byte header. Same approach as FITS but with 3D slicing. Hospitals and research institutions archive these long-term, often with encryption requirements (HIPAA).
+- [x] NIfTI container expansion — Neuroimaging (.nii). 8/16-bit 3D voxel arrays + 348-byte header. Voxels flattened to 2D for JXL encoding. Compact metadata stores header only. Byte-identical roundtrip.
 - [ ] DNG container expansion — Digital Negative (.dng). TIFF-based with embedded JPEG preview + raw sensor data. Extract JPEG preview → JXL transcode, decompress deflate-compressed raw data for better LZMA2. Photography studios archive large DNG collections.
 - [ ] PSD container expansion — Photoshop (.psd). Layer-based format with raw pixel data per layer. Extract layers, JXL-encode each. Professional photography/design archives.
 - [ ] MINC container expansion — HDF5-based neuroimaging (.mnc). Decomposes to HDF5 datasets. Medical data subject to privacy regulations.

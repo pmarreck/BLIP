@@ -111,7 +111,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         \u{2022} Transparent container expansion — PDFs, images \
         (JPEG, PNG, BMP, TGA, TIFF, GIF), audio (WAV, AIFF \u{2192} FLAC), \
-        archives (ZIP, gzip, tar), scientific (FITS, DICOM), \
+        archives (ZIP, gzip, tar), scientific (FITS, DICOM, NIfTI), \
         and Office/EPUB formats are automatically decomposed for \
         dramatically better compression, then perfectly \
         reconstructed on extraction.

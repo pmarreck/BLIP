@@ -855,6 +855,7 @@ pub const gif_mod = @import("gif.zig");
 pub const tga_mod = @import("tga.zig");
 pub const wav_mod = @import("wav.zig");
 pub const flac_mod = @import("flac.zig");
+pub const nifti_mod = @import("nifti.zig");
 pub const dicom_mod = @import("dicom.zig");
 pub const expansion_mod = @import("expansion.zig");
 pub const fits_mod = @import("fits.zig");

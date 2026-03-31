@@ -1727,7 +1727,7 @@ static int blar_extract_to_dir(
         /* Try Zig-based collapse for migrated formats */
         {
             static const char *zig_collapse_codecs[] = {
-                "bmp", "tga", "tiff", "png", "gif", "fits", "dicom", "wav", "aiff", "gz", "tar", "jpeg", "zip", NULL
+                "bmp", "tga", "tiff", "png", "gif", "fits", "dicom", "nifti", "wav", "aiff", "gz", "tar", "jpeg", "zip", NULL
             };
             bool is_zig_codec = false;
             for (const char **zc = zig_collapse_codecs; *zc; zc++) {
@@ -5958,6 +5958,7 @@ typedef bool (*blar_expand_fn)(entry_list_t *el, const uint8_t *content, size_t 
 static const char *const jpeg_extensions[] = { ".jpg", ".jpeg", ".jpe", NULL };
 static const char *const pdf_extensions[] = { ".pdf", NULL };
 static const char *const png_extensions[] = { ".png", NULL };
+static const char *const nifti_extensions[] = { ".nii", NULL };
 static const char *const dicom_extensions[] = { ".dcm", ".dicom", ".dic", NULL };
 static const char *const fits_extensions[] = { ".fits", ".fit", ".fts", NULL };
 static const char *const aiff_extensions[] = { ".aiff", ".aif", ".aifc", NULL };
@@ -5995,6 +5996,13 @@ static const blar_codec_t builtin_codecs[] = {
         .extensions = png_extensions,
         .detect     = blip_is_png,
         .expand     = (void *)expand_png_container,
+        .collapse   = NULL,
+    },
+    {
+        .name       = "nifti",
+        .extensions = nifti_extensions,
+        .detect     = blip_is_nifti,
+        .expand     = NULL,
         .collapse   = NULL,
     },
     {

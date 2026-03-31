@@ -19,6 +19,7 @@ const tar_mod = @import("tar.zig");
 const wav_mod = @import("wav.zig");
 const aiff_mod = @import("aiff.zig");
 const fits_mod = @import("fits.zig");
+const nifti_mod = @import("nifti.zig");
 const dicom_mod = @import("dicom.zig");
 const flac_mod = @import("flac.zig");
 const jxl_mod = @import("jxl.zig");
@@ -88,6 +89,7 @@ pub fn detectCodec(content: []const u8) ?[]const u8 {
     if (content.len >= 3 and content[0] == 0xFF and content[1] == 0xD8 and content[2] == 0xFF) return "jpeg";
     if (pdf_mod.isPdfMagic(content)) return "pdf";
     if (png_mod.isPngMagic(content)) return "png";
+    if (nifti_mod.isNiftiMagic(content)) return "nifti";
     if (dicom_mod.isDicomMagic(content)) return "dicom";
     if (fits_mod.isFitsMagic(content)) return "fits";
     if (aiff_mod.isAiffMagic(content)) return "aiff";
@@ -204,6 +206,19 @@ fn expandPixelFormat(
                 pixels[i + 1] = tmp;
             }
         }
+    } else if (std.mem.eql(u8, codec_name, "nifti")) {
+        const parsed = nifti_mod.parseNifti(allocator, content) catch return null;
+        pixels = parsed.voxels;
+        // NIfTI 3D: treat as width*height*slices grayscale image
+        // JXL encodes as a single 2D image with height = original_height * slices
+        const w = parsed.info.dim[1];
+        const h = parsed.info.dim[2];
+        const slices: u32 = if (parsed.info.dim[0] >= 3 and parsed.info.dim[3] > 0) parsed.info.dim[3] else 1;
+        width = w;
+        height = h * slices;
+        channels = 1; // grayscale
+        bps = parsed.info.bitpix;
+        meta = parsed.meta;
     } else if (std.mem.eql(u8, codec_name, "dicom")) {
         const parsed = dicom_mod.parseDicom(allocator, content) catch return null;
         pixels = parsed.pixels;
@@ -554,7 +569,8 @@ pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const
         std.mem.eql(u8, codec_name, "png") or
         std.mem.eql(u8, codec_name, "gif") or
         std.mem.eql(u8, codec_name, "fits") or
-        std.mem.eql(u8, codec_name, "dicom"))
+        std.mem.eql(u8, codec_name, "dicom") or
+        std.mem.eql(u8, codec_name, "nifti"))
     {
         return expandPixelFormat(allocator, content, codec_name, 1024);
     }
@@ -977,7 +993,8 @@ pub fn collapseContainer(
             return reconstructPng(allocator, meta, px_pixels, px_fmt.width, px_fmt.height, px_fmt.num_channels, px_fmt.bits_per_sample);
         } else if (std.mem.eql(u8, codec_name, "tiff") or
             std.mem.eql(u8, codec_name, "fits") or
-            std.mem.eql(u8, codec_name, "dicom"))
+            std.mem.eql(u8, codec_name, "dicom") or
+        std.mem.eql(u8, codec_name, "nifti"))
         {
             return reconstructFromTemplate(allocator, meta, px_pixels, codec_name, px_fmt.bits_per_sample);
         }

@@ -1482,6 +1482,7 @@ const gif_mod = blip.gif_mod;
 const tga_mod = blip.tga_mod;
 const wav_mod = blip.wav_mod;
 const flac_mod = blip.flac_mod;
+const nifti_mod = blip.nifti_mod;
 const dicom_mod = blip.dicom_mod;
 const expansion_mod = blip.expansion_mod;
 const fits_mod = blip.fits_mod;
@@ -2435,6 +2436,13 @@ export fn blip_fits_parse(
     out_meta.* = parsed.meta.ptr;
     out_meta_len.* = parsed.meta.len;
     return 0;
+}
+
+
+// --- NIfTI ---
+
+export fn blip_is_nifti(buf: [*]const u8, buf_len: usize) callconv(.c) bool {
+    return nifti_mod.isNiftiMagic(buf[0..buf_len]);
 }
 
 

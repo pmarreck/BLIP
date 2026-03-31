@@ -656,6 +656,9 @@ int32_t blip_fits_parse(const uint8_t *fits, size_t fits_len,
     uint32_t *out_num_channels, uint32_t *out_bits_per_sample,
     uint8_t **out_meta, size_t *out_meta_len);
 
+/* --- NIfTI operations --- */
+bool blip_is_nifti(const uint8_t *buf, size_t buf_len);
+
 /* --- DICOM operations --- */
 bool blip_is_dicom(const uint8_t *buf, size_t buf_len);
 int32_t blip_dicom_parse(const uint8_t *dcm, size_t dcm_len,

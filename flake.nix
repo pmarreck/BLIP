@@ -14,7 +14,7 @@
         version = "0.2.0";
         isDarwin = pkgs.stdenv.isDarwin;
 
-        zigDepsHash = "sha256-eGHAIAYChbF+N83IEKsOLpWOaGtfhPKQxLo2af+8NsY=";
+        zigDepsHash = "sha256-SkCJQPG10RD/up3RS6xXCkELHcpjAYFFuWPwf4fONXg=";
 
         zigDeps = pkgs.stdenv.mkDerivation {
           pname = "${pname}-zig-deps";
@@ -24,14 +24,19 @@
           outputHashMode = "recursive";
           outputHashAlgo = "sha256";
           outputHash = zigDepsHash;
+          dontPatchShebangs = true;
           buildPhase = ''
             export HOME=$TMPDIR
-            export ZIG_GLOBAL_CACHE_DIR=$out
+            export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+            mkdir -p $ZIG_GLOBAL_CACHE_DIR
             export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             export GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             zig build --fetch=all
           '';
-          dontInstall = true;
+          installPhase = ''
+            mkdir -p $out
+            cp -r $TMPDIR/zig-cache/p $out/p
+          '';
           dontFixup = true;
         };
       in {

@@ -211,7 +211,7 @@ static void print_usage(FILE *out) {
         "                   Password: BLIP_PASSWORD env var, or interactive prompt\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
         "  --no-expand-containers  Don't expand containers (PDF/JPEG/PNG/BMP/TGA/\n"
-        "                         TIFF/GIF/ZIP/gzip/tar/WAV/AIFF/FITS/DICOM)\n"
+        "                         TIFF/GIF/ZIP/gzip/tar/WAV/AIFF/FITS/DICOM/NIfTI)\n"
         "  --expand-all-zips      Also expand .zip files (normally opaque)\n"
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
@@ -695,6 +695,7 @@ static int cmd_list(int argc, char **argv) {
                     else if (strcmp(codec->name, "aiff") == 0) type_char = 'w';
                     else if (strcmp(codec->name, "fits") == 0) type_char = 's';
                     else if (strcmp(codec->name, "dicom") == 0) type_char = 'm';
+                    else if (strcmp(codec->name, "nifti") == 0) type_char = 'r';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */
@@ -1132,6 +1133,7 @@ static int cmd_info(int argc, char **argv) {
                     else if (strcmp(codec->name, "aiff") == 0) type_char = 'w';
                     else if (strcmp(codec->name, "fits") == 0) type_char = 's';
                     else if (strcmp(codec->name, "dicom") == 0) type_char = 'm';
+                    else if (strcmp(codec->name, "nifti") == 0) type_char = 'r';
                     else type_char = 'z';
                 } else {
                     type_char = '?';  /* unknown codec */

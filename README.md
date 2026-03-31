@@ -577,7 +577,7 @@ tar archives are decomposed into their constituent files with original tar heade
 
 **Scientific/medical container expansion (FITS, DICOM):**
 
-FITS astronomy images (8/16-bit) have their pixel data extracted and JXL-encoded, with the text header blocks stored as compact metadata. DICOM medical images have their uncompressed pixel data (8/16-bit grayscale/RGB) JXL-encoded with DICOM tags preserved. Both achieve byte-identical reconstruction. Compressed/encapsulated DICOM is left as-is.
+FITS astronomy images and NIfTI neuroimaging files (8/16-bit) have their pixel/voxel data extracted and JXL-encoded, with the text header blocks stored as compact metadata. DICOM medical images have their uncompressed pixel data (8/16-bit grayscale/RGB) JXL-encoded with DICOM tags preserved. Both achieve byte-identical reconstruction. Compressed/encapsulated DICOM is left as-is.
 
 **Controlling expansion:**
 

@@ -258,7 +258,7 @@ class OptionsPanel: NSViewController {
         expandCheckbox.state = .on
         expandCheckbox.controlSize = .small
         expandCheckbox.font = .systemFont(ofSize: 11)
-        expandCheckbox.toolTip = "Decompose supported formats (PDF, JPEG, PNG, BMP, TGA, TIFF, GIF, ZIP/Office/EPUB, gzip, tar, WAV, AIFF, FITS, DICOM) into their parts for better compression. Files are perfectly reconstructed on extraction."
+        expandCheckbox.toolTip = "Decompose supported formats (PDF, JPEG, PNG, BMP, TGA, TIFF, GIF, ZIP/Office/EPUB, gzip, tar, WAV, AIFF, FITS, DICOM, NIfTI) into their parts for better compression. Files are perfectly reconstructed on extraction."
         stack.addArrangedSubview(expandCheckbox)
     }
 
