@@ -126,5 +126,30 @@
 - [ ] ISO 9660 container expansion — Decompose ISO images into their constituent filesystem (squashfs, UDF, El Torito boot images). For ISOs with uncompressed or weakly-compressed content, this could improve compression. For already-squashfs ISOs (NixOS, Ubuntu), the gain would be minimal.
 - [ ] Cross-platform xattr key mapping — On extraction, translate xattr names to the target OS convention (e.g. macOS `com.apple.quarantine` → Linux `user.com.apple.quarantine`, and reverse on re-archiving). Archive stores original names; mapping is extraction-time only. Handle `system.*` xattrs (may require root on Linux), `security.selinux` (skip with warning on macOS).
 - [ ] AppleDouble resource fork fallback — When extracting on non-HFS+/APFS filesystems (Linux, Windows, FAT/exFAT), write macOS resource forks as AppleDouble `._filename` sidecar files. On archiving, detect `._filename` sidecars and slurp them back as resource forks. Default behavior on Windows; optional on Linux (`--apple-double` flag). macOS already creates these on non-native filesystems.
+## Container Expansion Roadmap
+
+### Audio lossless transcoding
+- [ ] WAV → FLAC container expansion — Uncompressed PCM → FLAC lossless (~50-60% savings). Bit-exact WAV reconstruction on extraction. Needs libFLAC or Zig FLAC encoder.
+- [ ] AIFF → FLAC container expansion — Same as WAV but Apple's format. Parse AIFF chunks, extract PCM, encode FLAC. Reconstruct AIFF with original chunk metadata.
+
+### Image lossless transcoding
+- [ ] BMP → JXL container expansion — Uncompressed raster → JXL lossless (90%+ savings). Easy: parse BMP header, extract pixels, use existing blip_jxl_from_pixels. Store BMP header as metadata for faithful reconstruction.
+- [ ] TIFF → JXL container expansion — Uncompressed or LZW-compressed raster → JXL lossless (50-80% savings). Parse TIFF IFDs, extract pixel strips/tiles, JXL encode. Preserve EXIF/XMP metadata.
+- [ ] GIF → JXL container expansion — Static and animated GIF → JXL lossless. libjxl supports animated JXL natively. CAUTION: roundtrip animated GIF requires preserving frame timings, disposal methods, and palette. Verify animated roundtrip produces identical GIF.
 - [ ] DNG (Digital Negative) container expansion — Extract embedded JPEG preview (→ JXL transcode), decompress deflate-compressed raw sensor data for better LZMA2 compression, preserve TIFF structure for reconstruction. DNG files are large and common in photography workflows.
+### Archive decomposition
+- [ ] tar → expand — Decompose tar archives into individual files. Parse 512-byte headers, extract entries as a directory tree. With MIME sorting in solid mode, this lets LZMA2 group similar file types together.
+
+### Additional ZIP-based formats to detect
+- [ ] Add all ZIP-based format extensions to codec detection: `.cbz` (comics), `.jar`/`.war`/`.ear` (Java), `.apk`/`.aab` (Android), `.ipa` (iOS), `.xpi` (Firefox), `.crx` (Chrome), `.3mf`/`.amf` (3D printing), `.sketch`, `.ott`/`.ots`/`.otp` (LibreOffice templates)
+
+## GUI Application Roadmap
+
+### File hierarchy view
+- [ ] Navigable file hierarchy — Tree view with expandable/collapsible directories showing archive contents. Right-click "Extract to..." on any directory or file. Hold Command to multi-select items. Drag items out to extract/reconstitute them. Drag items in to add to archive (highlight directories on rollover). Show file sizes, types, container status (expanded/opaque).
+
+### Internationalization
+- [ ] Translate GUI to 22 languages (same as ../validate): English, Spanish, French, German, Italian, Portuguese, Dutch, Russian, Chinese (Simplified), Chinese (Traditional), Japanese, Korean, Arabic, Hindi, Turkish, Polish, Czech, Swedish, Norwegian, Danish, Finnish, Thai
+
+## Future
 - [ ] macOS bundle container types — Recognize `.app`, `.framework`, `.bundle`, `.plugin`, `.kext` directories as containers with appropriate tags (`"co" -> "app"`, `"co" -> "framework"`, etc.). Preserves bundle structure awareness (code signing, `Info.plist` placement, `_CodeSignature/`) and enables bundle-aware deduplication (shared frameworks across apps).
