@@ -47,6 +47,7 @@ void blar_gui_free_xattrs(blip_xattr_entry *xattrs, size_t count,
 int blar_gui_create(const char *const *paths, size_t path_count,
                      uint8_t per_file_comp, uint8_t num_threads,
                      _Bool expand_containers, _Bool expand_all_zips,
+                     _Bool use_streaming,
                      blar_extract_progress_fn progress_fn,
                      void *progress_ctx,
                      uint8_t **out_buf, size_t *out_len);

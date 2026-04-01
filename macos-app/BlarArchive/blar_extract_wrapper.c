@@ -38,6 +38,7 @@ static void gui_expansion_progress_adapter(uint64_t done, uint64_t total, void *
 int blar_gui_create(const char *const *paths, size_t path_count,
                      uint8_t per_file_comp, uint8_t num_threads,
                      bool expand_containers, bool expand_all_zips,
+                     bool use_streaming,
                      blar_extract_progress_fn progress_fn,
                      void *progress_ctx,
                      uint8_t **out_buf, size_t *out_len) {
@@ -77,36 +78,71 @@ int blar_gui_create(const char *const *paths, size_t path_count,
         return -1;
     }
 
-    if (el.expand_containers) {
-        if (!expand_containers_pass(&el)) {
-            entry_list_free(&el);
-            return -1;
+    /* Auto-detect streaming mode based on total content size */
+    bool do_streaming = use_streaming;
+    if (!do_streaming) {
+        uint64_t est_total = 0;
+        for (size_t i = 0; i < el.count; i++) {
+            if (!el.entries[i].is_dir)
+                est_total += el.entries[i].content_len;
+        }
+        if (est_total > (uint64_t)1024 * 1024 * 1024) {
+            fprintf(stderr, "[blar_gui_create] auto-selecting streaming mode (%.1f GB input)\n",
+                    (double)est_total / (1024.0 * 1024.0 * 1024.0));
+            do_streaming = true;
         }
     }
 
     uint8_t *archive_buf = NULL;
     size_t archive_len = 0;
-    /* Compute total bytes for progress reporting */
-    uint64_t total_bytes = 0;
-    for (size_t i = 0; i < el.count; i++) {
-        if (!el.entries[i].is_dir)
-            total_bytes += el.entries[i].content_len;
-    }
+    int32_t rc;
 
-    /* Adapt the 5-arg progress callback to the 3-arg one that
-     * blip_archive_create_full expects. */
-    gui_create_progress_ctx_t progress_adapter = {
-        .fn = progress_fn,
-        .ctx = progress_ctx,
-        .total_files = el.count,
-        .total_bytes = total_bytes,
-    };
-    int32_t rc = blip_archive_create_full(el.entries, el.count, 0,
-                                           per_file_comp, num_threads,
-                                           progress_fn ? gui_create_progress_adapter : NULL,
-                                           NULL,
-                                           progress_fn ? &progress_adapter : NULL,
-                                           &archive_buf, &archive_len);
+    if (do_streaming) {
+        /* Streaming path — re-collect with metadata_only */
+        entry_list_free(&el);
+        entry_list_init(&el);
+        el.metadata_only = true;
+        el.expand_containers = expand_containers;
+        el.expand_all_zips = expand_all_zips;
+        el.num_threads = num_threads;
+        for (size_t i = 0; i < path_count; i++) {
+            if (!collect_entries_recurse(paths[i], &el)) {
+                entry_list_free(&el);
+                return -1;
+            }
+        }
+        rc = blip_archive_create_streaming(el.entries, el.count,
+                                            per_file_comp,
+                                            expand_containers, expand_all_zips,
+                                            &archive_buf, &archive_len);
+    } else {
+        /* In-memory path */
+        if (el.expand_containers) {
+            if (!expand_containers_pass(&el)) {
+                entry_list_free(&el);
+                return -1;
+            }
+        }
+
+        uint64_t total_bytes = 0;
+        for (size_t i = 0; i < el.count; i++) {
+            if (!el.entries[i].is_dir)
+                total_bytes += el.entries[i].content_len;
+        }
+
+        gui_create_progress_ctx_t progress_adapter = {
+            .fn = progress_fn,
+            .ctx = progress_ctx,
+            .total_files = el.count,
+            .total_bytes = total_bytes,
+        };
+        rc = blip_archive_create_full(el.entries, el.count, 0,
+                                       per_file_comp, num_threads,
+                                       progress_fn ? gui_create_progress_adapter : NULL,
+                                       NULL,
+                                       progress_fn ? &progress_adapter : NULL,
+                                       &archive_buf, &archive_len);
+    }
     entry_list_free(&el);
     if (rc != 0) return rc;
 

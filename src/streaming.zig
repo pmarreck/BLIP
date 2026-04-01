@@ -15,6 +15,7 @@ const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const csum_mod = @import("checksum.zig");
 const blip = @import("blip.zig");
+const expansion = @import("expansion.zig");
 
 const FileEntry = mini_blar.FileEntry;
 const DirEntry = mini_blar.DirEntry;
@@ -55,6 +56,7 @@ pub fn createArchiveStreaming(
     allocator: Allocator,
     entries: []const ArchiveEntry,
     comp_id: ?ct.CompressionId,
+    expand_containers: bool,
 ) (StreamingError || mini_blar.compression_mod.CompressionError)![]u8 {
     // Create temp spill file
     const tmp_path = "/tmp/blar_spill_XXXXXX";
@@ -77,48 +79,125 @@ pub fn createArchiveStreaming(
     var has_dir = false;
     var spill_offset: u64 = 0;
 
-    // ── Pass 1: Serialize entries to spill file ─────────────────────────
+    // ── Pre-pass: Expand containers if enabled ─────────────────────────
+    // Build a new entry list with expansions applied. Each expanded file
+    // becomes a DIR + child FILE entries. Non-expanded files pass through.
+    // This is done before the main serialization loop so we have a stable
+    // entry list with correct count/ordering.
 
-    // Phase 1A: Serialize FILE entries
-    for (entries, 0..) |entry, i| {
+    var work_entries = std.ArrayListUnmanaged(ArchiveEntry){};
+    defer work_entries.deinit(allocator);
+
+    // Track allocated paths for expanded children (need to free them)
+    var expanded_paths = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (expanded_paths.items) |p| allocator.free(p);
+        expanded_paths.deinit(allocator);
+    }
+    // Track allocated content for expanded children
+    var expanded_contents = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (expanded_contents.items) |buf| allocator.free(buf);
+        expanded_contents.deinit(allocator);
+    }
+
+    for (entries) |entry| {
         switch (entry) {
             .file => |file| {
-                // Serialize this single file entry
-                var to_free: std.ArrayList([]u8) = .{};
-                defer {
-                    for (to_free.items) |item| allocator.free(item);
-                    to_free.deinit(allocator);
-                }
+                if (expand_containers and file.content.len >= 128) {
+                    if (expansion.detectCodec(file.content)) |codec_name| {
+                        var exp_result = expansion.expandFile(allocator, file.content, codec_name) catch null;
+                        if (exp_result) |*exp| {
+                            // Expansion succeeded — add DIR + children
+                            has_dir = true;
+                            try work_entries.append(allocator, .{ .dir = .{
+                                .path = file.path,
+                                .mode = file.mode,
+                                .mtime_ns = file.mtime_ns,
+                                .ctime_ns = file.ctime_ns,
+                                .birthtime_ns = file.birthtime_ns,
+                                .uid = file.uid,
+                                .gid = file.gid,
+                                .username = file.username,
+                                .groupname = file.groupname,
+                                .xattrs = file.xattrs,
+                                .container_type = exp.container_type,
+                            }});
 
-                const serialized = try mini_blar.serializeFileEntry(
-                    allocator, file, &to_free, comp_id, null, null,
-                );
-                // serializeFileEntry returns a slice owned by to_free or allocator
+                            for (exp.entries) |child| {
+                                const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ file.path, child.path_suffix });
+                                try expanded_paths.append(allocator, child_path);
 
-                // Extract xxHash64 from serialized FILE container's checksum
-                var xhash: [8]u8 = .{0} ** 8;
-                {
-                    const file_view = container.parseLPHeader(serialized) catch null;
-                    if (file_view) |fv| {
-                        const csum = fv.checksumSlice();
-                        if (csum.len == 8) {
-                            @memcpy(&xhash, csum[0..8]);
+                                // Copy content to owned buffer
+                                const owned_content = try allocator.dupe(u8, child.content);
+                                try expanded_contents.append(allocator, owned_content);
+
+                                try work_entries.append(allocator, .{ .file = .{
+                                    .path = child_path,
+                                    .content = owned_content,
+                                    .mode = file.mode,
+                                    .mtime_ns = file.mtime_ns,
+                                    .zip_compression_method = if (child.zip_comp != 0xFFFF) child.zip_comp else null,
+                                    .pdf_stream_offset = if (child.pdf_offset != std.math.maxInt(u64)) child.pdf_offset else null,
+                                    .pdf_stream_length = if (child.pdf_length != std.math.maxInt(u64)) child.pdf_length else null,
+                                    .jxl_source_format = child.jxl_source_format,
+                                }});
+                            }
+                            exp.deinit();
+                            continue; // Don't add original file
                         }
                     }
                 }
-                try file_hashes.put(file.path, xhash);
+                // No expansion — pass through
+                try work_entries.append(allocator, entry);
+            },
+            .dir => {
+                has_dir = true;
+                try work_entries.append(allocator, entry);
+            },
+        }
+    }
 
-                // Write to spill file
-                spill_file.writeAll(serialized) catch return StreamingError.SpillFailed;
+    const final_entries = work_entries.items;
 
-                try spill_index.append(allocator, .{
-                    .offset = spill_offset,
-                    .size = serialized.len,
-                    .xhash = xhash,
-                    .entry_index = i,
-                    .is_dir = false,
-                });
-                spill_offset += serialized.len;
+    // ── Pass 1: Serialize entries to spill file ─────────────────────────
+
+    // Phase 1A: Serialize FILE entries
+    for (final_entries, 0..) |entry, i| {
+        switch (entry) {
+            .file => |file| {
+                    var to_free: std.ArrayList([]u8) = .{};
+                    defer {
+                        for (to_free.items) |item| allocator.free(item);
+                        to_free.deinit(allocator);
+                    }
+
+                    const serialized = try mini_blar.serializeFileEntry(
+                        allocator, file, &to_free, comp_id, null, null,
+                    );
+
+                    var xhash: [8]u8 = .{0} ** 8;
+                    {
+                        const file_view = container.parseLPHeader(serialized) catch null;
+                        if (file_view) |fv| {
+                            const csum = fv.checksumSlice();
+                            if (csum.len == 8) {
+                                @memcpy(&xhash, csum[0..8]);
+                            }
+                        }
+                    }
+                    try file_hashes.put(file.path, xhash);
+
+                    spill_file.writeAll(serialized) catch return StreamingError.SpillFailed;
+
+                    try spill_index.append(allocator, .{
+                        .offset = spill_offset,
+                        .size = serialized.len,
+                        .xhash = xhash,
+                        .entry_index = i,
+                        .is_dir = false,
+                    });
+                    spill_offset += serialized.len;
             },
             .dir => {
                 has_dir = true;
@@ -138,13 +217,13 @@ pub fn createArchiveStreaming(
     for (spill_index.items) |*se| {
         if (!se.is_dir) continue;
 
-        const dir = entries[se.entry_index].dir;
+        const dir = final_entries[se.entry_index].dir;
 
         // Compute Merkle hash from direct child FILE hashes
         var child_hashes_list: std.ArrayList([8]u8) = .{};
         defer child_hashes_list.deinit(allocator);
 
-        for (entries) |other| {
+        for (final_entries) |other| {
             switch (other) {
                 .file => |f| {
                     if (mini_blar.isDirectChild(dir.path, f.path)) {
@@ -179,11 +258,12 @@ pub fn createArchiveStreaming(
 
     // ── Pass 2: Assemble archive from spill ─────────────────────────────
 
-    // Build element sizes array (in entry order)
-    const element_sizes = try allocator.alloc(u64, entries.len);
+    // Build element sizes array from spill index (includes expanded entries)
+    const total_entries = spill_index.items.len;
+    const element_sizes = try allocator.alloc(u64, total_entries);
     defer allocator.free(element_sizes);
-    for (spill_index.items) |se| {
-        element_sizes[se.entry_index] = se.size;
+    for (spill_index.items, 0..) |se, idx| {
+        element_sizes[idx] = se.size;
     }
 
     // Magic bytes
@@ -227,19 +307,13 @@ pub fn createArchiveStreaming(
     @memcpy(result[pos..][0..body_layout.index_offset_len], body_layout.index_offset_encoded[0..body_layout.index_offset_len]);
     pos += body_layout.index_offset_len;
 
-    // Stream-copy entries from spill file (in entry order)
-    for (0..entries.len) |entry_idx| {
-        // Find the spill entry for this index
-        for (spill_index.items) |se| {
-            if (se.entry_index == entry_idx) {
-                const sz: usize = @intCast(se.size);
-                spill_file.seekTo(se.offset) catch return StreamingError.IoError;
-                const bytes_read = spill_file.readAll(result[pos..][0..sz]) catch return StreamingError.IoError;
-                if (bytes_read != sz) return StreamingError.IoError;
-                pos += sz;
-                break;
-            }
-        }
+    // Stream-copy entries from spill file (in spill order)
+    for (spill_index.items) |se| {
+        const sz: usize = @intCast(se.size);
+        spill_file.seekTo(se.offset) catch return StreamingError.IoError;
+        const bytes_read = spill_file.readAll(result[pos..][0..sz]) catch return StreamingError.IoError;
+        if (bytes_read != sz) return StreamingError.IoError;
+        pos += sz;
     }
 
     // Write body ARRAY index section
@@ -278,7 +352,7 @@ test "streaming produces byte-identical archive to createFullArchive" {
     defer alloc.free(inmem);
 
     // Create with streaming path
-    const streamed = try createArchiveStreaming(alloc, &entries, null);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false);
     defer alloc.free(streamed);
 
     // Must be byte-identical
@@ -298,7 +372,7 @@ test "streaming with directories produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, null, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, null);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);
@@ -317,7 +391,7 @@ test "streaming with compression produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, .lzma2, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2);
+    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2, false);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);

@@ -76,6 +76,69 @@ else
   fail "streaming roundtrip content differs"
 fi
 
+
+# =============================================================================
+# Test 2: Streaming with container expansion
+# =============================================================================
+echo "--- Test 2: Streaming with container expansion ---"
+
+mkdir -p "$TMPDIR_TEST/t2/input"
+# Create a BMP (will be expanded to JXL)
+python3 -c "
+import struct, sys
+width, height = 32, 32
+row_stride = (width * 3 + 3) & ~3
+pixel_data_len = row_stride * height
+file_size = 54 + pixel_data_len
+header = struct.pack('<2sIHHI', b'BM', file_size, 0, 0, 54)
+dib = struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0, pixel_data_len, 2835, 2835, 0, 0)
+with open(sys.argv[1], 'wb') as f:
+    f.write(header + dib)
+    for y in range(height):
+        row = b''
+        for x in range(width):
+            row += struct.pack('BBB', (x*4)&0xFF, (y*4)&0xFF, ((x+y)*2)&0xFF)
+        while len(row) % 4 != 0: row += b'\x00'
+        f.write(row)
+" "$TMPDIR_TEST/t2/input/image.bmp"
+echo "Plain text file" > "$TMPDIR_TEST/t2/input/readme.txt"
+
+# In-memory with expansion
+(cd "$TMPDIR_TEST/t2" && "$BLAR" create -z -f -o inmem.blar input 2>/dev/null)
+# Streaming with expansion
+(cd "$TMPDIR_TEST/t2" && "$BLAR" create -z -f --streaming -o stream.blar input 2>/dev/null)
+
+# Check that both expanded the BMP
+INMEM_LIST=$("$BLAR" list "$TMPDIR_TEST/t2/inmem.blar" 2>/dev/null)
+STREAM_LIST=$("$BLAR" list "$TMPDIR_TEST/t2/stream.blar" 2>/dev/null)
+
+if echo "$INMEM_LIST" | grep -q "^b"; then
+  pass "in-memory: BMP container expanded"
+else
+  fail "in-memory: BMP not expanded"
+fi
+
+if echo "$STREAM_LIST" | grep -q "^b"; then
+  pass "streaming: BMP container expanded"
+else
+  fail "streaming: BMP not expanded (list: $STREAM_LIST)"
+fi
+
+# Extract both and verify roundtrip
+mkdir -p "$TMPDIR_TEST/t2/ext_inmem" "$TMPDIR_TEST/t2/ext_stream"
+"$BLAR" extract "$TMPDIR_TEST/t2/inmem.blar" -f -C "$TMPDIR_TEST/t2/ext_inmem" 2>/dev/null
+"$BLAR" extract "$TMPDIR_TEST/t2/stream.blar" -f -C "$TMPDIR_TEST/t2/ext_stream" 2>/dev/null
+
+ORIG_MD5=$(md5 < "$TMPDIR_TEST/t2/input/image.bmp")
+INMEM_MD5=$(md5 < "$TMPDIR_TEST/t2/ext_inmem/input/image.bmp" 2>/dev/null)
+STREAM_MD5=$(md5 < "$TMPDIR_TEST/t2/ext_stream/input/image.bmp" 2>/dev/null)
+
+if [[ "$ORIG_MD5" == "$STREAM_MD5" ]]; then
+  pass "streaming expansion: BMP roundtrip byte-identical"
+else
+  fail "streaming expansion: BMP roundtrip differs (orig=$ORIG_MD5 stream=$STREAM_MD5)"
+fi
+
 # =============================================================================
 # Results
 # =============================================================================

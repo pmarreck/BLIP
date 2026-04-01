@@ -117,6 +117,7 @@ class BlarBridge {
                 cPaths, paths.count,
                 perFileComp, threads,
                 expandContainers, false, // expand_all_zips = false
+                true, // use_streaming = auto (>1GB triggers streaming)
                 createProgressFn, bridgePtr,
                 &archiveBuf, &archiveLen
             )

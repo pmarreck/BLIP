@@ -514,6 +514,20 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
+    /* Auto-detect streaming mode for large archives */
+    if (!use_streaming) {
+        uint64_t est_total = 0;
+        for (size_t i = 0; i < el.count; i++) {
+            if (!el.entries[i].is_dir)
+                est_total += el.entries[i].content_len;
+        }
+        if (est_total > (uint64_t)1024 * 1024 * 1024) {
+            fprintf(stderr, "blar: auto-selecting streaming mode (%.1f GB input)\n",
+                    (double)est_total / (1024.0 * 1024.0 * 1024.0));
+            use_streaming = true;
+        }
+    }
+
     /* ── Streaming path: low memory, processes files one at a time ── */
     if (use_streaming) {
         /* metadata_only was set before collection — no file content loaded */
