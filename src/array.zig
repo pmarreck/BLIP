@@ -269,6 +269,210 @@ pub const ArrayReader = struct {
 // Tests
 // =============================================================================
 
+/// Result of computing an ARRAY layout without materializing the payload.
+/// Contains all bytes needed to assemble the ARRAY by streaming elements.
+pub const ArrayLayout = struct {
+    /// Total serialized size of the ARRAY container.
+    total_size: u64,
+    /// LP header bytes (written before index_offset encoding + elements).
+    header: [64]u8,
+    header_len: usize,
+    /// BLIP-encoded index_offset (written after header, before elements).
+    index_offset_encoded: [16]u8,
+    index_offset_len: usize,
+    /// Index section bytes (written after all elements).
+    index_section: []u8,
+    /// Checksum size in bytes (0 if no checksum).
+    csum_size: usize,
+    /// Allocator used for index_section (caller must free).
+    allocator: Allocator,
+
+    pub fn deinit(self: *ArrayLayout) void {
+        if (self.index_section.len > 0) self.allocator.free(self.index_section);
+    }
+};
+
+/// Compute the layout of an ARRAY container from element sizes alone.
+/// This is a "dry run" of serializeArrayLike — it produces the exact same
+/// header, index section, and total size without needing the element data.
+/// Used for streaming archive assembly where we know entry sizes from the
+/// spill index but don't want to hold all entries in memory.
+pub fn computeArrayLayout(
+    allocator: Allocator,
+    element_sizes: []const u64,
+    type_id: ContainerTypeId,
+    options: LPOptions,
+) (Allocator.Error || LPContainerError)!ArrayLayout {
+    const n: u64 = element_sizes.len;
+    const csum_size: u64 = if (options.csum_id) |id| ct.checksumLength(id) else 0;
+
+    var data_size: u64 = 0;
+    for (element_sizes) |sz| {
+        data_size += sz;
+    }
+
+    // Stack buffer for element offsets
+    var offsets_stack: [1024]u64 = undefined;
+    var heap_offsets: ?[]u64 = null;
+    defer if (heap_offsets) |ho| allocator.free(ho);
+
+    const offset_storage: []u64 = if (element_sizes.len <= 1024)
+        offsets_stack[0..element_sizes.len]
+    else blk: {
+        heap_offsets = try allocator.alloc(u64, element_sizes.len);
+        break :blk heap_offsets.?;
+    };
+
+    // Same fixpoint iteration as serializeArrayLike
+    var I_size: usize = 1;
+    var total: u64 = undefined;
+    var index_offset: u64 = undefined;
+
+    for (0..10) |_| {
+        var val_offset: u64 = 0;
+
+        for (0..10) |_| {
+            var running_offset: u64 = val_offset + I_size;
+            for (element_sizes, 0..) |sz, k| {
+                offset_storage[k] = running_offset;
+                running_offset += sz;
+            }
+            index_offset = running_offset;
+
+            var index_section_size: u64 = blip.encodedSize(n);
+            for (offset_storage[0..element_sizes.len]) |off| {
+                index_section_size += blip.encodedSize(off);
+            }
+
+            const val_payload_size: u64 = I_size + data_size + index_section_size;
+            total = container.computeLPLength(type_id, val_payload_size, options);
+            const new_val_offset: u64 = total - val_payload_size - csum_size;
+
+            if (new_val_offset == val_offset) break;
+            val_offset = new_val_offset;
+        }
+
+        const I_size_new = blip.encodedSize(index_offset);
+        if (I_size_new == I_size) break;
+        I_size = I_size_new;
+    }
+
+    // Build header bytes
+    var header_buf: [64]u8 = undefined;
+    const header_len = container.writeLPHeader(&header_buf, type_id, total, options) catch
+        return LPContainerError.BufferTooSmall;
+
+    // Build index_offset encoding
+    var idx_off_buf: [16]u8 = undefined;
+    const idx_off_len = blip.encode(index_offset, &idx_off_buf) catch
+        return LPContainerError.BufferTooSmall;
+
+    // Build index section: BLIP(N), then BLIP(off_0), BLIP(off_1), ...
+    var index_section_size: usize = blip.encodedSize(n);
+    for (offset_storage[0..element_sizes.len]) |off| {
+        index_section_size += blip.encodedSize(off);
+    }
+    const index_section = try allocator.alloc(u8, index_section_size);
+    errdefer allocator.free(index_section);
+
+    var idx_pos: usize = 0;
+    idx_pos += blip.encode(n, index_section[idx_pos..]) catch return LPContainerError.BufferTooSmall;
+    for (offset_storage[0..element_sizes.len]) |off| {
+        idx_pos += blip.encode(off, index_section[idx_pos..]) catch return LPContainerError.BufferTooSmall;
+    }
+    std.debug.assert(idx_pos == index_section_size);
+
+    return ArrayLayout{
+        .total_size = total,
+        .header = header_buf,
+        .header_len = header_len,
+        .index_offset_encoded = idx_off_buf,
+        .index_offset_len = idx_off_len,
+        .index_section = index_section,
+        .csum_size = @intCast(csum_size),
+        .allocator = allocator,
+    };
+}
+
+test "computeArrayLayout matches serializeArrayLike" {
+    const alloc = testing.allocator;
+
+    // Build some test elements (small LP containers)
+    const elem1 = try leaf.serializeUtf8(alloc, "hello");
+    defer alloc.free(elem1);
+    const elem2 = try leaf.serializeUtf8(alloc, "world");
+    defer alloc.free(elem2);
+    const elem3 = try leaf.serializeData(alloc, &[_]u8{ 1, 2, 3, 4, 5 });
+    defer alloc.free(elem3);
+
+    const elements = [_][]const u8{ elem1, elem2, elem3 };
+
+    // Serialize the full ARRAY in memory
+    const full = try serializeArray(alloc, &elements);
+    defer alloc.free(full);
+
+    // Compute layout from sizes only
+    const sizes = [_]u64{ elem1.len, elem2.len, elem3.len };
+    var layout = try computeArrayLayout(alloc, &sizes, .array, .{});
+    defer layout.deinit();
+
+    // Total size must match
+    try testing.expectEqual(full.len, @as(usize, @intCast(layout.total_size)));
+
+    // Header bytes must match the start of the full array
+    try testing.expectEqualSlices(u8, full[0..layout.header_len], layout.header[0..layout.header_len]);
+
+    // Index offset encoding must match
+    const idx_start = layout.header_len;
+    try testing.expectEqualSlices(u8,
+        full[idx_start..][0..layout.index_offset_len],
+        layout.index_offset_encoded[0..layout.index_offset_len]);
+
+    // Index section must match the tail of the full array (before any checksum)
+    const idx_section_start = full.len - layout.csum_size - layout.index_section.len;
+    try testing.expectEqualSlices(u8,
+        full[idx_section_start..][0..layout.index_section.len],
+        layout.index_section);
+}
+
+test "computeArrayLayout with checksum matches serializeArrayLike" {
+    const alloc = testing.allocator;
+    const csum_mod_local = @import("checksum.zig");
+    _ = csum_mod_local;
+
+    const elem1 = try leaf.serializeUtf8(alloc, "test data");
+    defer alloc.free(elem1);
+
+    const elements = [_][]const u8{elem1};
+
+    // Serialize with BLAKE3-128 checksum
+    const opts = LPOptions{ .csum_id = .blake3_128 };
+    const full = try serializeArrayLike(alloc, &elements, .array, opts);
+    defer alloc.free(full);
+
+    const sizes = [_]u64{elem1.len};
+    var layout = try computeArrayLayout(alloc, &sizes, .array, opts);
+    defer layout.deinit();
+
+    // Total size must match
+    try testing.expectEqual(full.len, @as(usize, @intCast(layout.total_size)));
+    // Checksum size must be 16 (BLAKE3-128)
+    try testing.expectEqual(@as(usize, 16), layout.csum_size);
+}
+
+test "computeArrayLayout empty array" {
+    const alloc = testing.allocator;
+    const sizes = [_]u64{};
+    var layout = try computeArrayLayout(alloc, &sizes, .array, .{});
+    defer layout.deinit();
+
+    const full = try serializeArray(alloc, &[_][]const u8{});
+    defer alloc.free(full);
+
+    try testing.expectEqual(full.len, @as(usize, @intCast(layout.total_size)));
+}
+
+
 test "empty array: serialize and read back (count=0)" {
     const allocator = testing.allocator;
     const elements = [_][]const u8{};
