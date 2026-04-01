@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .z7z = .{
-            .url = "https://github.com/pmarreck/z7z/archive/675d2e0f15c91624b53de296d02b0ade7f386ce3.tar.gz",
-            .hash = "z7z-0.1.0-rkKuF2hCBgBoySmohPLRbhwKnIStQLLRO5O2OgelO0hE",
+            .url = "https://github.com/pmarreck/z7z/archive/d839d9fd18bedf7749f86c4cadaaada5dbc1f723.tar.gz",
+            .hash = "z7z-0.1.0-rkKuFwmuBgCU6yaAXj2eBMpGJme0nxUbD7MpLsMJvUs8",
             .lazy = true,
         },
         .bzip2z = .{
