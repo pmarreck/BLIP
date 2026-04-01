@@ -210,6 +210,7 @@ static void print_usage(FILE *out) {
         "  -e [cipher]      Encrypt archive (aes=default, chacha)\n"
         "                   Password: BLIP_PASSWORD env var, or interactive prompt\n"
         "  --kdf <name>     KDF for encryption (argon2=default, pbkdf2)\n"
+        "  --streaming             Use streaming mode (low memory, for large archives)\n"
         "  --no-expand-containers  Don't expand containers (PDF/JPEG/PNG/BMP/TGA/\n"
         "                         TIFF/GIF/ZIP/gzip/tar/WAV/AIFF/FITS/DICOM/NIfTI)\n"
         "  --expand-all-zips      Also expand .zip files (normally opaque)\n"
@@ -270,6 +271,7 @@ static int cmd_create(int argc, char **argv) {
     uint8_t enc_id = 1;   /* default: AES-256-GCM */
     uint8_t kdf_id = 1;   /* default: Argon2id */
     bool no_expand = false;     /* --no-expand-containers */
+    bool use_streaming = false; /* --streaming */
     bool expand_all = false;    /* --expand-all-zips */
 
     if (argc < 1) {
@@ -362,6 +364,11 @@ static int cmd_create(int argc, char **argv) {
             i--;
         } else if (strcmp(argv[i], "--no-sort") == 0) {
             no_sort = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "--streaming") == 0) {
+            use_streaming = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
@@ -505,6 +512,37 @@ static int cmd_create(int argc, char **argv) {
         fprintf(stderr, "blar: create: no entries to archive\n");
         entry_list_free(&el);
         return EXIT_USAGE;
+    }
+
+    /* ── Streaming path: low memory, processes files one at a time ── */
+    if (use_streaming) {
+        /* metadata_only was set before collection — no file content loaded */
+
+        uint8_t *archive_buf = NULL;
+        size_t archive_len = 0;
+        int32_t rc2 = blip_archive_create_streaming(
+            el.entries, el.count,
+            compress_algo,
+            el.expand_containers, el.expand_all_zips,
+            &archive_buf, &archive_len);
+
+        entry_list_free(&el);
+        if (rc2 != 0) {
+            fprintf(stderr, "blar: create: streaming archive creation failed (rc=%d)\n", rc2);
+            return EXIT_IO;
+        }
+
+        /* Write to output */
+        if (!write_file(out_path, archive_buf, archive_len)) {
+            fprintf(stderr, "blar: create: cannot write '%s': %s\n", out_path, strerror(errno));
+            blip_free(archive_buf, archive_len);
+            return EXIT_IO;
+        }
+
+        fprintf(stderr, "Created %s (%s, streaming mode)\n", out_path,
+                format_size(archive_len, (char[32]){0}, 32));
+        blip_free(archive_buf, archive_len);
+        return EXIT_OK;
     }
 
     /* Container expansion pass: separate phase with its own progress bar */

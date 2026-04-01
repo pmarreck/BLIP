@@ -3821,6 +3821,7 @@ typedef struct {
     bool expand_containers; /* expand zip containers into DIR+FILE entries */
     bool expand_all_zips;   /* also expand .zip/.gz files (normally excluded) */
     uint8_t num_threads;    /* thread count for parallel work (0=auto) */
+    bool metadata_only;     /* true: set source_path, skip read_file() */
     /* Generic progress callback (used by GUI — fires during expansion phase) */
     void (*expansion_progress_fn)(uint64_t done, uint64_t total, void *ctx);
     void *expansion_progress_ctx;
@@ -3840,6 +3841,7 @@ static void entry_list_init(entry_list_t *el) {
     el->expand_containers = false;
     el->expand_all_zips = false;
     el->num_threads = 0;
+    el->metadata_only = false;
 }
 
 static bool entry_list_add(entry_list_t *el, blip_archive_entry entry) {
@@ -6293,15 +6295,29 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         }
 
         size_t content_len = 0;
-        uint8_t *content = read_file(path, &content_len);
-        if (!content) {
-            fprintf(stderr, "blar: create: cannot read '%s': %s\n",
-                    path, strerror(errno));
-            return false;
-        }
-        if (!entry_list_add_content(el, content)) {
-            free(content);
-            return false;
+        uint8_t *content = NULL;
+        char *disk_path = NULL;
+
+        if (el->metadata_only) {
+            /* Streaming mode: record source path, don't load content */
+            content_len = (size_t)st.st_size;
+            disk_path = strdup(path);
+            if (!disk_path) return false;
+            if (!entry_list_add_content(el, (uint8_t *)disk_path)) {
+                free(disk_path);
+                return false;
+            }
+        } else {
+            content = read_file(path, &content_len);
+            if (!content) {
+                fprintf(stderr, "blar: create: cannot read '%s': %s\n",
+                        path, strerror(errno));
+                return false;
+            }
+            if (!entry_list_add_content(el, content)) {
+                free(content);
+                return false;
+            }
         }
 
         blip_archive_entry entry;
@@ -6311,6 +6327,8 @@ static bool collect_entries_recurse(const char *path, entry_list_t *el) {
         entry.content = content;
         entry.content_len = content_len;
         entry.is_dir = 0;
+        entry.source_path = disk_path;
+        entry.source_path_len = disk_path ? strlen(disk_path) : 0;
         fill_entry_metadata(&entry, &st);
 
         /* Read xattrs and resource fork */

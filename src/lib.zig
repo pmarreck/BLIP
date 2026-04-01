@@ -2654,6 +2654,20 @@ export fn blip_archive_create_streaming(
     for (0..entry_count) |i| {
         const ce = c_entries[i];
         if (ce.is_dir != 0) {
+            // Convert xattrs for dir
+            const dir_xa: []const mini_blar.XattrEntry = if (ce.xattrs) |xa_ptr| blk: {
+                const xa_count = ce.xattr_count;
+                if (xa_count == 0) break :blk &.{};
+                const xa_zig = page_allocator.alloc(mini_blar.XattrEntry, xa_count) catch break :blk &[_]mini_blar.XattrEntry{};
+                for (0..xa_count) |xi| {
+                    xa_zig[xi] = .{
+                        .name = xa_ptr[xi].name[0..xa_ptr[xi].name_len],
+                        .value = xa_ptr[xi].value[0..xa_ptr[xi].value_len],
+                    };
+                }
+                break :blk xa_zig;
+            } else &.{};
+
             zig_entries[i] = .{ .dir = .{
                 .path = ce.path[0..ce.path_len],
                 .mode = ce.mode,
@@ -2664,6 +2678,7 @@ export fn blip_archive_create_streaming(
                 .gid = ce.gid,
                 .username = if (ce.owner_len > 0 and ce.owner != null) ce.owner.?[0..ce.owner_len] else &.{},
                 .groupname = if (ce.groupname_len > 0 and ce.groupname != null) ce.groupname.?[0..ce.groupname_len] else &.{},
+                .xattrs = dir_xa,
                 .container_type = if (ce.container_type_len > 0 and ce.container_type != null) ce.container_type.?[0..ce.container_type_len] else &.{},
             }};
         } else {
@@ -2681,6 +2696,22 @@ export fn blip_archive_create_streaming(
                 content = data;
             }
 
+            // Convert xattrs
+            const xattr_slice: []const mini_blar.XattrEntry = if (ce.xattrs) |xa_ptr| blk: {
+                const xa_count = ce.xattr_count;
+                if (xa_count == 0) break :blk &.{};
+                const xa_zig = page_allocator.alloc(mini_blar.XattrEntry, xa_count) catch break :blk &[_]mini_blar.XattrEntry{};
+                for (0..xa_count) |xi| {
+                    xa_zig[xi] = .{
+                        .name = xa_ptr[xi].name[0..xa_ptr[xi].name_len],
+                        .value = xa_ptr[xi].value[0..xa_ptr[xi].value_len],
+                    };
+                }
+                break :blk xa_zig;
+            } else &.{};
+
+            const rfork: []const u8 = if (ce.resource_fork) |rf| rf[0..ce.resource_fork_len] else &.{};
+
             zig_entries[i] = .{ .file = .{
                 .path = ce.path[0..ce.path_len],
                 .content = content,
@@ -2692,6 +2723,8 @@ export fn blip_archive_create_streaming(
                 .gid = ce.gid,
                 .username = if (ce.owner_len > 0 and ce.owner != null) ce.owner.?[0..ce.owner_len] else &.{},
                 .groupname = if (ce.groupname_len > 0 and ce.groupname != null) ce.groupname.?[0..ce.groupname_len] else &.{},
+                .xattrs = xattr_slice,
+                .resource_fork = rfork,
                 .zip_compression_method = if (ce.zip_compression_method != 0xFFFF) ce.zip_compression_method else null,
                 .pdf_stream_offset = if (ce.pdf_stream_offset != std.math.maxInt(u64)) ce.pdf_stream_offset else null,
                 .pdf_stream_length = if (ce.pdf_stream_length != std.math.maxInt(u64)) ce.pdf_stream_length else null,
