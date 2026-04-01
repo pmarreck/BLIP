@@ -345,7 +345,7 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
 }
 
 /// Serialize a single DirEntry into a DIR container with 2-char keys.
-fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
+pub fn serializeDirEntry(allocator: Allocator, dir: DirEntry, to_free: *std.ArrayList([]u8)) (Allocator.Error || ContainerError)![]const u8 {
     // Build key-value pairs with 2-char keys in canonical order:
     // bt < co < ct < gi < gn < md < mt < pa < ui < un < xa < xh
     var pairs_buf: [12]dict_mod.KeyValue = undefined;

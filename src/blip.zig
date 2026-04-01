@@ -858,6 +858,7 @@ pub const flac_mod = @import("flac.zig");
 pub const nifti_mod = @import("nifti.zig");
 pub const dicom_mod = @import("dicom.zig");
 pub const expansion_mod = @import("expansion.zig");
+pub const streaming_mod = @import("streaming.zig");
 pub const fits_mod = @import("fits.zig");
 pub const aiff_mod = @import("aiff.zig");
 
@@ -905,4 +906,5 @@ test {
     _ = @import("fits.zig");
     _ = @import("dicom.zig");
     _ = @import("expansion.zig");
+    _ = @import("streaming.zig");
 }
