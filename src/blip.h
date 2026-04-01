@@ -155,7 +155,20 @@ typedef struct {
     uint32_t flate_columns;          /* PDF /Columns (image width in pixels), 0 = not set */
     uint8_t flate_colors;            /* PDF /Colors (channel count), 0 = not set */
     uint8_t flate_bpc;               /* PDF /BitsPerComponent, 0 = not set */
+    const char *source_path;         /* disk path for streaming (read on demand), NULL = use content */
+    size_t source_path_len;          /* 0 = not set */
 } blip_archive_entry;
+
+/* Create archive using streaming (spill-to-disk) approach.
+ * Entries should have source_path set and content=NULL for files.
+ * The streaming path reads files on demand, keeping memory at O(largest_file).
+ * Produces byte-identical output to blip_archive_create_full.
+ * expand_containers: if true, runs container expansion per-file during Pass 1. */
+int32_t blip_archive_create_streaming(
+    const blip_archive_entry *entries, size_t entry_count,
+    uint8_t per_file_comp_algo,
+    bool expand_containers, bool expand_all_zips,
+    uint8_t **out_buf, size_t *out_len);
 
 /* Progress callback for archive creation.
  * Called after each entry is serialized with cumulative counts.

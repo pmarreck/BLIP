@@ -220,6 +220,8 @@ const CArchiveEntry = extern struct {
     flate_columns: u32, // PDF /Columns, 0 = not set
     flate_colors: u8, // PDF /Colors, 0 = not set
     flate_bpc: u8, // PDF /BitsPerComponent, 0 = not set
+    source_path: ?[*]const u8 = null, // disk path for streaming (read on demand), NULL = use content
+    source_path_len: usize = 0, // 0 = not set
 };
 
 /// Create a BLIP archive from simple file entries (no metadata beyond path+content).
@@ -1485,6 +1487,7 @@ const flac_mod = blip.flac_mod;
 const nifti_mod = blip.nifti_mod;
 const dicom_mod = blip.dicom_mod;
 const expansion_mod = blip.expansion_mod;
+const streaming_mod = blip.streaming_mod;
 const fits_mod = blip.fits_mod;
 const aiff_mod = blip.aiff_mod;
 
@@ -2612,6 +2615,98 @@ export fn blip_collapse_container(
 
     out_data.* = data.ptr;
     out_data_len.* = data.len;
+    return 0;
+}
+
+
+// --- Streaming archive creation ---
+
+/// Create a BLAR archive using streaming (spill-to-disk) approach.
+/// Uses the same blip_archive_entry C struct but reads file content
+/// from source_path on demand instead of requiring content in memory.
+/// Produces byte-identical output to blip_archive_create_full.
+export fn blip_archive_create_streaming(
+    c_entries: [*]const CArchiveEntry,
+    entry_count: usize,
+    per_file_comp_algo: u8,
+    expand_containers: bool,
+    expand_all_zips: bool,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    _ = expand_containers;
+    _ = expand_all_zips;
+
+    // Convert C entries to Zig ArchiveEntry, reading content from source_path
+    const mini = blip.mini_blar_mod;
+    
+
+    const zig_entries = page_allocator.alloc(mini.ArchiveEntry, entry_count) catch return -13;
+    defer page_allocator.free(zig_entries);
+
+    // Track content buffers we read from disk so we can free them
+    var read_bufs = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (read_bufs.items) |buf| page_allocator.free(buf);
+        read_bufs.deinit(page_allocator);
+    }
+
+    for (0..entry_count) |i| {
+        const ce = c_entries[i];
+        if (ce.is_dir != 0) {
+            zig_entries[i] = .{ .dir = .{
+                .path = ce.path[0..ce.path_len],
+                .mode = ce.mode,
+                .mtime_ns = ce.mtime_ns,
+                .ctime_ns = ce.ctime_ns,
+                .birthtime_ns = ce.birthtime_ns,
+                .uid = ce.uid,
+                .gid = ce.gid,
+                .username = if (ce.owner_len > 0 and ce.owner != null) ce.owner.?[0..ce.owner_len] else &.{},
+                .groupname = if (ce.groupname_len > 0 and ce.groupname != null) ce.groupname.?[0..ce.groupname_len] else &.{},
+                .container_type = if (ce.container_type_len > 0 and ce.container_type != null) ce.container_type.?[0..ce.container_type_len] else &.{},
+            }};
+        } else {
+            // Read content from source_path if content is NULL
+            var content: []const u8 = &.{};
+            if (ce.content) |ptr| {
+                content = ptr[0..ce.content_len];
+            } else if (ce.source_path) |sp| {
+                // Read file from disk
+                const path = sp[0..ce.source_path_len];
+                const file = std.fs.cwd().openFile(path, .{}) catch return -42;
+                defer file.close();
+                const data = file.readToEndAlloc(page_allocator, std.math.maxInt(usize)) catch return -42;
+                read_bufs.append(page_allocator, data) catch return -13;
+                content = data;
+            }
+
+            zig_entries[i] = .{ .file = .{
+                .path = ce.path[0..ce.path_len],
+                .content = content,
+                .mode = ce.mode,
+                .mtime_ns = ce.mtime_ns,
+                .ctime_ns = ce.ctime_ns,
+                .birthtime_ns = ce.birthtime_ns,
+                .uid = ce.uid,
+                .gid = ce.gid,
+                .username = if (ce.owner_len > 0 and ce.owner != null) ce.owner.?[0..ce.owner_len] else &.{},
+                .groupname = if (ce.groupname_len > 0 and ce.groupname != null) ce.groupname.?[0..ce.groupname_len] else &.{},
+                .zip_compression_method = if (ce.zip_compression_method != 0xFFFF) ce.zip_compression_method else null,
+                .pdf_stream_offset = if (ce.pdf_stream_offset != std.math.maxInt(u64)) ce.pdf_stream_offset else null,
+                .pdf_stream_length = if (ce.pdf_stream_length != std.math.maxInt(u64)) ce.pdf_stream_length else null,
+                .jxl_source_format = if (ce.jxl_source_format_len > 0 and ce.jxl_source_format != null) ce.jxl_source_format.?[0..ce.jxl_source_format_len] else &.{},
+            }};
+        }
+    }
+
+    const CompId = mini_blar.container_mod.CompressionId;
+    const comp: ?CompId = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompId, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
+
+    const result = streaming_mod.createArchiveStreaming(page_allocator, zig_entries, comp) catch return -40;
+
+    out_buf.* = result.ptr;
+    out_len.* = result.len;
     return 0;
 }
 

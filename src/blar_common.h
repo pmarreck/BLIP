@@ -6089,6 +6089,99 @@ static const blar_codec_registry_t builtin_registry = {
     .count  = sizeof(builtin_codecs) / sizeof(builtin_codecs[0]),
 };
 
+
+/* Collect entries recording only metadata + disk paths (no file content loaded).
+ * For use with the streaming archive creation path. */
+static bool collect_entries_metadata_recurse(const char *path, entry_list_t *el);
+
+static bool collect_metadata_dir_children(const char *path, entry_list_t *el) {
+    DIR *dir = opendir(path);
+    if (!dir) return false;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char child_path[4096];
+        size_t plen = strlen(path);
+        while (plen > 0 && path[plen - 1] == '/') plen--;
+        int n = snprintf(child_path, sizeof(child_path), "%.*s/%s", (int)plen, path, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child_path)) { closedir(dir); return false; }
+        if (!collect_entries_metadata_recurse(child_path, el)) { closedir(dir); return false; }
+    }
+    closedir(dir);
+    return true;
+}
+
+static bool collect_entries_metadata_recurse(const char *path, entry_list_t *el) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+
+    const char *norm = NULL;
+    size_t norm_len = 0;
+    blip_normalize_path(path, strlen(path), &norm, &norm_len);
+    if (norm_len == 0) {
+        return collect_metadata_dir_children(path, el);
+    }
+    char *owned_path = strdup(norm);
+    if (!owned_path) return false;
+    if (!entry_list_add_content(el, (uint8_t *)owned_path)) { free(owned_path); return false; }
+
+    if (S_ISDIR(st.st_mode)) {
+        blip_archive_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.path = owned_path;
+        entry.path_len = strlen(owned_path);
+        entry.is_dir = 1;
+        fill_entry_metadata(&entry, &st);
+        /* Read xattrs */
+        blip_xattr_entry *xa = NULL; size_t xa_count = 0;
+        uint8_t *rfork = NULL; size_t rfork_len = 0;
+        read_file_xattrs(path, &xa, &xa_count, &rfork, &rfork_len);
+        entry.xattrs = xa; entry.xattr_count = xa_count;
+        entry.resource_fork = rfork; entry.resource_fork_len = rfork_len;
+        if (!entry_list_add(el, entry)) return false;
+        if (xa) entry_list_add_content(el, (uint8_t *)xa);
+        for (size_t xi = 0; xi < xa_count; xi++) {
+            if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+            if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+        }
+        if (rfork) entry_list_add_content(el, rfork);
+        return collect_metadata_dir_children(path, el);
+    } else if (S_ISREG(st.st_mode)) {
+        /* KEY DIFFERENCE: store source_path instead of reading content */
+        char *disk_path = strdup(path);
+        if (!disk_path) return false;
+        if (!entry_list_add_content(el, (uint8_t *)disk_path)) { free(disk_path); return false; }
+
+        blip_archive_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.path = owned_path;
+        entry.path_len = strlen(owned_path);
+        entry.content = NULL;  /* no content loaded */
+        entry.content_len = (size_t)st.st_size;  /* size from stat */
+        entry.is_dir = 0;
+        entry.source_path = disk_path;
+        entry.source_path_len = strlen(disk_path);
+        fill_entry_metadata(&entry, &st);
+        /* Read xattrs */
+        blip_xattr_entry *xa = NULL; size_t xa_count = 0;
+        uint8_t *rfork = NULL; size_t rfork_len = 0;
+        read_file_xattrs(path, &xa, &xa_count, &rfork, &rfork_len);
+        entry.xattrs = xa; entry.xattr_count = xa_count;
+        entry.resource_fork = rfork; entry.resource_fork_len = rfork_len;
+        if (!entry_list_add(el, entry)) return false;
+        if (xa) entry_list_add_content(el, (uint8_t *)xa);
+        for (size_t xi = 0; xi < xa_count; xi++) {
+            if (xa[xi].name) entry_list_add_content(el, (uint8_t *)xa[xi].name);
+            if (xa[xi].value) entry_list_add_content(el, (uint8_t *)xa[xi].value);
+        }
+        if (rfork) entry_list_add_content(el, rfork);
+        return true;
+    }
+    /* Skip non-regular, non-directory entries (symlinks, etc.) */
+    return true;
+}
+
+
 static bool expand_via_zig(entry_list_t *el, const uint8_t *content, size_t content_len, const blip_archive_entry *file_entry, const blar_codec_t *codec);
 
 static bool collect_entries_recurse(const char *path, entry_list_t *el);
@@ -6303,6 +6396,8 @@ static void *expand_worker(void *arg) {
 /* Bridge: try Zig expansion first, fall back to C expand function.
  * This is the transition layer — formats migrated to expansion.zig go through
  * blip_expand_file(), others still use their C expand_*_container() function. */
+
+
 static bool expand_via_zig(entry_list_t *el,
                                  const uint8_t *content, size_t content_len,
                                  const blip_archive_entry *file_entry,
@@ -6618,7 +6713,6 @@ static bool expand_containers_pass(entry_list_t *el) {
      * (their content has been replaced by JXL/FLAC children). */
     {
         /* Build a set of content pointers that belong to expanded entries */
-        size_t freed_bytes = 0;
         for (size_t i = 0; i < el->content_count; i++) {
             bool is_expanded_content = false;
             /* Check if this content buffer is the .content of an expanded entry */
@@ -6628,7 +6722,6 @@ static bool expand_containers_pass(entry_list_t *el) {
                 if (el->entries[eidx].content == el->content_bufs[i] &&
                     el->entries[eidx].content_len > 0) {
                     is_expanded_content = true;
-                    freed_bytes += el->entries[eidx].content_len;
                     break;
                 }
             }
