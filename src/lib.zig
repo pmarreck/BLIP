@@ -2486,10 +2486,10 @@ export fn blip_dicom_parse(
 
 /// Detect which codec matches content by magic bytes. Returns codec name or NULL.
 export fn blip_detect_codec(buf: [*]const u8, buf_len: usize, out_name: *[*]const u8, out_name_len: *usize) callconv(.c) bool {
-    if (expansion_mod.detectCodec(buf[0..buf_len])) |name| {
+    if (expansion_mod.detectCodec(buf[0..buf_len])) |codec_id| {
+        const name = codec_id.name();
         out_name.* = name.ptr;
-        out_name_len.* = name.len;
-        return true;
+        out_name_len.* = name.len;        return true;
     }
     return false;
 }

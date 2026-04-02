@@ -99,31 +99,61 @@ pub const CollapseChild = struct {
 
 // ── Format detection ─────────────────────────────────────────────────────
 
+/// Codec identifier enum — replaces stringly-typed codec names.
+/// Enables exhaustive switch checking and jump-table dispatch.
+pub const CodecId = enum {
+    jpeg, pdf, png, nifti, dicom, fits, aiff, wav,
+    bmp, tga, tiff, gif, tar, gz, zip,
+
+    /// Convert to the string name used in container_type metadata.
+    pub fn name(self: CodecId) []const u8 {
+        return switch (self) {
+            .jpeg => "jpeg", .pdf => "pdf", .png => "png",
+            .nifti => "nifti", .dicom => "dicom", .fits => "fits",
+            .aiff => "aiff", .wav => "wav", .bmp => "bmp",
+            .tga => "tga", .tiff => "tiff", .gif => "gif",
+            .tar => "tar", .gz => "gz", .zip => "zip",
+        };
+    }
+
+    /// Parse from a string name. Returns null for unknown names.
+    pub fn fromName(s: []const u8) ?CodecId {
+        inline for (@typeInfo(CodecId).@"enum".fields) |field| {
+            if (std.mem.eql(u8, s, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
 /// Detect which codec (if any) matches the given content by magic bytes.
-/// Returns the codec name or null.
-pub fn detectCodec(content: []const u8) ?[]const u8 {
+/// Returns the codec ID or null.
+pub fn detectCodec(content: []const u8) ?CodecId {
     // Order matters: more specific formats first to avoid false positives.
     // JPEG must come before TIFF (some TIFFs contain JPEG, but JPEG has distinct FF D8 FF magic).
-    if (content.len >= 3 and content[0] == 0xFF and content[1] == 0xD8 and content[2] == 0xFF) return "jpeg";
-    if (pdf_mod.isPdfMagic(content)) return "pdf";
-    if (png_mod.isPngMagic(content)) return "png";
-    if (nifti_mod.isNiftiMagic(content)) return "nifti";
-    if (dicom_mod.isDicomMagic(content)) return "dicom";
-    if (fits_mod.isFitsMagic(content)) return "fits";
-    if (aiff_mod.isAiffMagic(content)) return "aiff";
-    if (wav_mod.isWavMagic(content)) return "wav";
-    if (bmp_mod.isBmpMagic(content)) return "bmp";
-    if (tga_mod.isTgaMagic(content)) return "tga";
-    if (tiff_mod.isTiffMagic(content)) return "tiff";
-    if (gif_mod.isGifMagic(content)) return "gif";
-    if (tar_mod.isTarMagic(content)) return "tar";
-    if (content.len >= 2 and content[0] == 0x1F and content[1] == 0x8B) return "gz";
-    // ZIP detection: PK\x03\x04 magic
+    if (content.len >= 3 and content[0] == 0xFF and content[1] == 0xD8 and content[2] == 0xFF) return .jpeg;
+    if (pdf_mod.isPdfMagic(content)) return .pdf;
+    if (png_mod.isPngMagic(content)) return .png;
+    if (nifti_mod.isNiftiMagic(content)) return .nifti;
+    if (dicom_mod.isDicomMagic(content)) return .dicom;
+    if (fits_mod.isFitsMagic(content)) return .fits;
+    if (aiff_mod.isAiffMagic(content)) return .aiff;
+    if (wav_mod.isWavMagic(content)) return .wav;
+    if (bmp_mod.isBmpMagic(content)) return .bmp;
+    if (tga_mod.isTgaMagic(content)) return .tga;
+    if (tiff_mod.isTiffMagic(content)) return .tiff;
+    if (gif_mod.isGifMagic(content)) return .gif;
+    if (tar_mod.isTarMagic(content)) return .tar;
+    if (content.len >= 2 and content[0] == 0x1F and content[1] == 0x8B) return .gz;
     if (content.len >= 4 and content[0] == 0x50 and content[1] == 0x4B and
-        content[2] == 0x03 and content[3] == 0x04) return "zip";
+        content[2] == 0x03 and content[3] == 0x04) return .zip;
     return null;
 }
 
+/// Legacy string-based detection (for C FFI compatibility).
+pub fn detectCodecName(content: []const u8) ?[]const u8 {
+    if (detectCodec(content)) |id| return id.name();
+    return null;
+}
 // ── Pixel-based expansion helpers ────────────────────────────────────────
 
 /// Common pattern: parse format → pixels → JXL → [__meta__, __pixels__.jxl]
@@ -198,8 +228,7 @@ fn expandPixelFormat(
         @memcpy(meta[4 + parsed.pre_idat.len ..], parsed.post_idat);
         allocator.free(parsed.pre_idat);
         allocator.free(parsed.post_idat);
-    } else if (std.mem.eql(u8, codec_name, "gif")) {
-        var parsed = gif_mod.parseGif(allocator, content) catch return null;
+    } else if (std.mem.eql(u8, codec_name, "gif")) {        var parsed = gif_mod.parseGif(allocator, content) catch return null;
         if (parsed.is_animated) { parsed.deinit(); return null; }
         pixels = parsed.pixels;
         width = parsed.width;
@@ -584,166 +613,145 @@ fn expandZip(allocator: Allocator, content: []const u8) !?ExpandResult {
 /// Returns null if the format is not recognized or expansion isn't worthwhile.
 /// The caller owns the returned ExpandResult and must call deinit().
 pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const u8) !?ExpandResult {
-    // Pixel-based formats (→ JXL)
-    if (std.mem.eql(u8, codec_name, "bmp") or
-        std.mem.eql(u8, codec_name, "tga") or
-        std.mem.eql(u8, codec_name, "tiff") or
-        std.mem.eql(u8, codec_name, "png") or
-        std.mem.eql(u8, codec_name, "gif") or
-        std.mem.eql(u8, codec_name, "fits") or
-        std.mem.eql(u8, codec_name, "dicom") or
-        std.mem.eql(u8, codec_name, "nifti"))
-    {
-        return expandPixelFormat(allocator, content, codec_name, 1024);
-    }
-
-    // Audio formats (→ FLAC)
-    if (std.mem.eql(u8, codec_name, "wav") or
-        std.mem.eql(u8, codec_name, "aiff"))
-    {
-        return expandAudioFormat(allocator, content, codec_name);
-    }
-
-
-    // Gzip
-    if (std.mem.eql(u8, codec_name, "gz")) {
-        if (content.len < 20) return null;
-        const decompressed = pdf_mod.gzipDecompress(allocator, content) catch return null;
-        const gz_level = pdf_mod.gzipGuessLevel(allocator, content, decompressed);
-
-        const entries = try allocator.alloc(ExpandedEntry, 1);
-        errdefer allocator.free(entries);
-        entries[0] = .{
-            .path_suffix = try allocator.dupe(u8, "__body__"),
-            .content = decompressed,
-            .is_dir = false,
-            .jxl_source_format = &.{},
-            .gz_level = gz_level,
-        };
-        return ExpandResult{
-            .container_type = "gz",
-            .entries = entries,
-            .allocator = allocator,
-        };
-    }
-
-
-    // Tar
-    if (std.mem.eql(u8, codec_name, "tar")) {
-        if (content.len < 128) return null;
-
-        var parsed = tar_mod.parseTar(allocator, content) catch return null;
-        defer parsed.deinit();
-
-        if (parsed.entries.len == 0) return null;
-
-        // Build metadata: [u64_le count][u64_le trailer_len][trailer]
-        //                 [512-byte header + u8 typeflag] * count
-        const count = parsed.entries.len;
-        const meta_len = 8 + 8 + parsed.trailer.len + count * 513;
-        const meta = allocator.alloc(u8, meta_len) catch return null;
-
-        std.mem.writeInt(u64, meta[0..8], count, .little);
-        std.mem.writeInt(u64, meta[8..16], parsed.trailer.len, .little);
-        if (parsed.trailer.len > 0)
-            @memcpy(meta[16..][0..parsed.trailer.len], parsed.trailer);
-        var moff: usize = 16 + parsed.trailer.len;
-        for (parsed.entries) |entry| {
-            @memcpy(meta[moff..][0..512], &entry.header);
-            moff += 512;
-            meta[moff] = entry.typeflag;
-            moff += 1;
-        }
-
-        // Build entries: __meta__ + one entry per tar member
-        const num_entries = 1 + count;
-        const entries = allocator.alloc(ExpandedEntry, num_entries) catch {
-            allocator.free(meta);
-            return null;
-        };
-
-        entries[0] = .{
-            .path_suffix = allocator.dupe(u8, "__meta__") catch { allocator.free(meta); allocator.free(entries); return null; },
-            .content = meta,
-            .is_dir = false,
-            .jxl_source_format = &.{},
-            .gz_level = 0,
-        };
-
-        for (parsed.entries, 0..) |entry, i| {
-            // Path: __entry_NNNN/original_path
-            var idx_buf: [32]u8 = undefined;
-            const idx_str = std.fmt.bufPrint(&idx_buf, "__entry_{d:0>4}/", .{i}) catch unreachable;
-            const suffix_len = idx_str.len + entry.path.len;
-            const suffix = allocator.alloc(u8, suffix_len) catch return null;
-            @memcpy(suffix[0..idx_str.len], idx_str);
-            @memcpy(suffix[idx_str.len..], entry.path);
-
-            var child_content: []u8 = &.{};
-            if (entry.content.len > 0) {
-                child_content = allocator.alloc(u8, entry.content.len) catch return null;
-                @memcpy(child_content, entry.content);
-            }
-
-            entries[1 + i] = .{
-                .path_suffix = suffix,
-                .content = child_content,
-                .is_dir = entry.typeflag == '5',
-                .jxl_source_format = &.{},
-                .gz_level = 0,
-            };
-        }
-
-        return ExpandResult{
-            .container_type = "tar",
-            .entries = entries,
-            .allocator = allocator,
-        };
-    }
-
-
-    // JPEG → JXL (lossless JPEG transcode, not pixel-based)
-    if (std.mem.eql(u8, codec_name, "jpeg")) {
-        if (content.len < 128) return null;
-
-        const jxl_data = jxl_mod.jpegToJxl(allocator, content) catch return null;
-
-        // Size check: JXL must be < 85% of original (JPEG is already compressed)
-        if (jxl_data.len >= content.len * 85 / 100) {
-            allocator.free(jxl_data);
-            return null;
-        }
-
-        // Single child: __data__.jxl (the JXL transcoded JPEG)
-        const entries = try allocator.alloc(ExpandedEntry, 1);
-        errdefer allocator.free(entries);
-        entries[0] = .{
-            .path_suffix = try allocator.dupe(u8, "__body__.jxl"),
-            .content = jxl_data,
-            .is_dir = false,
-            .jxl_source_format = "jpeg",
-            .gz_level = 0,
-        };
-        return ExpandResult{
-            .container_type = "jpeg",
-            .entries = entries,
-            .allocator = allocator,
-        };
-    }
-
-
-    // PDF
-    if (std.mem.eql(u8, codec_name, "pdf")) {
-        return expandPdf(allocator, content);
-    }
-    // ZIP
-    if (std.mem.eql(u8, codec_name, "zip")) {
-        return expandZip(allocator, content);
-    }
-
-    return null;
+    const codec_id = CodecId.fromName(codec_name) orelse return null;
+    return expandFileById(allocator, content, codec_id);
 }
 
+/// Expand by CodecId — enum switch dispatch (exhaustive, no string comparisons).
+pub fn expandFileById(allocator: Allocator, content: []const u8, codec: CodecId) !?ExpandResult {
+    return switch (codec) {
+        // Pixel-based formats (→ JXL)
+        .bmp, .tga, .tiff, .png, .gif, .fits, .dicom, .nifti => expandPixelFormat(allocator, content, codec.name(), 20),
+        // Audio formats (→ FLAC)
+        .wav, .aiff => expandAudioFormat(allocator, content, codec.name()),
+        // Gzip
+        .gz => expandGz(allocator, content),
+        // Tar
+        .tar => expandTar(allocator, content),
+        // JPEG → JXL (lossless transcode)
+        .jpeg => expandJpeg(allocator, content),
+        // PDF
+        .pdf => expandPdf(allocator, content),
+        // ZIP
+        .zip => expandZip(allocator, content),
+    };
+}
+
+fn expandGz(allocator: Allocator, content: []const u8) !?ExpandResult {
+    if (content.len < 20) return null;
+    const decompressed = pdf_mod.gzipDecompress(allocator, content) catch return null;
+    const gz_level = pdf_mod.gzipGuessLevel(allocator, content, decompressed);
+
+    const entries = try allocator.alloc(ExpandedEntry, 1);
+    errdefer allocator.free(entries);
+    entries[0] = .{
+        .path_suffix = try allocator.dupe(u8, "__body__"),
+        .content = decompressed,
+        .is_dir = false,
+        .jxl_source_format = &.{},
+        .gz_level = gz_level,
+    };
+    return ExpandResult{
+        .container_type = "gz",
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
+
+fn expandTar(allocator: Allocator, content: []const u8) !?ExpandResult {
+    if (content.len < 128) return null;
+
+    var parsed = tar_mod.parseTar(allocator, content) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.entries.len == 0) return null;
+
+    const count = parsed.entries.len;
+    const meta_len = 8 + 8 + parsed.trailer.len + count * 513;
+    const meta = allocator.alloc(u8, meta_len) catch return null;
+
+    std.mem.writeInt(u64, meta[0..8], count, .little);
+    std.mem.writeInt(u64, meta[8..16], parsed.trailer.len, .little);
+    if (parsed.trailer.len > 0)
+        @memcpy(meta[16..][0..parsed.trailer.len], parsed.trailer);
+    var moff: usize = 16 + parsed.trailer.len;
+    for (parsed.entries) |entry| {
+        @memcpy(meta[moff..][0..512], &entry.header);
+        moff += 512;
+        meta[moff] = entry.typeflag;
+        moff += 1;
+    }
+
+    const num_entries = 1 + count;
+    const entries = allocator.alloc(ExpandedEntry, num_entries) catch {
+        allocator.free(meta);
+        return null;
+    };
+    errdefer allocator.free(entries);
+
+    entries[0] = .{
+        .path_suffix = allocator.dupe(u8, "__meta__") catch { allocator.free(meta); allocator.free(entries); return null; },
+        .content = meta,
+        .is_dir = false,
+        .jxl_source_format = &.{},
+        .gz_level = 0,
+    };
+
+    for (parsed.entries, 0..) |entry, i| {
+        var idx_buf: [32]u8 = undefined;
+        const idx_str = std.fmt.bufPrint(&idx_buf, "__entry_{d:0>4}/", .{i}) catch unreachable;
+        const suffix_len = idx_str.len + entry.path.len;
+        const suffix = allocator.alloc(u8, suffix_len) catch return null;
+        @memcpy(suffix[0..idx_str.len], idx_str);
+        @memcpy(suffix[idx_str.len..], entry.path);
+
+        var child_content: []u8 = &.{};
+        if (entry.content.len > 0) {
+            child_content = allocator.alloc(u8, entry.content.len) catch return null;
+            @memcpy(child_content, entry.content);
+        }
+
+        entries[1 + i] = .{
+            .path_suffix = suffix,
+            .content = child_content,
+            .is_dir = entry.typeflag == '5',
+            .jxl_source_format = &.{},
+            .gz_level = 0,
+        };
+    }
+
+    return ExpandResult{
+        .container_type = "tar",
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
+
+fn expandJpeg(allocator: Allocator, content: []const u8) !?ExpandResult {
+    if (content.len < 128) return null;
+
+    const jxl_data = jxl_mod.jpegToJxl(allocator, content) catch return null;
+
+    if (jxl_data.len >= content.len * 85 / 100) {
+        allocator.free(jxl_data);
+        return null;
+    }
+
+    const entries = try allocator.alloc(ExpandedEntry, 1);
+    errdefer allocator.free(entries);
+    entries[0] = .{
+        .path_suffix = try allocator.dupe(u8, "__body__.jxl"),
+        .content = jxl_data,
+        .is_dir = false,
+        .jxl_source_format = "jpeg",
+        .gz_level = 0,
+    };
+    return ExpandResult{
+        .container_type = "jpeg",
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
 /// Reconstruct a container's original file from its expanded children.
 /// Returns the reconstructed bytes, or null on failure.
 pub fn collapseContainer(
@@ -751,13 +759,22 @@ pub fn collapseContainer(
     codec_name: []const u8,
     children: []const CollapseChild,
 ) !?[]u8 {
+    const codec_id = CodecId.fromName(codec_name) orelse return null;
+    return collapseContainerById(allocator, codec_id, children);
+}
 
+/// Collapse by CodecId — the actual implementation with exhaustive switch.
+fn collapseContainerById(
+    allocator: Allocator,
+    codec: CodecId,
+    children: []const CollapseChild,
+) !?[]u8 {
 
 
 
 
     // ZIP collapse: reconstruct ZIP from child entries with compression methods
-    if (std.mem.eql(u8, codec_name, "zip")) {
+    if (codec == .zip) {
         // Collect child entries (skip __meta__ if present, though ZIP doesn't use it)
         var zip_entries = std.ArrayListUnmanaged(zip_mod.ZipWriteEntry){};
         defer zip_entries.deinit(allocator);
@@ -781,7 +798,7 @@ pub fn collapseContainer(
     }
 
     // PDF collapse: reconstruct from __body__ shell + __img_*.jxl children
-    if (std.mem.eql(u8, codec_name, "pdf")) {
+    if (codec == .pdf) {
         var shell: ?[]const u8 = null;
 
         // Collect all children
@@ -876,7 +893,7 @@ pub fn collapseContainer(
     }
 
     // JPEG collapse: JXL → JPEG (lossless reverse transcode)
-    if (std.mem.eql(u8, codec_name, "jpeg")) {
+    if (codec == .jpeg) {
         var jxl_content: ?[]const u8 = null;
         for (children) |child| {
             if (std.mem.eql(u8, child.inner_path, "__body__.jxl"))
@@ -887,7 +904,7 @@ pub fn collapseContainer(
     }
 
     // Tar collapse: reconstruct from __meta__ headers + child content
-    if (std.mem.eql(u8, codec_name, "tar")) {
+    if (codec == .tar) {
         var meta_content: ?[]const u8 = null;
         for (children) |child| {
             if (std.mem.eql(u8, child.inner_path, "__meta__"))
@@ -960,7 +977,7 @@ pub fn collapseContainer(
     }
 
     // Gzip collapse: recompress __body__ with stored level
-    if (std.mem.eql(u8, codec_name, "gz")) {
+    if (codec == .gz) {
         var body_content: ?[]const u8 = null;
         var gz_level: u8 = 6; // default
         for (children) |child| {
@@ -992,7 +1009,7 @@ pub fn collapseContainer(
     }
 
     // GIF: just return __meta__ (it IS the original file)
-    if (std.mem.eql(u8, codec_name, "gif")) {
+    if (codec == .gif) {
         const meta = meta_content orelse return null;
         const result = try allocator.alloc(u8, meta.len);
         @memcpy(result, meta);
@@ -1000,8 +1017,7 @@ pub fn collapseContainer(
     }
 
     // Audio collapse (WAV, AIFF)
-    if (std.mem.eql(u8, codec_name, "wav") or std.mem.eql(u8, codec_name, "aiff")) {
-        if (!build_options.enable_flac) return null;
+    if (codec == .wav or codec == .aiff) {        if (!build_options.enable_flac) return null;
         const meta = meta_content orelse return null;
         const flac_data = audio_content orelse return null;
 
@@ -1012,14 +1028,14 @@ pub fn collapseContainer(
         const pcm = flac_mod.decodeFlacToPcm(allocator, flac_data, &dec_channels, &dec_rate, &dec_bps, &dec_total) catch return null;
         defer allocator.free(pcm);
 
-        if (std.mem.eql(u8, codec_name, "wav")) {
+        if (codec == .wav) {
             return reconstructWav(allocator, meta, pcm);
         } else {
             return reconstructAiff(allocator, meta, pcm, dec_bps, dec_channels * @as(u32, @truncate(dec_total)));
         }
     }
 
-    // Pixel collapse (BMP, TGA, TIFF, PNG, FITS, DICOM)
+    // Pixel collapse (BMP, TGA, TIFF, PNG, FITS, DICOM, NIfTI)
     if (pixel_content != null and meta_content != null) {
         const jxl_data = pixel_content.?;
         const meta = meta_content.?;
@@ -1029,24 +1045,17 @@ pub fn collapseContainer(
         const px_pixels = jxl_mod.jxlToPixels(allocator, jxl_data, &px_fmt) catch return null;
         defer allocator.free(px_pixels);
 
-        if (std.mem.eql(u8, codec_name, "bmp")) {
-            return reconstructBmp(allocator, meta, px_pixels, px_fmt.width, px_fmt.height);
-        } else if (std.mem.eql(u8, codec_name, "tga")) {
-            return reconstructTga(allocator, meta, px_pixels, px_fmt.width, px_fmt.height);
-        } else if (std.mem.eql(u8, codec_name, "png")) {
-            return reconstructPng(allocator, meta, px_pixels, px_fmt.width, px_fmt.height, px_fmt.num_channels, px_fmt.bits_per_sample);
-        } else if (std.mem.eql(u8, codec_name, "tiff") or
-            std.mem.eql(u8, codec_name, "fits") or
-            std.mem.eql(u8, codec_name, "dicom") or
-        std.mem.eql(u8, codec_name, "nifti"))
-        {
-            return reconstructFromTemplate(allocator, meta, px_pixels, codec_name, px_fmt.bits_per_sample);
-        }
+        return switch (codec) {
+            .bmp => reconstructBmp(allocator, meta, px_pixels, px_fmt.width, px_fmt.height),
+            .tga => reconstructTga(allocator, meta, px_pixels, px_fmt.width, px_fmt.height),
+            .png => reconstructPng(allocator, meta, px_pixels, px_fmt.width, px_fmt.height, px_fmt.num_channels, px_fmt.bits_per_sample),
+            .tiff, .fits, .dicom, .nifti => reconstructFromTemplate(allocator, meta, px_pixels, codec.name(), px_fmt.bits_per_sample),
+            else => null,
+        };
     }
 
     return null;
 }
-
 // ── Reconstruction helpers ───────────────────────────────────────────────
 
 fn reconstructBmp(allocator: Allocator, meta: []const u8, pixels: []const u8, width: u32, height: u32) !?[]u8 {
@@ -1276,16 +1285,16 @@ const testing = std.testing;
 
 test "detectCodec identifies ALL supported formats" {
     // JPEG: FF D8 FF
-    try testing.expectEqualStrings("jpeg", detectCodec(&[_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 }).?);
+    try testing.expectEqual(CodecId.jpeg, detectCodec(&[_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 }).?);
 
     // PDF: %PDF-
-    try testing.expectEqualStrings("pdf", detectCodec("%PDF-1.4 test content here!!" ++ &[_]u8{0} ** 4).?);
+    try testing.expectEqual(CodecId.pdf, detectCodec("%PDF-1.4 test content here!!" ++ &[_]u8{0} ** 4).?);
 
     // PNG: 89 50 4E 47 0D 0A 1A 0A
-    try testing.expectEqualStrings("png", detectCodec(&[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }).?);
+    try testing.expectEqual(CodecId.png, detectCodec(&[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }).?);
 
     // BMP: BM + 16 bytes of header
-    try testing.expectEqualStrings("bmp", detectCodec(&[_]u8{ 'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }).?);
+    try testing.expectEqual(CodecId.bmp, detectCodec(&[_]u8{ 'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }).?);
 
     // TGA: type=2, color_map=0, bpp=24, width/height non-zero
     {
@@ -1294,34 +1303,34 @@ test "detectCodec identifies ALL supported formats" {
         tga[12] = 1; // width low byte
         tga[14] = 1; // height low byte
         tga[16] = 24; // bits per pixel
-        try testing.expectEqualStrings("tga", detectCodec(&tga).?);
+        try testing.expectEqual(CodecId.tga, detectCodec(&tga).?);
     }
 
     // TIFF LE: II + 42
-    try testing.expectEqualStrings("tiff", detectCodec(&[_]u8{ 'I', 'I', 42, 0 }).?);
+    try testing.expectEqual(CodecId.tiff, detectCodec(&[_]u8{ 'I', 'I', 42, 0 }).?);
     // TIFF BE: MM + 0x002A
-    try testing.expectEqualStrings("tiff", detectCodec(&[_]u8{ 'M', 'M', 0, 42 }).?);
+    try testing.expectEqual(CodecId.tiff, detectCodec(&[_]u8{ 'M', 'M', 0, 42 }).?);
 
     // GIF: GIF89a
-    try testing.expectEqualStrings("gif", detectCodec("GIF89a" ++ &[_]u8{0} ** 2).?);
-    try testing.expectEqualStrings("gif", detectCodec("GIF87a" ++ &[_]u8{0} ** 2).?);
+    try testing.expectEqual(CodecId.gif, detectCodec("GIF89a" ++ &[_]u8{0} ** 2).?);
+    try testing.expectEqual(CodecId.gif, detectCodec("GIF87a" ++ &[_]u8{0} ** 2).?);
 
     // DICOM: 128-byte preamble + "DICM"
     {
         var dcm: [136]u8 = .{0} ** 136;
         dcm[128] = 'D'; dcm[129] = 'I'; dcm[130] = 'C'; dcm[131] = 'M';
-        try testing.expectEqualStrings("dicom", detectCodec(&dcm).?);
+        try testing.expectEqual(CodecId.dicom, detectCodec(&dcm).?);
     }
 
     // FITS: "SIMPLE  =                    T" at start
-    try testing.expectEqualStrings("fits", detectCodec("SIMPLE  =                    T" ++ &[_]u8{' '} ** 50).?);
+    try testing.expectEqual(CodecId.fits, detectCodec("SIMPLE  =                    T" ++ &[_]u8{' '} ** 50).?);
 
     // NIfTI: sizeof_hdr=348 LE + magic "n+1\0" at offset 344
     {
         var nii: [348]u8 = .{0} ** 348;
         std.mem.writeInt(u32, nii[0..4], 348, .little);
         nii[344] = 'n'; nii[345] = '+'; nii[346] = '1'; nii[347] = 0;
-        try testing.expectEqualStrings("nifti", detectCodec(&nii).?);
+        try testing.expectEqual(CodecId.nifti, detectCodec(&nii).?);
     }
 
     // AIFF: FORM....AIFF
@@ -1329,7 +1338,7 @@ test "detectCodec identifies ALL supported formats" {
         var aiff: [12]u8 = .{0} ** 12;
         @memcpy(aiff[0..4], "FORM");
         @memcpy(aiff[8..12], "AIFF");
-        try testing.expectEqualStrings("aiff", detectCodec(&aiff).?);
+        try testing.expectEqual(CodecId.aiff, detectCodec(&aiff).?);
     }
 
     // WAV: RIFF....WAVE
@@ -1337,21 +1346,21 @@ test "detectCodec identifies ALL supported formats" {
         var wav: [12]u8 = .{0} ** 12;
         @memcpy(wav[0..4], "RIFF");
         @memcpy(wav[8..12], "WAVE");
-        try testing.expectEqualStrings("wav", detectCodec(&wav).?);
+        try testing.expectEqual(CodecId.wav, detectCodec(&wav).?);
     }
 
     // tar: ustar magic at offset 257
     {
         var tar: [512]u8 = .{0} ** 512;
         tar[257] = 'u'; tar[258] = 's'; tar[259] = 't'; tar[260] = 'a'; tar[261] = 'r'; tar[262] = 0;
-        try testing.expectEqualStrings("tar", detectCodec(&tar).?);
+        try testing.expectEqual(CodecId.tar, detectCodec(&tar).?);
     }
 
     // gzip: 1F 8B
-    try testing.expectEqualStrings("gz", detectCodec(&[_]u8{ 0x1F, 0x8B, 0x08, 0x00 }).?);
+    try testing.expectEqual(CodecId.gz, detectCodec(&[_]u8{ 0x1F, 0x8B, 0x08, 0x00 }).?);
 
     // ZIP: PK\x03\x04
-    try testing.expectEqualStrings("zip", detectCodec(&[_]u8{ 0x50, 0x4B, 0x03, 0x04 }).?);
+    try testing.expectEqual(CodecId.zip, detectCodec(&[_]u8{ 0x50, 0x4B, 0x03, 0x04 }).?);
 
     // Negative: random bytes
     try testing.expect(detectCodec(&[_]u8{ 0x00, 0x00, 0x00, 0x00 }) == null);

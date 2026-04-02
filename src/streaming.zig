@@ -58,17 +58,16 @@ fn expandSlot(allocator: Allocator, entry: ArchiveEntry, slot: *ExpSlot, do_expa
     switch (entry) {
         .file => |file| {
             if (do_expand and file.content.len >= 20) {
-                if (expansion.detectCodec(file.content)) |codec_name| {
+                if (expansion.detectCodec(file.content)) |codec_id| {
                     // Skip .zip files with archive extensions unless expand_all_zips
-                    if (std.mem.eql(u8, codec_name, "zip") and !expand_all_zips) {
+                    if (codec_id == .zip and !expand_all_zips) {
                         if (isArchiveExtension(file.path)) {
                             slot.result_entries.append(allocator, entry) catch {};
                             return;
                         }
                     }
 
-                    var exp_result = expansion.expandFile(allocator, file.content, codec_name) catch null;
-                    if (exp_result) |*exp| {
+                    var exp_result = expansion.expandFileById(allocator, file.content, codec_id) catch null;                    if (exp_result) |*exp| {
                         slot.has_dir = true;
                         slot.result_entries.append(allocator, .{ .dir = .{
                             .path = file.path,
