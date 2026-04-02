@@ -1,3 +1,44 @@
 #!/usr/bin/env bash
+# =============================================================================
+# BLIP Benchmark Suite
+# =============================================================================
+# Runs both the Zig microbenchmarks (encoding/decoding) and the archive
+# creation benchmarks (expansion, serialization, streaming).
+#
+# Results are logged to bench/*.jsonl (git-tracked) for historical comparison.
+# =============================================================================
+
 set -euo pipefail
-nix develop -c zig build bench -Doptimize=ReleaseFast
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║                    BLIP Benchmark Suite                     ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Build everything optimized
+echo "Building (ReleaseFast)..."
+nix develop -c zig build -Doptimize=ReleaseFast 2>/dev/null
+
+# Check for DEBUG BUILD
+if zig-out/bin/blar --about 2>&1 | grep -qi "DEBUG BUILD"; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  ERROR: DEBUG BUILD detected. Benchmarks require Release.   ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    exit 1
+fi
+
+# Run Zig encoding benchmarks
+echo ""
+echo "━━━ Zig Encoding Benchmarks ━━━"
+nix develop -c zig build bench -Doptimize=ReleaseFast 2>/dev/null || true
+
+# Run archive creation benchmarks
+echo ""
+echo "━━━ Archive Creation Benchmarks ━━━"
+bash bench/archive_bench.sh
+
+echo ""
+echo "Done. Results in bench/*.jsonl"

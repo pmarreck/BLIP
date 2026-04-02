@@ -514,16 +514,26 @@ static int cmd_create(int argc, char **argv) {
         return EXIT_USAGE;
     }
 
-    /* Auto-detect streaming mode for large archives */
+    /* Auto-detect streaming mode for large archives.
+     * Threshold configurable via BLAR_STREAMING_THRESHOLD (bytes, default 1GB).
+     * Set to 0 to always stream, or very large to never auto-stream. */
     if (!use_streaming) {
+        uint64_t threshold = (uint64_t)1024 * 1024 * 1024; /* 1 GB default */
+        const char *env_thresh = getenv("BLAR_STREAMING_THRESHOLD");
+        if (env_thresh) {
+            char *end;
+            uint64_t val = strtoull(env_thresh, &end, 10);
+            if (end != env_thresh) threshold = val;
+        }
         uint64_t est_total = 0;
         for (size_t i = 0; i < el.count; i++) {
             if (!el.entries[i].is_dir)
                 est_total += el.entries[i].content_len;
         }
-        if (est_total > (uint64_t)1024 * 1024 * 1024) {
-            fprintf(stderr, "blar: auto-selecting streaming mode (%.1f GB input)\n",
-                    (double)est_total / (1024.0 * 1024.0 * 1024.0));
+        if (est_total > threshold) {
+            fprintf(stderr, "blar: auto-selecting streaming mode (%.1f GB input, threshold %.1f GB)\n",
+                    (double)est_total / (1024.0 * 1024.0 * 1024.0),
+                    (double)threshold / (1024.0 * 1024.0 * 1024.0));
             use_streaming = true;
         }
     }

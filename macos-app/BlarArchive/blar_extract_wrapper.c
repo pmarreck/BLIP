@@ -86,7 +86,14 @@ int blar_gui_create(const char *const *paths, size_t path_count,
             if (!el.entries[i].is_dir)
                 est_total += el.entries[i].content_len;
         }
-        if (est_total > (uint64_t)1024 * 1024 * 1024) {
+        uint64_t threshold = (uint64_t)1024 * 1024 * 1024;
+        const char *env_thresh = getenv("BLAR_STREAMING_THRESHOLD");
+        if (env_thresh) {
+            char *end;
+            uint64_t val = strtoull(env_thresh, &end, 10);
+            if (end != env_thresh) threshold = val;
+        }
+        if (est_total > threshold) {
             fprintf(stderr, "[blar_gui_create] auto-selecting streaming mode (%.1f GB input)\n",
                     (double)est_total / (1024.0 * 1024.0 * 1024.0));
             do_streaming = true;

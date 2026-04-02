@@ -1239,3 +1239,167 @@ test "detectCodec identifies formats" {
     try testing.expect(detectCodec(&[_]u8{ 0x00, 0x00, 0x00, 0x00 }) == null);
 }
 
+// ── Microbenchmarks ──────────────────────────────────────────────────────
+// Only run in ReleaseFast (guarded by builtin.mode check).
+// Prefix: "microbench:" for filtering.
+
+const builtin = @import("builtin");
+
+test "microbench: BMP expansion 64x64" {
+    if (builtin.mode == .Debug) return;
+
+    // Generate a 64x64 24-bit BMP in memory
+    const bmp_mod_local = @import("bmp.zig");
+    const alloc = testing.allocator;
+
+    // Build BMP data
+    const width: u32 = 64;
+    const height: u32 = 64;
+    const row_stride = (width * 3 + 3) & ~@as(u32, 3);
+    const pixel_data_len = row_stride * height;
+    const total = 54 + pixel_data_len;
+    const bmp = try alloc.alloc(u8, total);
+    defer alloc.free(bmp);
+    @memset(bmp, 0);
+    bmp[0] = 'B'; bmp[1] = 'M';
+    std.mem.writeInt(u32, bmp[2..6], @intCast(total), .little);
+    std.mem.writeInt(u32, bmp[10..14], 54, .little);
+    std.mem.writeInt(u32, bmp[14..18], 40, .little);
+    std.mem.writeInt(u32, bmp[18..22], width, .little);
+    std.mem.writeInt(u32, bmp[22..26], height, .little);
+    std.mem.writeInt(u16, bmp[26..28], 1, .little);
+    std.mem.writeInt(u16, bmp[28..30], 24, .little);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const off = 54 + y * row_stride + x * 3;
+            bmp[off] = @truncate(x * 4);
+            bmp[off + 1] = @truncate(y * 4);
+            bmp[off + 2] = @truncate((x + y) * 2);
+        }
+    }
+
+    _ = bmp_mod_local;
+
+    // Warm up
+    for (0..5) |_| {
+        var r = expandFile(alloc, bmp, "bmp") catch null;
+        if (r) |*res| res.deinit();
+    }
+
+    // Measure
+    const iterations: u64 = 50;
+    var timer = try std.time.Timer.start();
+    _ = timer.lap();
+    for (0..iterations) |_| {
+        var r = expandFile(alloc, bmp, "bmp") catch null;
+        if (r) |*res| {
+            std.mem.doNotOptimizeAway(res.entries.ptr);
+            res.deinit();
+        }
+    }
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsed_ns / iterations;
+
+    const stderr = std.io.getStdErr().writer();
+    try stderr.print("  BMP 64x64 expansion: {d} ns/op ({d:.2} ms/op)\n", .{
+        ns_per_op,
+        @as(f64, @floatFromInt(ns_per_op)) / 1e6,
+    });
+}
+
+test "microbench: JPEG→JXL transcode 8x8" {
+    if (builtin.mode == .Debug) return;
+
+    const jxl_local = @import("jxl.zig");
+    const alloc = testing.allocator;
+
+    // Minimal 8x8 JPEG from test suite
+    const jpeg = [_]u8{
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43,
+        0x00, 0x03, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x02, 0x02, 0x02, 0x03,
+        0x03, 0x03, 0x03, 0x04, 0x06, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08, 0x06,
+        0x06, 0x05, 0x06, 0x09, 0x08, 0x0a, 0x0a, 0x09, 0x08, 0x09, 0x09, 0x0a,
+        0x0c, 0x0f, 0x0c, 0x0a, 0x0b, 0x0e, 0x0b, 0x09, 0x09, 0x0d, 0x11, 0x0d,
+        0x0e, 0x0f, 0x10, 0x10, 0x11, 0x10, 0x0a, 0x0c, 0x12, 0x13, 0x12, 0x10,
+        0x13, 0x0f, 0x10, 0x10, 0x10, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x03, 0x03,
+        0x03, 0x04, 0x03, 0x04, 0x08, 0x04, 0x04, 0x08, 0x10, 0x0b, 0x09, 0x0b,
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x08, 0x00, 0x08, 0x03,
+        0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xff, 0xc4, 0x00,
+        0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xff, 0xc4, 0x00, 0x14, 0x10,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xc4, 0x00, 0x15, 0x01, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x09, 0xff, 0xc4, 0x00, 0x14, 0x11, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03,
+        0x11, 0x00, 0x3f, 0x00, 0x3a, 0x03, 0x15, 0x4d, 0xff, 0xd9,
+    };
+
+    // Warm up
+    for (0..5) |_| {
+        const r = jxl_local.jpegToJxl(alloc, &jpeg) catch continue;
+        alloc.free(r);
+    }
+
+    const iterations: u64 = 100;
+    var timer = try std.time.Timer.start();
+    _ = timer.lap();
+    for (0..iterations) |_| {
+        const r = jxl_local.jpegToJxl(alloc, &jpeg) catch continue;
+        std.mem.doNotOptimizeAway(r.ptr);
+        alloc.free(r);
+    }
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsed_ns / iterations;
+
+    const stderr = std.io.getStdErr().writer();
+    try stderr.print("  JPEG→JXL 8x8: {d} ns/op ({d:.2} ms/op)\n", .{
+        ns_per_op,
+        @as(f64, @floatFromInt(ns_per_op)) / 1e6,
+    });
+}
+
+test "microbench: serializeFileEntry 4KB" {
+    if (builtin.mode == .Debug) return;
+
+    const alloc = testing.allocator;
+    const mini = @import("mini_blar.zig");
+
+    const content = "The quick brown fox jumps over the lazy dog. " ** 90; // ~4KB
+    const file = mini.FileEntry{
+        .path = "benchmark/test.txt",
+        .content = content,
+    };
+
+    // Warm up
+    for (0..10) |_| {
+        var to_free: std.ArrayList([]u8) = .{};
+        defer { for (to_free.items) |item| alloc.free(item); to_free.deinit(alloc); }
+        const r = try mini.serializeFileEntry(alloc, file, &to_free, null, null, null);
+        std.mem.doNotOptimizeAway(r.ptr);
+    }
+
+    const iterations: u64 = 1000;
+    var timer = try std.time.Timer.start();
+    _ = timer.lap();
+    for (0..iterations) |_| {
+        var to_free: std.ArrayList([]u8) = .{};
+        defer { for (to_free.items) |item| alloc.free(item); to_free.deinit(alloc); }
+        const r = try mini.serializeFileEntry(alloc, file, &to_free, null, null, null);
+        std.mem.doNotOptimizeAway(r.ptr);
+    }
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsed_ns / iterations;
+
+    const stderr = std.io.getStdErr().writer();
+    try stderr.print("  serializeFileEntry 4KB: {d} ns/op ({d:.2} µs/op)\n", .{
+        ns_per_op,
+        @as(f64, @floatFromInt(ns_per_op)) / 1e3,
+    });
+}
