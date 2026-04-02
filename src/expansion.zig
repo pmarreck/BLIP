@@ -254,6 +254,7 @@ fn expandPixelFormat(
 
     // Build result entries
     const entries = try allocator.alloc(ExpandedEntry, 2);
+    errdefer allocator.free(entries);
     entries[0] = .{
         .path_suffix = try allocator.dupe(u8, "__meta__"),
         .content = meta,
@@ -455,6 +456,7 @@ fn expandPdf(allocator: Allocator, content: []const u8) !?ExpandResult {
     // Build entries: __body__ (shell) + __img_N.jxl children
     const num_entries = 1 + num_jxl;
     const entries = try allocator.alloc(ExpandedEntry, num_entries);
+    errdefer allocator.free(entries);
 
     // __body__ = working PDF (with content streams decompressed)
     entries[0] = .{
@@ -595,6 +597,7 @@ pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const
         const gz_level = pdf_mod.gzipGuessLevel(allocator, content, decompressed);
 
         const entries = try allocator.alloc(ExpandedEntry, 1);
+        errdefer allocator.free(entries);
         entries[0] = .{
             .path_suffix = try allocator.dupe(u8, "__body__"),
             .content = decompressed,
@@ -698,6 +701,7 @@ pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const
 
         // Single child: __data__.jxl (the JXL transcoded JPEG)
         const entries = try allocator.alloc(ExpandedEntry, 1);
+        errdefer allocator.free(entries);
         entries[0] = .{
             .path_suffix = try allocator.dupe(u8, "__body__.jxl"),
             .content = jxl_data,

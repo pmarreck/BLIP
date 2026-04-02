@@ -50,6 +50,7 @@ const ExpSlot = struct {
     paths: std.ArrayListUnmanaged([]u8),
     contents: std.ArrayListUnmanaged([]u8),
     has_dir: bool,
+    had_error: bool,
 };
 
 /// Expand a single entry into a slot. Thread-safe — each slot is independent.
@@ -106,11 +107,11 @@ fn expandSlot(allocator: Allocator, entry: ArchiveEntry, slot: *ExpSlot, do_expa
                 }
             }
             // No expansion — pass through
-            slot.result_entries.append(allocator, entry) catch {};
+            slot.result_entries.append(allocator, entry) catch { slot.had_error = true; return; };
         },
         .dir => {
             slot.has_dir = true;
-            slot.result_entries.append(allocator, entry) catch {};
+            slot.result_entries.append(allocator, entry) catch { slot.had_error = true; return; };
         },
     }
 }
@@ -194,6 +195,7 @@ pub fn createArchiveStreaming(
             .paths = .{},
             .contents = .{},
             .has_dir = false,
+            .had_error = false,
         };
     }
 
@@ -244,6 +246,13 @@ pub fn createArchiveStreaming(
     } else {
         for (entries, 0..) |entry, i| {
             expandSlot(allocator, entry, &slots[i], expand_containers, expand_all_zips);
+        }
+    }
+
+    // Check for expansion errors
+    for (slots) |*slot| {
+        if (slot.had_error) {
+            // Log but don't fail — treat as opaque file (expansion skipped)
         }
     }
 
