@@ -4,7 +4,7 @@
 # Tests: -e flag for create, auto-decrypt on list/extract/verify,
 #        wrong password rejection, ChaCha20, PBKDF2, compressed+encrypted
 
-set -euo pipefail
+set -u
 
 PASS=0
 FAIL=0

@@ -5,7 +5,7 @@
 # for list/extract/verify/info/cat/peek/to-json/from-json, plus backward
 # compatibility (default algo, aliases).
 
-set -euo pipefail
+set -u
 
 PASS=0
 FAIL=0

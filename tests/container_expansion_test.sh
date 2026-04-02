@@ -542,7 +542,8 @@ if [[ -n "$TAR_EXP" && -n "$TAR_OPQ" && "$TAR_EXP" -lt "$TAR_OPQ" ]]; then
   pass "tar container: expanded ($TAR_EXP) smaller than opaque ($TAR_OPQ)"
 else
   # tar expansion may not always be smaller for tiny test data — that's OK
-  pass "tar container: size comparison ($TAR_EXP vs $TAR_OPQ) — expansion overhead acceptable for small data"
+  echo "NOTE: tar expansion overhead ($TAR_EXP vs $TAR_OPQ) — acceptable for small test data"
+  pass "tar container: size check (soft)"
 fi
 
 # Verify tar was expanded — list should show 't' prefix
@@ -781,7 +782,8 @@ fi
 if [[ -n "$EXPANDED_SIZE" && -n "$OPAQUE_SIZE" && "$EXPANDED_SIZE" -lt "$OPAQUE_SIZE" ]]; then
   pass "WAV container: expanded ($EXPANDED_SIZE) smaller than opaque ($OPAQUE_SIZE)"
 else
-  pass "WAV container: size comparison ($EXPANDED_SIZE vs $OPAQUE_SIZE) — FLAC overhead acceptable for synthetic test data"
+  echo "NOTE: WAV FLAC overhead ($EXPANDED_SIZE vs $OPAQUE_SIZE) — acceptable for synthetic data"
+  pass "WAV container: size check (soft)"
 fi
 
 # Checksum roundtrip
@@ -833,7 +835,8 @@ if echo "$LIST_OUTPUT" | grep -q "^w\|^d"; then
   pass "AIFF container: expansion detected"
 else
   # AIFF may not always expand (FLAC overhead vs LZMA2 on raw PCM)
-  pass "AIFF container: treated as opaque (FLAC overhead acceptable)"
+  echo "NOTE: AIFF not expanded (FLAC overhead for synthetic data)"
+  pass "AIFF container: detection check (soft)"
 fi
 
 mkdir -p "$TMPDIR_TEST/t22/out"
@@ -895,7 +898,8 @@ fi
 if [[ -n "$FITS_EXP" && -n "$FITS_OPQ" && "$FITS_EXP" -lt "$FITS_OPQ" ]]; then
   pass "FITS container: expanded ($FITS_EXP) smaller than opaque ($FITS_OPQ)"
 else
-  pass "FITS container: size comparison ($FITS_EXP vs $FITS_OPQ)"
+  echo "NOTE: FITS expansion overhead ($FITS_EXP vs $FITS_OPQ)"
+  pass "FITS container: size check (soft)"
 fi
 
 mkdir -p "$TMPDIR_TEST/t23/out"
@@ -939,13 +943,15 @@ if echo "$LIST_OUTPUT" | grep -q "^r"; then
   pass "NIfTI container: expansion detected (r prefix)"
 else
   # Small NIfTI may not expand (JXL overhead > savings). Roundtrip still verified.
-  pass "NIfTI container: stored opaque (small file, expansion overhead)"
+  echo "NOTE: NIfTI not expanded (small file, JXL overhead)"
+  pass "NIfTI container: detection check (soft)"
 fi
 
 if [[ -n "$NII_EXP" && -n "$NII_OPQ" && "$NII_EXP" -lt "$NII_OPQ" ]]; then
   pass "NIfTI container: expanded ($NII_EXP) smaller than opaque ($NII_OPQ)"
 else
-  pass "NIfTI container: size comparison ($NII_EXP vs $NII_OPQ)"
+  echo "NOTE: NIfTI expansion overhead ($NII_EXP vs $NII_OPQ)"
+  pass "NIfTI container: size check (soft)"
 fi
 
 mkdir -p "$TMPDIR_TEST/t24/out"
