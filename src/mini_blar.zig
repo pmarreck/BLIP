@@ -785,31 +785,44 @@ pub fn createFullArchive(
         }
     }
 
-    // Phase 2: Compute Merkle hashes for DIR entries, then serialize them
+    // Phase 2: Compute Merkle hashes for DIR entries, then serialize them.
+    // Build parent→child-hashes map in O(N), then each DIR does O(1) lookup.
+    var parent_child_hashes = std.StringHashMap(std.ArrayList([8]u8)).init(allocator);
+    defer {
+        var it = parent_child_hashes.iterator();
+        while (it.next()) |kv| kv.value_ptr.deinit(allocator);
+        parent_child_hashes.deinit();
+    }
+
+    // One pass: for each FILE with a hash, extract parent path → append hash
+    for (entries) |entry| {
+        switch (entry) {
+            .file => |f| {
+                if (file_hashes.get(f.path)) |hash| {
+                    // Extract parent path (everything before last '/')
+                    if (std.mem.lastIndexOfScalar(u8, f.path, '/')) |slash| {
+                        const parent = f.path[0..slash];
+                        const gop = try parent_child_hashes.getOrPut(parent);
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = .{};
+                        }
+                        try gop.value_ptr.append(allocator, hash);
+                    }
+                }
+            },
+            .dir => {},
+        }
+    }
+
+    // Now serialize each DIR with its pre-computed Merkle hash
     for (entries, 0..) |entry, i| {
         switch (entry) {
             .dir => |dir| {
-                // Find direct child FILEs and collect their hashes
-                var child_hashes_list: std.ArrayList([8]u8) = .{};
-                defer child_hashes_list.deinit(allocator);
-
-                for (entries) |other| {
-                    switch (other) {
-                        .file => |f| {
-                            if (isDirectChild(dir.path, f.path)) {
-                                if (file_hashes.get(f.path)) |hash| {
-                                    try child_hashes_list.append(allocator, hash);
-                                }
-                            }
-                        },
-                        .dir => {},
-                    }
-                }
-
-                // Build DirEntry with computed Merkle hash
                 var dir_with_merkle = dir;
-                if (child_hashes_list.items.len > 0) {
-                    dir_with_merkle.xh64 = computeMerkleHash(child_hashes_list.items);
+                if (parent_child_hashes.get(dir.path)) |*child_list| {
+                    if (child_list.items.len > 0) {
+                        dir_with_merkle.xh64 = computeMerkleHash(child_list.items);
+                    }
                 }
 
                 const dir_bytes = try serializeDirEntry(allocator, dir_with_merkle, &to_free);
@@ -820,7 +833,6 @@ pub fn createFullArchive(
             .file => {},
         }
     }
-
     // Phase 3: Assemble archive — signal phase change so callers can update UI
     if (phase_fn) |cb| {
         const label = "Assembling";

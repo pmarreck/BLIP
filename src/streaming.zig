@@ -313,32 +313,41 @@ pub fn createArchiveStreaming(
         }
     }
 
-    // Phase 1B: Serialize DIR entries (now that all file hashes are known)
+    // Phase 1B: Serialize DIR entries (now that all file hashes are known).
+    // Build parent→child-hashes map in O(N), then each DIR does O(1) lookup.
+    var parent_child_hashes = std.StringHashMap(std.ArrayListUnmanaged([8]u8)).init(allocator);
+    defer {
+        var it = parent_child_hashes.iterator();
+        while (it.next()) |kv| kv.value_ptr.deinit(allocator);
+        parent_child_hashes.deinit();
+    }
+
+    for (final_entries) |fentry| {
+        switch (fentry) {
+            .file => |f| {
+                if (file_hashes.get(f.path)) |hash| {
+                    if (std.mem.lastIndexOfScalar(u8, f.path, '/')) |slash| {
+                        const parent = f.path[0..slash];
+                        const gop = try parent_child_hashes.getOrPut(parent);
+                        if (!gop.found_existing) gop.value_ptr.* = .{};
+                        try gop.value_ptr.append(allocator, hash);
+                    }
+                }
+            },
+            .dir => {},
+        }
+    }
+
     for (spill_index.items) |*se| {
         if (!se.is_dir) continue;
 
         const dir = final_entries[se.entry_index].dir;
 
-        // Compute Merkle hash from direct child FILE hashes
-        var child_hashes_list: std.ArrayList([8]u8) = .{};
-        defer child_hashes_list.deinit(allocator);
-
-        for (final_entries) |other| {
-            switch (other) {
-                .file => |f| {
-                    if (mini_blar.isDirectChild(dir.path, f.path)) {
-                        if (file_hashes.get(f.path)) |hash| {
-                            try child_hashes_list.append(allocator, hash);
-                        }
-                    }
-                },
-                .dir => {},
-            }
-        }
-
         var dir_with_merkle = dir;
-        if (child_hashes_list.items.len > 0) {
-            dir_with_merkle.xh64 = mini_blar.computeMerkleHash(child_hashes_list.items);
+        if (parent_child_hashes.get(dir.path)) |child_list| {
+            if (child_list.items.len > 0) {
+                dir_with_merkle.xh64 = mini_blar.computeMerkleHash(child_list.items);
+            }
         }
 
         var to_free: std.ArrayList([]u8) = .{};
@@ -355,7 +364,6 @@ pub fn createArchiveStreaming(
         se.size = dir_bytes.len;
         spill_offset += dir_bytes.len;
     }
-
     // ── Pass 2: Assemble archive from spill ─────────────────────────────
 
     // Build element sizes array from spill index (includes expanded entries)
