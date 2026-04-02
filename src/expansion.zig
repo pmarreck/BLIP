@@ -44,6 +44,11 @@ pub const ExpandedEntry = struct {
     pdf_offset: u64 = std.math.maxInt(u64),
     /// PDF stream length in the shell, maxInt if N/A.
     pdf_length: u64 = std.math.maxInt(u64),
+    /// FlateDecode metadata for PDF image entries.
+    flate_predictor: u16 = 0,
+    flate_columns: u32 = 0,
+    flate_colors: u8 = 0,
+    flate_bpc: u8 = 0,
 };
 
 /// Result of expanding a file.

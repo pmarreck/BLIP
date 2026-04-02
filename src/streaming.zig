@@ -149,8 +149,6 @@ pub const StreamingError = error{
 /// spilling serialized bytes to a temp file. Peak memory: O(largest file).
 ///
 /// Returns the final archive as a byte slice (caller owns).
-/// For truly streaming output (write directly to output file), use
-/// createArchiveStreamingToFile (future).
 pub fn createArchiveStreaming(
     allocator: Allocator,
     entries: []const ArchiveEntry,

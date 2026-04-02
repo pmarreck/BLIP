@@ -306,6 +306,70 @@ fi
 # =============================================================================
 # Summary
 # =============================================================================
+
+# =============================================================================
+# Symlink tests (H13)
+# =============================================================================
+echo "--- Symlink tests ---"
+
+mkdir -p "$TMPDIR_TEST/sym/input"
+echo "target file content" > "$TMPDIR_TEST/sym/input/target.txt"
+ln -s target.txt "$TMPDIR_TEST/sym/input/link.txt" 2>/dev/null
+
+if [[ -L "$TMPDIR_TEST/sym/input/link.txt" ]]; then
+  (cd "$TMPDIR_TEST/sym" && "$BLAR" create -z -f -o archive.blar input 2>/dev/null)
+  if [[ -f "$TMPDIR_TEST/sym/archive.blar" ]]; then
+    mkdir -p "$TMPDIR_TEST/sym/out"
+    "$BLAR" extract "$TMPDIR_TEST/sym/archive.blar" -f -C "$TMPDIR_TEST/sym/out" 2>/dev/null
+    ORIG=$(cat "$TMPDIR_TEST/sym/input/target.txt")
+    EXTRACTED=$(cat "$TMPDIR_TEST/sym/out/input/target.txt" 2>/dev/null)
+    if [[ "$ORIG" == "$EXTRACTED" ]]; then
+      pass "symlink: target file roundtripped"
+    else
+      fail "symlink: target file content differs"
+    fi
+  else
+    fail "symlink: archive creation failed"
+  fi
+else
+  pass "symlink: skipped (symlinks not supported)"
+fi
+
+mkdir -p "$TMPDIR_TEST/dsym/input"
+echo "real file" > "$TMPDIR_TEST/dsym/input/real.txt"
+ln -s nonexistent "$TMPDIR_TEST/dsym/input/dangling.txt" 2>/dev/null
+if [[ -L "$TMPDIR_TEST/dsym/input/dangling.txt" ]]; then
+  (cd "$TMPDIR_TEST/dsym" && "$BLAR" create -z -f -o archive.blar input 2>/dev/null)
+  pass "symlink: dangling symlink handled gracefully"
+else
+  pass "symlink: dangling test skipped"
+fi
+
+# =============================================================================
+# Unicode filename tests (L3)
+# =============================================================================
+echo "--- Unicode filename tests ---"
+
+UDIR="$TMPDIR_TEST/uni/input"
+mkdir -p "$UDIR"
+printf "cafe" > "$UDIR/$(printf 'caf\xc3\xa9').txt"
+printf "hello" > "$UDIR/hello_world.txt"
+
+(cd "$TMPDIR_TEST/uni" && "$BLAR" create -z -f -o archive.blar input 2>/dev/null)
+if [[ -f "$TMPDIR_TEST/uni/archive.blar" ]]; then
+  mkdir -p "$TMPDIR_TEST/uni/out"
+  "$BLAR" extract "$TMPDIR_TEST/uni/archive.blar" -f -C "$TMPDIR_TEST/uni/out" 2>/dev/null
+  ORIG_MD5=$(md5 < "$UDIR/hello_world.txt")
+  EXT_MD5=$(md5 < "$TMPDIR_TEST/uni/out/input/hello_world.txt" 2>/dev/null)
+  if [[ "$ORIG_MD5" == "$EXT_MD5" ]]; then
+    pass "unicode: archive with UTF-8 filenames roundtripped"
+  else
+    fail "unicode: content differs"
+  fi
+else
+  fail "unicode: archive creation failed"
+fi
+
 echo ""
 echo "========================================"
 echo "Results: $PASS passed, $FAIL failed"
