@@ -275,19 +275,24 @@ pub fn serializeFileEntry(allocator: Allocator, file: FileEntry, to_free: *std.A
     try to_free.append(allocator, metadata_dict);
 
     // --- Element 1: DATA container with xxHash64 checksum (optionally per-file compressed) ---
+    // Skip compression for already-compressed container expansion outputs (JXL, FLAC).
+    // These are entropy-coded data where LZMA2/zstd would add overhead, not savings.
+    const skip_compression = file.jxl_source_format.len > 0 or
+        (file.path.len >= 4 and std.mem.eql(u8, file.path[file.path.len - 4 ..], ".jxl")) or
+        (file.path.len >= 5 and std.mem.eql(u8, file.path[file.path.len - 5 ..], ".flac"));
+
     const data_container = blk: {
         const raw = try leaf.serializeDataWithOptions(allocator, file.content, .{ .csum_id = .xxhash64 });
-        if (comp_id) |algo| {
+        if (comp_id != null and !skip_compression) {
             defer allocator.free(raw);
-            break :blk compression_mod.compressContainer(allocator, algo, raw, compress_progress_fn, null, compress_progress_ctx, 1) catch |e| switch (e) {
+            break :blk compression_mod.compressContainer(allocator, comp_id.?, raw, compress_progress_fn, null, compress_progress_ctx, 1) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CompressionFailed => return error.CompressionFailed,
                 else => return error.InvalidContainerType,
             };
         }
         break :blk raw;
-    };
-    try to_free.append(allocator, data_container);
+    };    try to_free.append(allocator, data_container);
 
     // --- Element 2: forks DICT (optional) ---
     const has_forks = file.resource_fork.len > 0 or file.xattrs.len > 0;
