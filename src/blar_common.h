@@ -3228,31 +3228,38 @@ static bool expand_containers_pass(entry_list_t *el) {
         }
     }
 
-    /* Transfer content ownership from original list to merged —
-     * BUT free content that belonged to successfully expanded entries
-     * (their content has been replaced by JXL/FLAC children). */
+    /* Transfer content ownership — free expanded entries' content (O(N) via pointer set).
+     * Build set of expanded content pointers first, then iterate with O(1) lookup. */
     {
-        /* Build a set of content pointers that belong to expanded entries */
-        for (size_t i = 0; i < el->content_count; i++) {
-            bool is_expanded_content = false;
-            /* Check if this content buffer is the .content of an expanded entry */
+        /* Collect pointers to free in a simple array (expandable is typically small) */
+        const uint8_t **expanded_ptrs = calloc(expandable, sizeof(const uint8_t *));
+        size_t num_expanded_ptrs = 0;
+        if (expanded_ptrs) {
             for (size_t w = 0; w < expandable; w++) {
                 if (!workers[w].success) continue;
                 size_t eidx = workers[w].index;
-                if (el->entries[eidx].content == el->content_bufs[i] &&
-                    el->entries[eidx].content_len > 0) {
-                    is_expanded_content = true;
-                    break;
+                if (el->entries[eidx].content && el->entries[eidx].content_len > 0) {
+                    expanded_ptrs[num_expanded_ptrs++] = el->entries[eidx].content;
                 }
             }
-            if (is_expanded_content) {
-                /* Free the original content — it's been replaced by expanded children */
+        }
+        for (size_t i = 0; i < el->content_count; i++) {
+            bool is_expanded = false;
+            if (expanded_ptrs) {
+                for (size_t ep = 0; ep < num_expanded_ptrs; ep++) {
+                    if (el->content_bufs[i] == expanded_ptrs[ep]) {
+                        is_expanded = true;
+                        break;
+                    }
+                }
+            }
+            if (is_expanded) {
                 free(el->content_bufs[i]);
             } else {
-                /* Keep non-expanded content (paths, metadata, non-expanded files) */
                 entry_list_add_content(&merged, el->content_bufs[i]);
             }
         }
+        free(expanded_ptrs);
     }
     /* Prevent original from freeing content (transferred or freed above) */
     el->content_count = 0;
