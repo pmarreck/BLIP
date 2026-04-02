@@ -1230,13 +1230,89 @@ fn reconstructAiff(allocator: Allocator, meta: []const u8, pcm: []const u8, bps:
 
 const testing = std.testing;
 
-test "detectCodec identifies formats" {
-    try testing.expectEqualStrings("bmp", detectCodec(&[_]u8{ 'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }).?);
-    try testing.expectEqualStrings("png", detectCodec(&[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }).?);
+test "detectCodec identifies ALL supported formats" {
+    // JPEG: FF D8 FF
     try testing.expectEqualStrings("jpeg", detectCodec(&[_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 }).?);
+
+    // PDF: %PDF-
+    try testing.expectEqualStrings("pdf", detectCodec("%PDF-1.4 test content here!!" ++ &[_]u8{0} ** 4).?);
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    try testing.expectEqualStrings("png", detectCodec(&[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }).?);
+
+    // BMP: BM + 16 bytes of header
+    try testing.expectEqualStrings("bmp", detectCodec(&[_]u8{ 'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }).?);
+
+    // TGA: type=2, color_map=0, bpp=24, width/height non-zero
+    {
+        var tga: [18]u8 = .{0} ** 18;
+        tga[2] = 2; // image type: uncompressed true-color
+        tga[12] = 1; // width low byte
+        tga[14] = 1; // height low byte
+        tga[16] = 24; // bits per pixel
+        try testing.expectEqualStrings("tga", detectCodec(&tga).?);
+    }
+
+    // TIFF LE: II + 42
+    try testing.expectEqualStrings("tiff", detectCodec(&[_]u8{ 'I', 'I', 42, 0 }).?);
+    // TIFF BE: MM + 0x002A
+    try testing.expectEqualStrings("tiff", detectCodec(&[_]u8{ 'M', 'M', 0, 42 }).?);
+
+    // GIF: GIF89a
+    try testing.expectEqualStrings("gif", detectCodec("GIF89a" ++ &[_]u8{0} ** 2).?);
+    try testing.expectEqualStrings("gif", detectCodec("GIF87a" ++ &[_]u8{0} ** 2).?);
+
+    // DICOM: 128-byte preamble + "DICM"
+    {
+        var dcm: [136]u8 = .{0} ** 136;
+        dcm[128] = 'D'; dcm[129] = 'I'; dcm[130] = 'C'; dcm[131] = 'M';
+        try testing.expectEqualStrings("dicom", detectCodec(&dcm).?);
+    }
+
+    // FITS: "SIMPLE  =                    T" at start
+    try testing.expectEqualStrings("fits", detectCodec("SIMPLE  =                    T" ++ &[_]u8{' '} ** 50).?);
+
+    // NIfTI: sizeof_hdr=348 LE + magic "n+1\0" at offset 344
+    {
+        var nii: [348]u8 = .{0} ** 348;
+        std.mem.writeInt(u32, nii[0..4], 348, .little);
+        nii[344] = 'n'; nii[345] = '+'; nii[346] = '1'; nii[347] = 0;
+        try testing.expectEqualStrings("nifti", detectCodec(&nii).?);
+    }
+
+    // AIFF: FORM....AIFF
+    {
+        var aiff: [12]u8 = .{0} ** 12;
+        @memcpy(aiff[0..4], "FORM");
+        @memcpy(aiff[8..12], "AIFF");
+        try testing.expectEqualStrings("aiff", detectCodec(&aiff).?);
+    }
+
+    // WAV: RIFF....WAVE
+    {
+        var wav: [12]u8 = .{0} ** 12;
+        @memcpy(wav[0..4], "RIFF");
+        @memcpy(wav[8..12], "WAVE");
+        try testing.expectEqualStrings("wav", detectCodec(&wav).?);
+    }
+
+    // tar: ustar magic at offset 257
+    {
+        var tar: [512]u8 = .{0} ** 512;
+        tar[257] = 'u'; tar[258] = 's'; tar[259] = 't'; tar[260] = 'a'; tar[261] = 'r'; tar[262] = 0;
+        try testing.expectEqualStrings("tar", detectCodec(&tar).?);
+    }
+
+    // gzip: 1F 8B
     try testing.expectEqualStrings("gz", detectCodec(&[_]u8{ 0x1F, 0x8B, 0x08, 0x00 }).?);
+
+    // ZIP: PK\x03\x04
     try testing.expectEqualStrings("zip", detectCodec(&[_]u8{ 0x50, 0x4B, 0x03, 0x04 }).?);
+
+    // Negative: random bytes
     try testing.expect(detectCodec(&[_]u8{ 0x00, 0x00, 0x00, 0x00 }) == null);
+    try testing.expect(detectCodec(&[_]u8{ 0xDE, 0xAD }) == null);
+    try testing.expect(detectCodec(&[_]u8{}) == null);
 }
 
 // ── Microbenchmarks ──────────────────────────────────────────────────────
@@ -1300,8 +1376,7 @@ test "microbench: BMP expansion 64x64" {
     const elapsed_ns = timer.read();
     const ns_per_op = elapsed_ns / iterations;
 
-    const stderr = std.io.getStdErr().writer();
-    try stderr.print("  BMP 64x64 expansion: {d} ns/op ({d:.2} ms/op)\n", .{
+    std.debug.print("  BMP 64x64 expansion: {d} ns/op ({d:.2} ms/op)\n", .{
         ns_per_op,
         @as(f64, @floatFromInt(ns_per_op)) / 1e6,
     });
@@ -1358,8 +1433,7 @@ test "microbench: JPEG→JXL transcode 8x8" {
     const elapsed_ns = timer.read();
     const ns_per_op = elapsed_ns / iterations;
 
-    const stderr = std.io.getStdErr().writer();
-    try stderr.print("  JPEG→JXL 8x8: {d} ns/op ({d:.2} ms/op)\n", .{
+    std.debug.print("  JPEG→JXL 8x8: {d} ns/op ({d:.2} ms/op)\n", .{
         ns_per_op,
         @as(f64, @floatFromInt(ns_per_op)) / 1e6,
     });
@@ -1397,8 +1471,7 @@ test "microbench: serializeFileEntry 4KB" {
     const elapsed_ns = timer.read();
     const ns_per_op = elapsed_ns / iterations;
 
-    const stderr = std.io.getStdErr().writer();
-    try stderr.print("  serializeFileEntry 4KB: {d} ns/op ({d:.2} µs/op)\n", .{
+    std.debug.print("  serializeFileEntry 4KB: {d} ns/op ({d:.2} µs/op)\n", .{
         ns_per_op,
         @as(f64, @floatFromInt(ns_per_op)) / 1e3,
     });

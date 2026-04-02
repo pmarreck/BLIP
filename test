@@ -1,4 +1,66 @@
 #!/usr/bin/env bash
-set -euo pipefail
-nix develop -c zig build test -Doptimize=Debug
-echo "All tests passed."
+set -u
+
+# =============================================================================
+# BLIP Master Test Runner
+# =============================================================================
+# Runs the ENTIRE test suite: Zig unit tests + all CLI integration tests.
+# Exit code = total number of failures across all suites.
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOTAL_FAIL=0
+TOTAL_PASS=0
+
+run_suite() {
+    local name="$1"
+    local cmd="$2"
+    echo ""
+    echo "━━━ $name ━━━"
+    local output
+    output=$(eval "$cmd" 2>&1)
+    local rc=$?
+    # Extract pass/fail counts if present
+    local pass fail
+    pass=$(echo "$output" | grep -o '[0-9]* passed' | head -1 | grep -o '[0-9]*' || echo "0")
+    fail=$(echo "$output" | grep -o '[0-9]* failed' | head -1 | grep -o '[0-9]*' || echo "0")
+    if [[ $rc -ne 0 && "$fail" == "0" ]]; then
+        fail=1
+    fi
+    TOTAL_PASS=$((TOTAL_PASS + pass))
+    TOTAL_FAIL=$((TOTAL_FAIL + fail))
+    # Show last few lines of output
+    echo "$output" | tail -5
+}
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║                   BLIP Master Test Suite                    ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+
+# Build everything first (ReleaseFast for CLI tests)
+echo ""
+echo "Building (ReleaseFast)..."
+nix develop -c zig build -Doptimize=ReleaseFast 2>/dev/null \
+    || { echo "FATAL: build failed"; exit 1; }
+
+# Zig unit tests
+run_suite "Zig Unit Tests" "nix develop -c zig build test 2>&1"
+
+# CLI integration test suites
+run_suite "blar CLI Tests" "bash tests/blar_test.sh"
+run_suite "Container Expansion (in-memory)" "bash tests/container_expansion_test.sh"
+run_suite "Container Expansion (streaming)" "BLAR_STREAMING_THRESHOLD=0 bash tests/container_expansion_test.sh"
+run_suite "PDF Container Tests" "bash tests/pdf_container_test.sh"
+run_suite "PNG Container Tests" "bash tests/png_container_test.sh"
+run_suite "Streaming Tests" "bash tests/streaming_test.sh"
+run_suite "Compression Tests" "bash tests/compression_test.sh"
+run_suite "Encryption Tests" "bash tests/encryption_test.sh"
+run_suite "MiniBLAR Tests" "bash tests/miniblar_test.sh"
+
+# Summary
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  TOTAL: $TOTAL_PASS passed, $TOTAL_FAIL failed"
+echo "╚══════════════════════════════════════════════════════════════╝"
+
+exit $TOTAL_FAIL

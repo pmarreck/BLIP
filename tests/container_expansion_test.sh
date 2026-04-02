@@ -641,7 +641,22 @@ fi
 # =============================================================================
 echo "--- Test 19: GIF roundtrip integrity ---"
 
-python3 /tmp/make_test_gif.py "$TMPDIR_TEST/t19_input.gif" >/dev/null 2>&1
+python3 -c "
+import struct, sys
+# Minimal 1x1 red pixel GIF89a
+with open(sys.argv[1], 'wb') as f:
+    f.write(b'GIF89a')
+    f.write(struct.pack('<HH', 1, 1))  # 1x1
+    f.write(bytes([0x80, 0, 0]))  # GCT flag, 2 colors
+    f.write(bytes([255, 0, 0, 0, 0, 0]))  # GCT: red, black
+    f.write(b'\x2c')  # image separator
+    f.write(struct.pack('<HHHH', 0, 0, 1, 1))  # 1x1
+    f.write(bytes([0]))  # no LCT
+    f.write(bytes([2]))  # LZW min code size
+    f.write(bytes([2, 0x44, 0x01]))  # 2 bytes of LZW data
+    f.write(bytes([0]))  # block terminator
+    f.write(b'\x3b')  # trailer
+" "$TMPDIR_TEST/t19_input.gif"
 
 mkdir -p "$TMPDIR_TEST/t19/input"
 cp "$TMPDIR_TEST/t19_input.gif" "$TMPDIR_TEST/t19/input/test.gif"
