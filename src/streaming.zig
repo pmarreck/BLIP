@@ -46,9 +46,9 @@ fn isArchiveExtension(path: []const u8) bool {
 
 /// Per-entry expansion result slot for parallel expansion.
 const ExpSlot = struct {
-    result_entries: std.ArrayListUnmanaged(ArchiveEntry),
-    paths: std.ArrayListUnmanaged([]u8),
-    contents: std.ArrayListUnmanaged([]u8),
+    result_entries: std.ArrayList(ArchiveEntry),
+    paths: std.ArrayList([]u8),
+    contents: std.ArrayList([]u8),
     has_dir: bool,
     had_error: bool,
 };
@@ -170,7 +170,7 @@ pub fn createArchiveStreaming(
         std.fs.cwd().deleteFile(spill_path) catch {};
     }
 
-    var spill_index = std.ArrayListUnmanaged(SpillEntry){};
+    var spill_index = std.ArrayList(SpillEntry){};
     defer spill_index.deinit(allocator);
 
     // Track file hashes for Merkle computation
@@ -264,7 +264,7 @@ pub fn createArchiveStreaming(
     }
 
     // Flatten slots into final entry list
-    var work_entries = std.ArrayListUnmanaged(ArchiveEntry){};
+    var work_entries = std.ArrayList(ArchiveEntry){};
     defer work_entries.deinit(allocator);
 
     for (slots) |*slot| {
@@ -331,7 +331,7 @@ pub fn createArchiveStreaming(
 
     // Phase 1B: Serialize DIR entries (now that all file hashes are known).
     // Build parent→child-hashes map in O(N), then each DIR does O(1) lookup.
-    var parent_child_hashes = std.StringHashMap(std.ArrayListUnmanaged([8]u8)).init(allocator);
+    var parent_child_hashes = std.StringHashMap(std.ArrayList([8]u8)).init(allocator);
     defer {
         var it = parent_child_hashes.iterator();
         while (it.next()) |kv| kv.value_ptr.deinit(allocator);

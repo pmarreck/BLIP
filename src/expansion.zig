@@ -411,7 +411,7 @@ fn expandPdf(allocator: Allocator, content: []const u8) !?ExpandResult {
         defer allocator.free(content_streams);
             if (content_streams.len == 0) break :blk;
 
-        var replacements = std.ArrayListUnmanaged(pdf_mod.StreamReplacement){};
+        var replacements = std.ArrayList(pdf_mod.StreamReplacement){};
         defer {
             for (replacements.items) |rep| allocator.free(@constCast(rep.new_data));
             replacements.deinit(allocator);
@@ -776,7 +776,7 @@ fn collapseContainerById(
     // ZIP collapse: reconstruct ZIP from child entries with compression methods
     if (codec == .zip) {
         // Collect child entries (skip __meta__ if present, though ZIP doesn't use it)
-        var zip_entries = std.ArrayListUnmanaged(zip_mod.ZipWriteEntry){};
+        var zip_entries = std.ArrayList(zip_mod.ZipWriteEntry){};
         defer zip_entries.deinit(allocator);
 
         for (children) |child| {
@@ -813,7 +813,7 @@ fn collapseContainerById(
         @memcpy(pdf_buf, shell_data);
 
         // Track FlateDecode replacements for potential rewrite
-        var flate_replacements = std.ArrayListUnmanaged(struct {
+        var flate_replacements = std.ArrayList(struct {
             start: u64,
             orig_len: u64,
             new_data: []u8,
