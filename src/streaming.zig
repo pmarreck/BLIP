@@ -23,6 +23,27 @@ const ArchiveEntry = mini_blar.ArchiveEntry;
 const ContainerError = container.ContainerError;
 const LPOptions = container.LPOptions;
 
+/// Check if a file path has an archive extension (should not be expanded as ZIP).
+fn isArchiveExtension(path: []const u8) bool {
+    const archive_exts = [_][]const u8{
+        ".zip", ".gz", ".gzip", ".tgz", ".tar", ".bz2", ".xz", ".7z",
+        ".rar", ".lz4", ".zst", ".zstd", ".blar", ".lzma", ".lzo",
+        ".cab", ".arj", ".z",
+    };
+    var dot_pos: ?usize = null;
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '.') { dot_pos = i; break; }
+        if (path[i] == '/') break;
+    }
+    const ext = if (dot_pos) |d| path[d..] else return false;
+    for (archive_exts) |ae| {
+        if (std.ascii.eqlIgnoreCase(ext, ae)) return true;
+    }
+    return false;
+}
+
 /// Per-entry expansion result slot for parallel expansion.
 const ExpSlot = struct {
     result_entries: std.ArrayListUnmanaged(ArchiveEntry),
@@ -32,15 +53,22 @@ const ExpSlot = struct {
 };
 
 /// Expand a single entry into a slot. Thread-safe — each slot is independent.
-fn expandSlot(allocator: Allocator, entry: ArchiveEntry, slot: *ExpSlot, do_expand: bool) void {
+fn expandSlot(allocator: Allocator, entry: ArchiveEntry, slot: *ExpSlot, do_expand: bool, expand_all_zips: bool) void {
     switch (entry) {
         .file => |file| {
-            if (do_expand and file.content.len >= 128) {
+            if (do_expand and file.content.len >= 20) {
                 if (expansion.detectCodec(file.content)) |codec_name| {
+                    // Skip .zip files with archive extensions unless expand_all_zips
+                    if (std.mem.eql(u8, codec_name, "zip") and !expand_all_zips) {
+                        if (isArchiveExtension(file.path)) {
+                            slot.result_entries.append(allocator, entry) catch {};
+                            return;
+                        }
+                    }
+
                     var exp_result = expansion.expandFile(allocator, file.content, codec_name) catch null;
                     if (exp_result) |*exp| {
                         slot.has_dir = true;
-                        // DIR entry
                         slot.result_entries.append(allocator, .{ .dir = .{
                             .path = file.path,
                             .mode = file.mode,
@@ -121,6 +149,7 @@ pub fn createArchiveStreaming(
     entries: []const ArchiveEntry,
     comp_id: ?ct.CompressionId,
     expand_containers: bool,
+    expand_all_zips: bool,
 ) (StreamingError || mini_blar.compression_mod.CompressionError)![]u8 {
     // Create temp spill file
     const tmp_path = "/tmp/blar_spill_XXXXXX";
@@ -178,12 +207,13 @@ pub fn createArchiveStreaming(
             slots_slice: []ExpSlot,
             next_idx: std.atomic.Value(usize),
             alloc: Allocator,
+            expand_all: bool,
 
             fn work(self: *@This()) void {
                 while (true) {
                     const idx = self.next_idx.fetchAdd(1, .seq_cst);
                     if (idx >= self.entries_slice.len) break;
-                    expandSlot(self.alloc, self.entries_slice[idx], &self.slots_slice[idx], true);
+                    expandSlot(self.alloc, self.entries_slice[idx], &self.slots_slice[idx], true, self.expand_all);
                 }
             }
         };
@@ -193,6 +223,7 @@ pub fn createArchiveStreaming(
             .slots_slice = slots,
             .next_idx = std.atomic.Value(usize).init(0),
             .alloc = allocator,
+            .expand_all = expand_all_zips,
         };
 
         var thread_buf: [256]std.Thread = undefined;
@@ -212,7 +243,7 @@ pub fn createArchiveStreaming(
         }
     } else {
         for (entries, 0..) |entry, i| {
-            expandSlot(allocator, entry, &slots[i], expand_containers);
+            expandSlot(allocator, entry, &slots[i], expand_containers, expand_all_zips);
         }
     }
 
@@ -421,7 +452,7 @@ test "streaming produces byte-identical archive to createFullArchive" {
     defer alloc.free(inmem);
 
     // Create with streaming path
-    const streamed = try createArchiveStreaming(alloc, &entries, null, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false);
     defer alloc.free(streamed);
 
     // Must be byte-identical
@@ -441,7 +472,7 @@ test "streaming with directories produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, null, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, null, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);
@@ -460,7 +491,7 @@ test "streaming with compression produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, .lzma2, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2, false, false);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);

@@ -2734,8 +2734,8 @@ export fn blip_archive_create_streaming(
     const CompId = mini_blar.container_mod.CompressionId;
     const comp: ?CompId = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompId, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
 
-    _ = expand_all_zips; // TODO: pass to streaming for ZIP expansion control
-    const result = streaming_mod.createArchiveStreaming(page_allocator, zig_entries, comp, expand_containers) catch return -40;
+    
+    const result = streaming_mod.createArchiveStreaming(page_allocator, zig_entries, comp, expand_containers, expand_all_zips) catch return -40;
 
     out_buf.* = result.ptr;
     out_len.* = result.len;
