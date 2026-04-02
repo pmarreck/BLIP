@@ -43,14 +43,12 @@ pub fn isAiffMagic(buf: []const u8) bool {
 }
 
 fn readU16BE(buf: []const u8) u16 {
-    return (@as(u16, buf[0]) << 8) | @as(u16, buf[1]);
+    return std.mem.readInt(u16, buf[0..2], .big);
 }
 
 fn readU32BE(buf: []const u8) u32 {
-    return (@as(u32, buf[0]) << 24) | (@as(u32, buf[1]) << 16) |
-        (@as(u32, buf[2]) << 8) | @as(u32, buf[3]);
+    return std.mem.readInt(u32, buf[0..4], .big);
 }
-
 /// Parse 80-bit IEEE 754 extended precision to u32 (for sample rate).
 /// AIFF stores sample rate as 80-bit extended float.
 fn parseExtended80(buf: []const u8) u32 {

@@ -50,22 +50,18 @@ pub fn isBmpMagic(buf: []const u8) bool {
 
 /// Read a little-endian u16 from a byte slice.
 fn readU16LE(buf: []const u8) u16 {
-    return @as(u16, buf[0]) | (@as(u16, buf[1]) << 8);
+    return std.mem.readInt(u16, buf[0..2], .little);
 }
 
 /// Read a little-endian u32 from a byte slice.
 fn readU32LE(buf: []const u8) u32 {
-    return @as(u32, buf[0]) |
-        (@as(u32, buf[1]) << 8) |
-        (@as(u32, buf[2]) << 16) |
-        (@as(u32, buf[3]) << 24);
+    return std.mem.readInt(u32, buf[0..4], .little);
 }
 
 /// Read a little-endian i32 from a byte slice.
 fn readI32LE(buf: []const u8) i32 {
-    return @bitCast(readU32LE(buf));
+    return @bitCast(std.mem.readInt(u32, buf[0..4], .little));
 }
-
 /// Parse a BMP file into header metadata + raw pixels.
 /// Only supports uncompressed 24-bit and 32-bit BMPs (BI_RGB, compression=0).
 pub fn parseBmp(allocator: Allocator, data: []const u8) (BmpError || Allocator.Error)!ParsedBmp {

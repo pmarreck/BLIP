@@ -37,9 +37,8 @@ pub fn isGifMagic(buf: []const u8) bool {
 
 /// Read a little-endian u16.
 fn readU16LE(buf: []const u8) u16 {
-    return @as(u16, buf[0]) | (@as(u16, buf[1]) << 8);
+    return std.mem.readInt(u16, buf[0..2], .little);
 }
-
 /// LZW decoder for GIF.
 const LzwDecoder = struct {
     const MAX_CODE_SIZE = 12;

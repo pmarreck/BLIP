@@ -54,23 +54,20 @@ pub fn isNiftiMagic(buf: []const u8) bool {
 }
 
 fn readU16LE(buf: []const u8) u16 {
-    return @as(u16, buf[0]) | (@as(u16, buf[1]) << 8);
+    return std.mem.readInt(u16, buf[0..2], .little);
 }
 
 fn readU32LE(buf: []const u8) u32 {
-    return @as(u32, buf[0]) | (@as(u32, buf[1]) << 8) |
-        (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 24);
+    return std.mem.readInt(u32, buf[0..4], .little);
 }
 
 fn readU32BE(buf: []const u8) u32 {
-    return (@as(u32, buf[0]) << 24) | (@as(u32, buf[1]) << 16) |
-        (@as(u32, buf[2]) << 8) | @as(u32, buf[3]);
+    return std.mem.readInt(u32, buf[0..4], .big);
 }
 
 fn readF32LE(buf: []const u8) f32 {
-    return @bitCast(readU32LE(buf));
+    return @bitCast(std.mem.readInt(u32, buf[0..4], .little));
 }
-
 /// Parse a NIfTI-1 single-file (.nii).
 /// Only supports 8-bit and 16-bit integer datatypes for JXL transcoding.
 pub fn parseNifti(allocator: Allocator, data: []const u8) (NiftiError || Allocator.Error)!ParsedNifti {

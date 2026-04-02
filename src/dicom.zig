@@ -41,14 +41,12 @@ pub fn isDicomMagic(buf: []const u8) bool {
 }
 
 fn readU16LE(buf: []const u8) u16 {
-    return @as(u16, buf[0]) | (@as(u16, buf[1]) << 8);
+    return std.mem.readInt(u16, buf[0..2], .little);
 }
 
 fn readU32LE(buf: []const u8) u32 {
-    return @as(u32, buf[0]) | (@as(u32, buf[1]) << 8) |
-        (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 24);
+    return std.mem.readInt(u32, buf[0..4], .little);
 }
-
 /// Check if a VR is explicit (2-char ASCII tag).
 fn isExplicitVR(vr: []const u8) bool {
     if (vr.len < 2) return false;

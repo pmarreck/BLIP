@@ -42,14 +42,12 @@ pub fn isWavMagic(buf: []const u8) bool {
 }
 
 fn readU16LE(buf: []const u8) u16 {
-    return @as(u16, buf[0]) | (@as(u16, buf[1]) << 8);
+    return std.mem.readInt(u16, buf[0..2], .little);
 }
 
 fn readU32LE(buf: []const u8) u32 {
-    return @as(u32, buf[0]) | (@as(u32, buf[1]) << 8) |
-        (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 24);
+    return std.mem.readInt(u32, buf[0..4], .little);
 }
-
 /// Parse a WAV file into audio info + raw PCM samples.
 /// Only supports uncompressed PCM (format tag 1), 8/16/24/32-bit.
 pub fn parseWav(allocator: Allocator, data: []const u8) (WavError || Allocator.Error)!ParsedWav {
