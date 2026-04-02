@@ -553,14 +553,22 @@ static int cmd_create(int argc, char **argv) {
     if (use_streaming) {
         /* metadata_only was set before collection -- no file content loaded */
 
+        /* Set up progress for streaming creation */
+        if (progress) {
+            progrez_set_label(progress, "Creating");
+            progrez_set_determinate(progress, el.count, el.bytes_seen);
+            progrez_update(progress, 0, 0);
+        }
+
         uint8_t *archive_buf = NULL;
         size_t archive_len = 0;
         int32_t rc2 = blip_archive_create_streaming(
             el.entries, el.count,
             compress_algo,
             el.expand_containers, el.expand_all_zips,
+            progress ? create_progress_cb : NULL,
+            progress ? (void *)progress : NULL,
             &archive_buf, &archive_len);
-
         entry_list_free(&el);
         if (rc2 != 0) {
             fprintf(stderr, "blar: create: streaming archive creation failed (rc=%d)\n", rc2);

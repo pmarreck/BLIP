@@ -14,7 +14,6 @@ const leaf = @import("leaf.zig");
 const container = @import("container.zig");
 const ct = @import("container_types.zig");
 const csum_mod = @import("checksum.zig");
-const blip = @import("blip.zig");
 const expansion = @import("expansion.zig");
 
 const FileEntry = mini_blar.FileEntry;
@@ -148,12 +147,16 @@ pub const StreamingError = error{
 /// spilling serialized bytes to a temp file. Peak memory: O(largest file).
 ///
 /// Returns the final archive as a byte slice (caller owns).
+/// Progress callback type for streaming archive creation.
+pub const ProgressFn = ?*const fn (u64, u64, ?*anyopaque) callconv(.c) void;
 pub fn createArchiveStreaming(
     allocator: Allocator,
     entries: []const ArchiveEntry,
     comp_id: ?ct.CompressionId,
     expand_containers: bool,
     expand_all_zips: bool,
+    progress_fn: ProgressFn,
+    progress_ctx: ?*anyopaque,
 ) (StreamingError || mini_blar.compression_mod.CompressionError)![]u8 {
     // Create temp spill file in TMPDIR (RAM-backed per project convention)
     const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
@@ -278,6 +281,9 @@ pub fn createArchiveStreaming(
 
     // ── Pass 1: Serialize entries to spill file ─────────────────────────
 
+    var entries_done: u64 = 0;
+    var bytes_done: u64 = 0;
+
     // Phase 1A: Serialize FILE entries
     for (final_entries, 0..) |entry, i| {
         switch (entry) {
@@ -314,6 +320,9 @@ pub fn createArchiveStreaming(
                         .is_dir = false,
                     });
                     spill_offset += serialized.len;
+                    entries_done += 1;
+                    bytes_done += file.content.len;
+                    if (progress_fn) |cb| cb(entries_done, bytes_done, progress_ctx);
             },
             .dir => {
                 has_dir = true;
@@ -476,7 +485,7 @@ test "streaming produces byte-identical archive to createFullArchive" {
     defer alloc.free(inmem);
 
     // Create with streaming path
-    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false, null, null);
     defer alloc.free(streamed);
 
     // Must be byte-identical
@@ -496,7 +505,7 @@ test "streaming with directories produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, null, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, null, false, false, null, null);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);
@@ -515,7 +524,7 @@ test "streaming with compression produces byte-identical archive" {
     const inmem = try mini_blar.createFullArchive(alloc, &entries, null, null, null, .lzma2, 0);
     defer alloc.free(inmem);
 
-    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2, false, false);
+    const streamed = try createArchiveStreaming(alloc, &entries, .lzma2, false, false, null, null);
     defer alloc.free(streamed);
 
     try testing.expectEqual(inmem.len, streamed.len);

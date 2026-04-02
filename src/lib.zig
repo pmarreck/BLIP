@@ -2631,10 +2631,11 @@ export fn blip_archive_create_streaming(
     per_file_comp_algo: u8,
     expand_containers: bool,
     expand_all_zips: bool,
+    progress_fn: ?*const fn (u64, u64, ?*anyopaque) callconv(.c) void,
+    progress_ctx: ?*anyopaque,
     out_buf: *[*]u8,
     out_len: *usize,
 ) callconv(.c) i32 {
-
     // Convert C entries to Zig ArchiveEntry, reading content from source_path
     const mini = blip.mini_blar_mod;
     
@@ -2735,8 +2736,7 @@ export fn blip_archive_create_streaming(
     const comp: ?CompId = if (per_file_comp_algo == 0) null else std.meta.intToEnum(CompId, @as(u7, @truncate(per_file_comp_algo))) catch return -32;
 
     
-    const result = streaming_mod.createArchiveStreaming(page_allocator, zig_entries, comp, expand_containers, expand_all_zips) catch return -40;
-
+    const result = streaming_mod.createArchiveStreaming(page_allocator, zig_entries, comp, expand_containers, expand_all_zips, progress_fn, progress_ctx) catch return -40;
     out_buf.* = result.ptr;
     out_len.* = result.len;
     return 0;

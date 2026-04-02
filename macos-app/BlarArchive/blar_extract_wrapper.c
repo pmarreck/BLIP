@@ -104,6 +104,19 @@ int blar_gui_create(const char *const *paths, size_t path_count,
     size_t archive_len = 0;
     int32_t rc;
 
+    /* Compute total bytes for progress (used by both paths) */
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < el.count; i++) {
+        if (!el.entries[i].is_dir)
+            total_bytes += el.entries[i].content_len;
+    }
+
+    gui_create_progress_ctx_t progress_adapter = {
+        .fn = progress_fn,
+        .ctx = progress_ctx,
+        .total_files = el.count,
+        .total_bytes = total_bytes,
+    };
     if (do_streaming) {
         /* Streaming path — re-collect with metadata_only */
         entry_list_free(&el);
@@ -121,8 +134,9 @@ int blar_gui_create(const char *const *paths, size_t path_count,
         rc = blip_archive_create_streaming(el.entries, el.count,
                                             per_file_comp,
                                             expand_containers, expand_all_zips,
-                                            &archive_buf, &archive_len);
-    } else {
+                                            progress_fn ? gui_create_progress_adapter : NULL,
+                                            progress_fn ? &progress_adapter : NULL,
+                                            &archive_buf, &archive_len);    } else {
         /* In-memory path */
         if (el.expand_containers) {
             if (!expand_containers_pass(&el)) {
@@ -131,19 +145,7 @@ int blar_gui_create(const char *const *paths, size_t path_count,
             }
         }
 
-        uint64_t total_bytes = 0;
-        for (size_t i = 0; i < el.count; i++) {
-            if (!el.entries[i].is_dir)
-                total_bytes += el.entries[i].content_len;
-        }
-
-        gui_create_progress_ctx_t progress_adapter = {
-            .fn = progress_fn,
-            .ctx = progress_ctx,
-            .total_files = el.count,
-            .total_bytes = total_bytes,
-        };
-        rc = blip_archive_create_full(el.entries, el.count, 0,
+        /* progress_adapter already declared above */        rc = blip_archive_create_full(el.entries, el.count, 0,
                                        per_file_comp, num_threads,
                                        progress_fn ? gui_create_progress_adapter : NULL,
                                        NULL,

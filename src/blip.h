@@ -159,23 +159,26 @@ typedef struct {
     size_t source_path_len;          /* 0 = not set */
 } blip_archive_entry;
 
+/* Forward declaration for streaming progress callback */
+typedef void (*blip_progress_fn)(uint64_t entries_done, uint64_t bytes_done,
+                                  void *user_ctx);
+
 /* Create archive using streaming (spill-to-disk) approach.
  * Entries should have source_path set and content=NULL for files.
  * The streaming path reads files on demand, keeping memory at O(largest_file).
  * Produces byte-identical output to blip_archive_create_full.
- * expand_containers: if true, runs container expansion per-file during Pass 1. */
+ * expand_containers: if true, runs container expansion per-file during Pass 1.
+ * progress_fn/progress_ctx: called after each file is processed (can be NULL). */
 int32_t blip_archive_create_streaming(
     const blip_archive_entry *entries, size_t entry_count,
     uint8_t per_file_comp_algo,
     bool expand_containers, bool expand_all_zips,
+    blip_progress_fn progress_fn, void *progress_ctx,
     uint8_t **out_buf, size_t *out_len);
-
 /* Progress callback for archive creation.
  * Called after each entry is serialized with cumulative counts.
  * entries_done: entries serialized so far
  * bytes_done: cumulative content bytes serialized so far */
-typedef void (*blip_progress_fn)(uint64_t entries_done, uint64_t bytes_done,
-                                  void *user_ctx);
 
 /* Phase callback for archive creation.
  * Called when the operation transitions to a new phase (e.g., "Assembling").
