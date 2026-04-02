@@ -188,37 +188,37 @@
 ## Code Review Findings (2026-04-02)
 
 ### CRITICAL — Fix Immediately
-- [ ] C1: `./test` script doesn't run any of the 17 CLI test suites — violates "one command runs everything" rule
-- [ ] C2: `detectCodec` unit test covers only 5 of 13 formats — missing pdf, tga, tiff, gif, tar, dicom, fits, nifti, wav, aiff
-- [ ] C3: GIF container expansion test depends on `/tmp/make_test_gif.py` (not in repo) — inline the GIF generation
+- [x] C1: `./test` script doesn't run any of the 17 CLI test suites — violates "one command runs everything" rule
+- [x] C2: `detectCodec` unit test covers only 5 of 13 formats — missing pdf, tga, tiff, gif, tar, dicom, fits, nifti, wav, aiff
+- [x] C3: GIF container expansion test depends on `/tmp/make_test_gif.py` (not in repo) — inline the GIF generation
 
 ### HIGH — Fix Soon
-- [ ] H1: FlateDecode PDF image collapse is a no-op in Zig path (`expansion.zig:796`) — images silently zeroed
-- [ ] H2: Gzip collapse hardcodes level 6, ignores stored gz_level (`expansion.zig:932`)
+- [x] H1: FlateDecode PDF image collapse is a no-op in Zig path (`expansion.zig:796`) — images silently zeroed
+- [x] H2: Gzip collapse hardcodes level 6, ignores stored gz_level (`expansion.zig:932`)
 - [ ] H3: ZIP collapse zeroes all modification timestamps and external_attributes (`expansion.zig:748`)
-- [ ] H4: O(D×N) Merkle hash computation — nested loop scans all entries per DIR (`mini_blar.zig:789`)
-- [ ] H5: Same O(D×N) Merkle pattern in streaming path (`streaming.zig:317`)
-- [ ] H6: O(C×N) child collection in extract Pass 3 (`blar_common.h:1762`)
-- [ ] H7: Missing `errdefer` on allocations throughout expansion.zig — memory leaks on error paths
-- [ ] H8: `expandSlot` silently drops entries on OOM — no error reporting (`streaming.zig:64,109,113`)
-- [ ] H9: 8+ test assertions that always pass (both branches call `pass`) in container_expansion_test.sh
-- [ ] H10: `set -euo pipefail` in 3 test scripts violates CLAUDE.md rule (compression, encryption, explode)
-- [ ] H11: ~3,500 lines of dead C code in blar_common.h (old expand_*_container + reconstruction blocks)
-- [ ] H12: No DICOM container expansion CLI roundtrip test
+- [x] H4: O(D×N) Merkle hash computation — nested loop scans all entries per DIR (`mini_blar.zig:789`)
+- [x] H5: Same O(D×N) Merkle pattern in streaming path (`streaming.zig:317`)
+- [x] H6: O(C×N) child collection in extract Pass 3 (`blar_common.h:1762`)
+- [x] H7: Missing `errdefer` on allocations throughout expansion.zig — memory leaks on error paths
+- [x] H8: `expandSlot` silently drops entries on OOM — no error reporting (`streaming.zig:64,109,113`)
+- [x] H9: 8+ test assertions that always pass (both branches call `pass`) in container_expansion_test.sh
+- [x] H10: `set -euo pipefail` in 3 test scripts violates CLAUDE.md rule (compression, encryption, explode)
+- [x] H11: ~3,500 lines of dead C code in blar_common.h (old expand_*_container + reconstruction blocks)
+- [x] H12: No DICOM container expansion CLI roundtrip test
 - [ ] H13: No symlink tests anywhere in the test suite
 
 ### MEDIUM — Address When Touching Nearby Code
 - [ ] M1: NIfTI `.expand = NULL` in builtin_codecs (inconsistent, Zig handles it)
 - [ ] M2: Expanded child entries lose ctime/birthtime/uid/gid/username in streaming (`streaming.zig:92`)
-- [ ] M3: `--about` flag missing from `blar.c` CLI (required by CLAUDE.md)
-- [ ] M4: Hardcoded `/tmp/blar_streaming_spill.tmp` — not unique, ignores TMPDIR (`streaming.zig:157`)
+- [x] M3: `--about` flag missing from `blar.c` CLI (required by CLAUDE.md)
+- [x] M4: Hardcoded `/tmp/blar_streaming_spill.tmp` — not unique, ignores TMPDIR (`streaming.zig:157`)
 - [ ] M5: 6 format parsers hand-roll readU16LE/readU32LE — replace with `std.mem.readInt` (~60 lines)
 - [ ] M6: 44 runtime `std.mem.eql` string comparisons — introduce `CodecId` enum with switch dispatch
 - [ ] M7: Duplicated C→Zig metadata conversion in lib.zig (create_full vs streaming, ~80 lines)
 - [ ] M8: O(B×E) content ownership transfer after expansion (`blar_common.h:6734`) — use hashset
 - [ ] M9: CODE_MINIMAP.md missing 23 source files
 - [ ] M10: `bench_helpers.zig` is orphaned (never imported)
-- [ ] M11: Copy-paste "PDF size" comments in non-PDF functions (`expansion.zig:281,610,684`)
+- [x] M11: Copy-paste "PDF size" comments in non-PDF functions (`expansion.zig:281,610,684`)
 - [ ] M12: Flate metadata (predictor/columns/colors/bpc) not propagated from Zig expansion path
 
 ### LOW — Nice to Have
