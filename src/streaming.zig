@@ -23,6 +23,70 @@ const ArchiveEntry = mini_blar.ArchiveEntry;
 const ContainerError = container.ContainerError;
 const LPOptions = container.LPOptions;
 
+/// Per-entry expansion result slot for parallel expansion.
+const ExpSlot = struct {
+    result_entries: std.ArrayListUnmanaged(ArchiveEntry),
+    paths: std.ArrayListUnmanaged([]u8),
+    contents: std.ArrayListUnmanaged([]u8),
+    has_dir: bool,
+};
+
+/// Expand a single entry into a slot. Thread-safe — each slot is independent.
+fn expandSlot(allocator: Allocator, entry: ArchiveEntry, slot: *ExpSlot, do_expand: bool) void {
+    switch (entry) {
+        .file => |file| {
+            if (do_expand and file.content.len >= 128) {
+                if (expansion.detectCodec(file.content)) |codec_name| {
+                    var exp_result = expansion.expandFile(allocator, file.content, codec_name) catch null;
+                    if (exp_result) |*exp| {
+                        slot.has_dir = true;
+                        // DIR entry
+                        slot.result_entries.append(allocator, .{ .dir = .{
+                            .path = file.path,
+                            .mode = file.mode,
+                            .mtime_ns = file.mtime_ns,
+                            .ctime_ns = file.ctime_ns,
+                            .birthtime_ns = file.birthtime_ns,
+                            .uid = file.uid,
+                            .gid = file.gid,
+                            .username = file.username,
+                            .groupname = file.groupname,
+                            .xattrs = file.xattrs,
+                            .container_type = exp.container_type,
+                        }}) catch return;
+
+                        for (exp.entries) |child| {
+                            const child_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ file.path, child.path_suffix }) catch continue;
+                            slot.paths.append(allocator, child_path) catch { allocator.free(child_path); continue; };
+                            const owned = allocator.dupe(u8, child.content) catch continue;
+                            slot.contents.append(allocator, owned) catch { allocator.free(owned); continue; };
+
+                            slot.result_entries.append(allocator, .{ .file = .{
+                                .path = child_path,
+                                .content = owned,
+                                .mode = file.mode,
+                                .mtime_ns = file.mtime_ns,
+                                .zip_compression_method = if (child.zip_comp != 0xFFFF) child.zip_comp else null,
+                                .pdf_stream_offset = if (child.pdf_offset != std.math.maxInt(u64)) child.pdf_offset else null,
+                                .pdf_stream_length = if (child.pdf_length != std.math.maxInt(u64)) child.pdf_length else null,
+                                .jxl_source_format = child.jxl_source_format,
+                            }}) catch continue;
+                        }
+                        exp.deinit();
+                        return;
+                    }
+                }
+            }
+            // No expansion — pass through
+            slot.result_entries.append(allocator, entry) catch {};
+        },
+        .dir => {
+            slot.has_dir = true;
+            slot.result_entries.append(allocator, entry) catch {};
+        },
+    }
+}
+
 /// One entry in the spill index.
 const SpillEntry = struct {
     /// Offset in the spill file where serialized bytes start.
@@ -79,82 +143,87 @@ pub fn createArchiveStreaming(
     var has_dir = false;
     var spill_offset: u64 = 0;
 
-    // ── Pre-pass: Expand containers if enabled ─────────────────────────
-    // Build a new entry list with expansions applied. Each expanded file
-    // becomes a DIR + child FILE entries. Non-expanded files pass through.
-    // This is done before the main serialization loop so we have a stable
-    // entry list with correct count/ordering.
+    // ── Pre-pass: Expand containers if enabled (PARALLEL) ──────────────
+    // Each file is expanded independently. Results are stored per-slot so
+    // ordering is preserved. Uses std.Thread for parallelism.
 
+    // Per-entry expansion result: either the original entry or expanded DIR + children
+    const slots = try allocator.alloc(ExpSlot, entries.len);
+    defer {
+        for (slots) |*slot| {
+            for (slot.paths.items) |p| allocator.free(p);
+            slot.paths.deinit(allocator);
+            for (slot.contents.items) |buf| allocator.free(buf);
+            slot.contents.deinit(allocator);
+            slot.result_entries.deinit(allocator);
+        }
+        allocator.free(slots);
+    }
+    for (slots) |*s| {
+        s.* = .{
+            .result_entries = .{},
+            .paths = .{},
+            .contents = .{},
+            .has_dir = false,
+        };
+    }
+
+    // Parallel expansion via work-stealing (or sequential fallback)
+    const cpu_count: usize = if (expand_containers) (std.Thread.getCpuCount() catch 1) else 1;
+    const actual_threads = @min(cpu_count, @max(entries.len, 1));
+
+    if (actual_threads > 1) {
+        const WorkCtx = struct {
+            entries_slice: []const ArchiveEntry,
+            slots_slice: []ExpSlot,
+            next_idx: std.atomic.Value(usize),
+            alloc: Allocator,
+
+            fn work(self: *@This()) void {
+                while (true) {
+                    const idx = self.next_idx.fetchAdd(1, .seq_cst);
+                    if (idx >= self.entries_slice.len) break;
+                    expandSlot(self.alloc, self.entries_slice[idx], &self.slots_slice[idx], true);
+                }
+            }
+        };
+
+        var ctx = WorkCtx{
+            .entries_slice = entries,
+            .slots_slice = slots,
+            .next_idx = std.atomic.Value(usize).init(0),
+            .alloc = allocator,
+        };
+
+        var thread_buf: [256]std.Thread = undefined;
+        const spawn_count = @min(actual_threads - 1, 256);
+        var spawned: usize = 0;
+
+        for (0..spawn_count) |_| {
+            thread_buf[spawned] = std.Thread.spawn(.{}, WorkCtx.work, .{&ctx}) catch break;
+            spawned += 1;
+        }
+
+        // Main thread participates
+        ctx.work();
+
+        for (thread_buf[0..spawned]) |handle| {
+            handle.join();
+        }
+    } else {
+        for (entries, 0..) |entry, i| {
+            expandSlot(allocator, entry, &slots[i], expand_containers);
+        }
+    }
+
+    // Flatten slots into final entry list
     var work_entries = std.ArrayListUnmanaged(ArchiveEntry){};
     defer work_entries.deinit(allocator);
 
-    // Track allocated paths for expanded children (need to free them)
-    var expanded_paths = std.ArrayListUnmanaged([]u8){};
-    defer {
-        for (expanded_paths.items) |p| allocator.free(p);
-        expanded_paths.deinit(allocator);
-    }
-    // Track allocated content for expanded children
-    var expanded_contents = std.ArrayListUnmanaged([]u8){};
-    defer {
-        for (expanded_contents.items) |buf| allocator.free(buf);
-        expanded_contents.deinit(allocator);
-    }
-
-    for (entries) |entry| {
-        switch (entry) {
-            .file => |file| {
-                if (expand_containers and file.content.len >= 128) {
-                    if (expansion.detectCodec(file.content)) |codec_name| {
-                        var exp_result = expansion.expandFile(allocator, file.content, codec_name) catch null;
-                        if (exp_result) |*exp| {
-                            // Expansion succeeded — add DIR + children
-                            has_dir = true;
-                            try work_entries.append(allocator, .{ .dir = .{
-                                .path = file.path,
-                                .mode = file.mode,
-                                .mtime_ns = file.mtime_ns,
-                                .ctime_ns = file.ctime_ns,
-                                .birthtime_ns = file.birthtime_ns,
-                                .uid = file.uid,
-                                .gid = file.gid,
-                                .username = file.username,
-                                .groupname = file.groupname,
-                                .xattrs = file.xattrs,
-                                .container_type = exp.container_type,
-                            }});
-
-                            for (exp.entries) |child| {
-                                const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ file.path, child.path_suffix });
-                                try expanded_paths.append(allocator, child_path);
-
-                                // Copy content to owned buffer
-                                const owned_content = try allocator.dupe(u8, child.content);
-                                try expanded_contents.append(allocator, owned_content);
-
-                                try work_entries.append(allocator, .{ .file = .{
-                                    .path = child_path,
-                                    .content = owned_content,
-                                    .mode = file.mode,
-                                    .mtime_ns = file.mtime_ns,
-                                    .zip_compression_method = if (child.zip_comp != 0xFFFF) child.zip_comp else null,
-                                    .pdf_stream_offset = if (child.pdf_offset != std.math.maxInt(u64)) child.pdf_offset else null,
-                                    .pdf_stream_length = if (child.pdf_length != std.math.maxInt(u64)) child.pdf_length else null,
-                                    .jxl_source_format = child.jxl_source_format,
-                                }});
-                            }
-                            exp.deinit();
-                            continue; // Don't add original file
-                        }
-                    }
-                }
-                // No expansion — pass through
-                try work_entries.append(allocator, entry);
-            },
-            .dir => {
-                has_dir = true;
-                try work_entries.append(allocator, entry);
-            },
+    for (slots) |*slot| {
+        if (slot.has_dir) has_dir = true;
+        for (slot.result_entries.items) |entry| {
+            try work_entries.append(allocator, entry);
         }
     }
 
