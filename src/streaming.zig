@@ -152,15 +152,19 @@ pub fn createArchiveStreaming(
     expand_containers: bool,
     expand_all_zips: bool,
 ) (StreamingError || mini_blar.compression_mod.CompressionError)![]u8 {
-    // Create temp spill file
-    const tmp_path = "/tmp/blar_spill_XXXXXX";
-    _ = tmp_path;
-    var spill_file = std.fs.cwd().createFile("/tmp/blar_streaming_spill.tmp", .{
+    // Create temp spill file in TMPDIR (RAM-backed per project convention)
+    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    var spill_path_buf: [512]u8 = undefined;
+    const spill_path = std.fmt.bufPrint(&spill_path_buf, "{s}/blar_spill_{d}.tmp", .{
+        tmpdir, std.time.milliTimestamp(),
+    }) catch return StreamingError.SpillFailed;
+
+    var spill_file = std.fs.cwd().createFile(spill_path, .{
         .read = true,
     }) catch return StreamingError.SpillFailed;
     defer {
         spill_file.close();
-        std.fs.cwd().deleteFile("/tmp/blar_streaming_spill.tmp") catch {};
+        std.fs.cwd().deleteFile(spill_path) catch {};
     }
 
     var spill_index = std.ArrayListUnmanaged(SpillEntry){};

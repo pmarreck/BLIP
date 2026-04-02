@@ -67,6 +67,16 @@ int main(int argc, char **argv) {
         print_version();
         return EXIT_OK;
     }
+    if (strcmp(arg1, "--about") == 0) {
+#ifdef __aarch64__
+        printf("blar %s -- BLAR archive tool (aarch64)\n", BLAR_VERSION);
+#elif defined(__x86_64__)
+        printf("blar %s -- BLAR archive tool (x86_64)\n", BLAR_VERSION);
+#else
+        printf("blar %s -- BLAR archive tool\n", BLAR_VERSION);
+#endif
+        return EXIT_OK;
+    }
 
     if (strcmp(arg1, "create") == 0) return cmd_create(argc - 2, argv + 2);
     if (strcmp(arg1, "list") == 0)   return cmd_list(argc - 2, argv + 2);
@@ -217,6 +227,7 @@ static void print_usage(FILE *out) {
         "  --absolute-names Preserve absolute paths in archive\n"
         "  -h, --help       Show this help\n"
         "  --version        Show version\n"
+        "  --about          Show one-line description\n"
     );
 }
 
@@ -414,7 +425,7 @@ static int cmd_create(int argc, char **argv) {
     if (!out_path && argc >= 1) {
         struct stat st_check;
         if (stat(argv[0], &st_check) != 0) {
-            /* First arg doesn't exist — treat as output path (tar-style) */
+            /* First arg doesn't exist -- treat as output path (tar-style) */
             out_path = argv[0];
             input_start = 1;
         }
@@ -460,7 +471,7 @@ static int cmd_create(int argc, char **argv) {
         }
     }
 
-    /* Check for existing output file — prompt before overwriting */
+    /* Check for existing output file -- prompt before overwriting */
     if (!force) {
         struct stat out_st;
         if (stat(out_path, &out_st) == 0) {
@@ -540,7 +551,7 @@ static int cmd_create(int argc, char **argv) {
 
     /* ── Streaming path: low memory, processes files one at a time ── */
     if (use_streaming) {
-        /* metadata_only was set before collection — no file content loaded */
+        /* metadata_only was set before collection -- no file content loaded */
 
         uint8_t *archive_buf = NULL;
         size_t archive_len = 0;
@@ -644,7 +655,7 @@ static int cmd_create(int argc, char **argv) {
         archive_len = compressed_len;
     }
 
-    /* Optionally encrypt (outermost layer — after compression) */
+    /* Optionally encrypt (outermost layer -- after compression) */
     if (do_encrypt) {
         if (progress) {
             progrez_set_label(progress, "Encrypting");
@@ -832,11 +843,11 @@ static int cmd_extract(int argc, char **argv) {
         }
     }
 
-    /* Check if output directory already has files — warn unless --force */
+    /* Check if output directory already has files -- warn unless --force */
     if (!force && output_dir) {
         struct stat out_st;
         if (stat(output_dir, &out_st) == 0 && S_ISDIR(out_st.st_mode)) {
-            /* Directory exists — check if non-empty */
+            /* Directory exists -- check if non-empty */
             DIR *d = opendir(output_dir);
             if (d) {
                 struct dirent *de;
@@ -1484,7 +1495,7 @@ static int cmd_text(int argc, char **argv) {
         }
 
         if (entry_type == 0x07) {
-            /* DIR entry — show with trailing / */
+            /* DIR entry -- show with trailing / */
             text_indent(out, depth);
             if (display_len > 0 && display_name[display_len - 1] == '/')
                 fprintf(out, "DIR \"%.*s\"", (int)display_len, display_name);
@@ -1811,7 +1822,7 @@ static int cmd_from_text(int argc, char **argv) {
         size_t content_len = line_len - indent;
 
         if (content_len == 0) {
-            /* blank line — skip */
+            /* blank line -- skip */
             line = nl ? nl + 1 : text_end;
             continue;
         }
@@ -2288,7 +2299,7 @@ static int cmd_explode(int argc, char **argv) {
         blip_archive_entry_pdf_length(buf, buf_len, i, &pl);
 
         /* Determine basename and parent directory */
-        /* path is like "dir/sub/file.txt" — basename is "file.txt", parent is output_dir/dir/sub */
+        /* path is like "dir/sub/file.txt" -- basename is "file.txt", parent is output_dir/dir/sub */
         char path_str[4096];
         snprintf(path_str, sizeof(path_str), "%.*s", (int)path_len, path);
 

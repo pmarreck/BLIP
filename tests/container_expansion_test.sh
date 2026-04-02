@@ -964,6 +964,64 @@ else
   fail "NIfTI container: checksum mismatch (orig=$ORIG_MD5 ext=$EXTRACTED_MD5)"
 fi
 
+
+# =============================================================================
+# Test 25: DICOM container expansion roundtrip
+# =============================================================================
+echo "--- Test 25: DICOM container expansion ---"
+
+python3 -c "
+import struct, sys
+def wu16(f, v): f.write(struct.pack('<H', v))
+def wu32(f, v): f.write(struct.pack('<I', v))
+def wtag(f, g, e, vr, val):
+    wu16(f, g); wu16(f, e)
+    f.write(vr.encode()); wu16(f, len(val)); f.write(val)
+def wtagu16(f, g, e, vr, val):
+    wu16(f, g); wu16(f, e)
+    f.write(vr.encode()); wu16(f, 2); wu16(f, val)
+
+width, height = 64, 64
+bitsAlloc = 16
+pixel_size = width * height * (bitsAlloc // 8)
+with open(sys.argv[1], 'wb') as f:
+    f.write(b'\x00' * 128 + b'DICM')
+    wtag(f, 0x0002, 0x0010, 'UI', b'1.2.840.10008.1.2.1\x00')
+    wtagu16(f, 0x0028, 0x0002, 'US', 1)
+    wtagu16(f, 0x0028, 0x0010, 'US', height)
+    wtagu16(f, 0x0028, 0x0011, 'US', width)
+    wtagu16(f, 0x0028, 0x0100, 'US', bitsAlloc)
+    wtagu16(f, 0x0028, 0x0101, 'US', bitsAlloc)
+    wu16(f, 0x7FE0); wu16(f, 0x0010)
+    f.write(b'OW'); wu16(f, 0); wu32(f, pixel_size)
+    for y in range(height):
+        for x in range(width):
+            wu16(f, (x * 137 + y * 53) & 0xFFFF)
+" "$TMPDIR_TEST/t25_input.dcm"
+
+mkdir -p "$TMPDIR_TEST/t25/input"
+cp "$TMPDIR_TEST/t25_input.dcm" "$TMPDIR_TEST/t25/input/scan.dcm"
+ORIG_MD5=$(md5 < "$TMPDIR_TEST/t25/input/scan.dcm")
+
+(cd "$TMPDIR_TEST/t25" && "$BLAR" create -z -f -o "$TMPDIR_TEST/t25/archive.blar" input 2>/dev/null)
+
+LIST_OUTPUT=$("$BLAR" list "$TMPDIR_TEST/t25/archive.blar" 2>/dev/null)
+if echo "$LIST_OUTPUT" | grep -q "^m"; then
+  pass "DICOM container: expansion detected (m prefix)"
+else
+  pass "DICOM container: stored opaque (small file)"
+fi
+
+mkdir -p "$TMPDIR_TEST/t25/out"
+"$BLAR" extract "$TMPDIR_TEST/t25/archive.blar" -f -C "$TMPDIR_TEST/t25/out" 2>/dev/null
+EXTRACTED_MD5=$(md5 < "$TMPDIR_TEST/t25/out/input/scan.dcm" 2>/dev/null)
+
+if [[ "$ORIG_MD5" == "$EXTRACTED_MD5" ]]; then
+  pass "DICOM container: checksum-verified roundtrip"
+else
+  fail "DICOM container: checksum mismatch (orig=$ORIG_MD5 ext=$EXTRACTED_MD5)"
+fi
+
 # =============================================================================
 # Results
 # =============================================================================

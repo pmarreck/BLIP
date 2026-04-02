@@ -284,7 +284,7 @@ fn expandAudioFormat(
     codec_name: []const u8,
 ) !?ExpandResult {
     if (!build_options.enable_flac) return null;
-    if (content.len < 128) return null; // Minimum viable PDF size
+    if (content.len < 128) return null;
 
     var pcm_samples: []u8 = undefined;
     var meta: []u8 = undefined;
@@ -355,7 +355,7 @@ fn expandAudioFormat(
 
 /// Expand a PDF into shell + JXL-transcoded image children.
 fn expandPdf(allocator: Allocator, content: []const u8) !?ExpandResult {
-    if (content.len < 128) return null; // Minimum viable PDF size
+    if (content.len < 128) return null;
 
     // Phase 1: Decompress FlateDecode content streams for better LZMA2 compression
     var working: []u8 = undefined;
@@ -615,7 +615,7 @@ pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const
 
     // Tar
     if (std.mem.eql(u8, codec_name, "tar")) {
-        if (content.len < 128) return null; // Minimum viable PDF size
+        if (content.len < 128) return null;
 
         var parsed = tar_mod.parseTar(allocator, content) catch return null;
         defer parsed.deinit();
@@ -689,7 +689,7 @@ pub fn expandFile(allocator: Allocator, content: []const u8, codec_name: []const
 
     // JPEG → JXL (lossless JPEG transcode, not pixel-based)
     if (std.mem.eql(u8, codec_name, "jpeg")) {
-        if (content.len < 128) return null; // Minimum viable PDF size
+        if (content.len < 128) return null;
 
         const jxl_data = jxl_mod.jpegToJxl(allocator, content) catch return null;
 
