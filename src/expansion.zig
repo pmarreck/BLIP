@@ -77,6 +77,11 @@ pub const CollapseChild = struct {
     zip_comp: u16 = 0xFFFF,
     /// Optional metadata: JXL source format tag.
     jxl_source: []const u8 = &.{},
+    /// FlateDecode metadata for PDF image reconstruction.
+    flate_predictor: u16 = 0,
+    flate_columns: u32 = 0,
+    flate_colors: u8 = 0,
+    flate_bpc: u8 = 0,
 };
 
 // ── Format detection ─────────────────────────────────────────────────────
@@ -745,8 +750,8 @@ pub fn collapseContainer(
                 .filename = child.inner_path,
                 .content = child.content,
                 .compression_method = comp_method,
-                .last_modification_time = 0,
-                .last_modification_date = 0,
+                .last_modification_time = 0, // TODO H3: preserve from archive metadata
+                .last_modification_date = 0, // TODO H3: preserve from archive metadata
                 .external_attributes = 0,
             });
         }
@@ -827,8 +832,22 @@ pub fn collapseContainer(
             }
         }
 
-        // If we have replacements that changed size, rewrite the PDF
+        // If we have replacements that changed size, rewrite the whole PDF
         if (flate_replacements.items.len > 0) {
+            // Convert to StreamReplacement format
+            const reps = try allocator.alloc(pdf_mod.StreamReplacement, flate_replacements.items.len);
+            defer allocator.free(reps);
+            for (flate_replacements.items, 0..) |rep, ri| {
+                reps[ri] = .{
+                    .stream_start = @intCast(rep.start),
+                    .original_length = @intCast(rep.orig_len),
+                    .new_data = rep.new_data,
+                };
+            }
+            if (pdf_mod.rewritePdfWithStreams(allocator, pdf_buf, reps) catch null) |rewritten| {
+                allocator.free(pdf_buf);
+                return rewritten;
+            }
             // Use blip_pdf_rewrite_streams for size-changing replacements
             // For now this is handled by the C path — the Zig path only handles
             // same-size JPEG replacements (which is the common case for lossless JPEG↔JXL)
@@ -924,12 +943,18 @@ pub fn collapseContainer(
     // Gzip collapse: recompress __body__ with stored level
     if (std.mem.eql(u8, codec_name, "gz")) {
         var body_content: ?[]const u8 = null;
+        var gz_level: u8 = 6; // default
         for (children) |child| {
-            if (std.mem.eql(u8, child.inner_path, "__body__"))
+            if (std.mem.eql(u8, child.inner_path, "__body__")) {
                 body_content = child.content;
+                // gz_level stored in zip_comp field (repurposed during expansion)
+                if (child.zip_comp != 0xFFFF and child.zip_comp >= 1 and child.zip_comp <= 9) {
+                    gz_level = @truncate(child.zip_comp);
+                }
+            }
         }
         const body = body_content orelse return null;
-        const gz_data = pdf_mod.gzipCompressLevel(allocator, body, 6) catch return null;
+        const gz_data = pdf_mod.gzipCompressLevel(allocator, body, gz_level) catch return null;
         return gz_data;
     }
 

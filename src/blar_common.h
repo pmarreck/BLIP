@@ -1811,6 +1811,8 @@ static int blar_extract_to_dir(
                         child_zip_comps[child_n] = zc;
                     }
                     child_n++;
+                    /* Note: flate metadata (predictor/columns/colors/bpc) is passed
+                     * through the blip_collapse_container FFI via CollapseChild fields */
                 }
 
                 uint8_t *result_data = NULL; size_t result_len = 0;
