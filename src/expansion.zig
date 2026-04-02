@@ -40,6 +40,10 @@ pub const ExpandedEntry = struct {
     gz_level: u8,
     /// ZIP compression method (0=store, 8=deflate), 0xFFFF if N/A.
     zip_comp: u16 = 0xFFFF,
+    /// ZIP modification time (MS-DOS format), 0 if not set.
+    zip_mod_time: u16 = 0,
+    /// ZIP modification date (MS-DOS format), 0 if not set.
+    zip_mod_date: u16 = 0,
     /// PDF stream offset in the shell, maxInt if N/A.
     pdf_offset: u64 = std.math.maxInt(u64),
     /// PDF stream length in the shell, maxInt if N/A.
@@ -80,6 +84,10 @@ pub const CollapseChild = struct {
     pdf_length: u64 = std.math.maxInt(u64),
     /// Optional metadata: ZIP compression method (0xFFFF if unused).
     zip_comp: u16 = 0xFFFF,
+    /// ZIP modification time (MS-DOS format), 0 if not set.
+    zip_mod_time: u16 = 0,
+    /// ZIP modification date (MS-DOS format), 0 if not set.
+    zip_mod_date: u16 = 0,
     /// Optional metadata: JXL source format tag.
     jxl_source: []const u8 = &.{},
     /// FlateDecode metadata for PDF image reconstruction.
@@ -553,6 +561,8 @@ fn expandZip(allocator: Allocator, content: []const u8) !?ExpandResult {
             .jxl_source_format = &.{},
             .gz_level = 0,
             .zip_comp = ze.compression_method,
+            .zip_mod_time = ze.last_modification_time,
+            .zip_mod_date = ze.last_modification_date,
         };
         valid += 1;
     }
@@ -759,8 +769,8 @@ pub fn collapseContainer(
                 .filename = child.inner_path,
                 .content = child.content,
                 .compression_method = comp_method,
-                .last_modification_time = 0, // TODO H3: preserve from archive metadata
-                .last_modification_date = 0, // TODO H3: preserve from archive metadata
+                .last_modification_time = child.zip_mod_time,
+                .last_modification_date = child.zip_mod_date,
                 .external_attributes = 0,
             });
         }
@@ -1347,6 +1357,59 @@ test "detectCodec identifies ALL supported formats" {
     try testing.expect(detectCodec(&[_]u8{ 0x00, 0x00, 0x00, 0x00 }) == null);
     try testing.expect(detectCodec(&[_]u8{ 0xDE, 0xAD }) == null);
     try testing.expect(detectCodec(&[_]u8{}) == null);
+}
+
+
+test "ZIP expansion/collapse preserves modification timestamps" {
+    const alloc = testing.allocator;
+    const zip_local = @import("zip.zig");
+
+    // Create a ZIP with known timestamps
+    const write_entries = [_]zip_local.ZipWriteEntry{
+        .{
+            .filename = "hello.txt",
+            .content = "Hello, World!",
+            .compression_method = 0, // store
+            .last_modification_time = 0x4A3B, // specific time
+            .last_modification_date = 0x5C6D, // specific date
+            .external_attributes = 0,
+        },
+    };
+
+    const zip_data = try zip_local.createZip(alloc, &write_entries);
+    defer alloc.free(zip_data);
+
+    // Expand the ZIP
+    var result = (try expandFile(alloc, zip_data, "zip")) orelse return error.TestExpectedEqual;
+    defer result.deinit();
+
+    // The expanded entries should have the ZIP entry data
+    try testing.expect(result.entries.len > 0);
+
+    // Collapse back to ZIP
+    const collapse_children = try alloc.alloc(CollapseChild, result.entries.len);
+    defer alloc.free(collapse_children);
+
+    for (result.entries, 0..) |entry, i| {
+        collapse_children[i] = .{
+            .inner_path = entry.path_suffix,
+            .content = entry.content,
+            .zip_comp = entry.zip_comp,
+            .zip_mod_time = entry.zip_mod_time,
+            .zip_mod_date = entry.zip_mod_date,
+        };
+    }
+
+    const reconstructed = (try collapseContainer(alloc, "zip", collapse_children)) orelse return error.TestExpectedEqual;
+    defer alloc.free(reconstructed);
+
+    // Read back the reconstructed ZIP and verify timestamps
+    const re_entries = try zip_local.readEntries(alloc, reconstructed);
+    defer alloc.free(re_entries);
+
+    try testing.expect(re_entries.len > 0);
+    try testing.expectEqual(@as(u16, 0x4A3B), re_entries[0].last_modification_time);
+    try testing.expectEqual(@as(u16, 0x5C6D), re_entries[0].last_modification_date);
 }
 
 // ── Microbenchmarks ──────────────────────────────────────────────────────
