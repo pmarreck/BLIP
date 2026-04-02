@@ -205,26 +205,26 @@
 - [x] H10: `set -euo pipefail` in 3 test scripts violates CLAUDE.md rule (compression, encryption, explode)
 - [x] H11: ~3,500 lines of dead C code in blar_common.h (old expand_*_container + reconstruction blocks)
 - [x] H12: No DICOM container expansion CLI roundtrip test
-- [ ] H13: No symlink tests anywhere in the test suite
+- [x] H13: No symlink tests anywhere in the test suite
 
 ### MEDIUM — Address When Touching Nearby Code
 - [x] M1: NIfTI `.expand = NULL` in builtin_codecs (inconsistent, Zig handles it)
 - [x] M2: Expanded child entries lose ctime/birthtime/uid/gid/username in streaming (`streaming.zig:92`)
 - [x] M3: `--about` flag missing from `blar.c` CLI (required by CLAUDE.md)
 - [x] M4: Hardcoded `/tmp/blar_streaming_spill.tmp` — not unique, ignores TMPDIR (`streaming.zig:157`)
-- [ ] M5: 6 format parsers hand-roll readU16LE/readU32LE — replace with `std.mem.readInt` (~60 lines)
+- [ ] M5 (deferred): 6 format parsers hand-roll readU16LE/readU32LE — replace with `std.mem.readInt` (~60 lines)
 - [ ] M6: 44 runtime `std.mem.eql` string comparisons — introduce `CodecId` enum with switch dispatch
 - [ ] M7: Duplicated C→Zig metadata conversion in lib.zig (create_full vs streaming, ~80 lines)
 - [x] M8: O(B×E) content ownership transfer after expansion (`blar_common.h:6734`) — use hashset
 - [ ] M9: CODE_MINIMAP.md missing 23 source files
 - [x] M10: `bench_helpers.zig` is orphaned (never imported)
 - [x] M11: Copy-paste "PDF size" comments in non-PDF functions (`expansion.zig:281,610,684`)
-- [ ] M12: Flate metadata (predictor/columns/colors/bpc) not propagated from Zig expansion path
+- [x] M12: Flate metadata (predictor/columns/colors/bpc) not propagated from Zig expansion path
 
 ### LOW — Nice to Have
 - [ ] L1: Interlaced GIF unhandled (returns UnsupportedGif error)
-- [ ] L2: `createArchiveStreamingToFile` mentioned as "(future)" but unimplemented
-- [ ] L3: No Unicode filename tests
-- [ ] L4: No streaming + encryption combo test
+- [x] L2: `createArchiveStreamingToFile` mentioned as "(future)" but unimplemented
+- [x] L3: No Unicode filename tests
+- [x] L4: No streaming + encryption combo test
 - [x] L5: `CURRENT_GOALS.md` is stale — consolidate into PLAN.md or remove
 - [ ] L6: Inconsistent `ArrayList` vs `ArrayListUnmanaged` naming (same type in 0.15)

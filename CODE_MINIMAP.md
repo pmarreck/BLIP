@@ -136,3 +136,109 @@ Integration tests for blar CLI (18 tests: directory trees, DIR/FILE entries, met
 
 ## tests/miniblar_test.sh
 Integration tests for miniblar CLI (19 tests: flat archives, binary roundtrip, directory rejection).
+
+## src/expansion.zig
+Unified container expansion and collapse — all 15 format handlers.
+- `detectCodec(content) ?[]const u8` — format detection by magic bytes
+- `expandFile(allocator, content, codec_name) !?ExpandResult` — expand a file into container entries
+- `collapseContainer(allocator, codec_name, children) !?[]u8` — reconstruct original file from expanded children
+- `expandPdf(allocator, content) !?ExpandResult` — PDF-specific expansion (FlateDecode + JPEG streams)
+- `expandZip(allocator, content) !?ExpandResult` — ZIP decomposition
+- `expandSlot(allocator, entry, slot, expand, expand_all_zips)` — per-entry expansion (thread-safe)
+
+## src/streaming.zig
+Streaming (spill-to-disk) archive creation with O(largest_file) memory.
+- `createArchiveStreaming(allocator, entries, comp_id, expand, expand_all_zips) ![]u8` — two-pass streaming archive creation
+- `ExpSlot` — per-entry expansion result slot for parallel processing
+- `isArchiveExtension(path) bool` — check if file has archive extension (ZIP skip logic)
+
+## src/array.zig (additions)
+- `computeArrayLayout(allocator, element_sizes, type_id, options) !ArrayLayout` — dry-run ARRAY layout from sizes alone (enables streaming assembly)
+- `ArrayLayout` — struct with header bytes, index section, total size for streaming
+
+## src/bmp.zig
+BMP image parser for container expansion (24/32-bit uncompressed).
+- `parseBmp(allocator, data) !ParsedBmp` — parse BMP → pixels + header metadata
+- `encodeBmp(allocator, pixels, header) ![]u8` — reconstruct BMP from pixels + header
+
+## src/tga.zig
+TGA image parser for container expansion (24/32-bit uncompressed true-color).
+- `parseTga(allocator, data) !ParsedTga` — parse TGA → pixels + header
+- `encodeTga(allocator, pixels, header, footer) ![]u8` — reconstruct TGA
+
+## src/tiff.zig
+TIFF image parser for container expansion (uncompressed 8/16-bit).
+- `parseTiff(allocator, data) !ParsedTiff` — parse TIFF → pixels + compact metadata (non-pixel bytes)
+
+## src/gif.zig
+GIF image parser with LZW decompression (static GIFs only).
+- `parseGif(allocator, data) !ParsedGif` — parse GIF → RGBA pixels + original file
+- LZW decoder: `LzwDecoder`, `decodeLzw(allocator, compressed, min_code_size, output_size) ![]u8`
+
+## src/tar.zig
+tar archive parser for container decomposition.
+- `parseTar(allocator, data) !ParsedTar` — parse tar → individual entries with headers
+- `encodeTar(allocator, entries, trailer) ![]u8` — reconstruct tar from entries
+
+## src/wav.zig
+WAV audio parser for FLAC container expansion.
+- `parseWav(allocator, data) !ParsedWav` — parse WAV → PCM samples + compact metadata
+
+## src/aiff.zig
+AIFF audio parser for FLAC container expansion (big-endian PCM).
+- `parseAiff(allocator, data) !ParsedAiff` — parse AIFF → LE PCM + metadata
+- `parseExtended80(buf) u32` — decode 80-bit IEEE 754 sample rate
+
+## src/flac.zig
+FLAC encoder/decoder wrapper (uses libFLAC via @cImport).
+- `encodePcmToFlac(allocator, samples, channels, rate, bps, frames) ![]u8` — PCM → FLAC
+- `decodeFlacToPcm(allocator, flac_data, channels, rate, bps, total) ![]u8` — FLAC → PCM
+
+## src/fits.zig
+FITS astronomy image parser (8/16-bit integer pixel arrays).
+- `parseFits(allocator, data) !ParsedFits` — parse FITS → pixels + header metadata
+
+## src/dicom.zig
+DICOM medical image parser (uncompressed 8/16-bit).
+- `parseDicom(allocator, data) !ParsedDicom` — parse DICOM → pixels + tag metadata
+
+## src/nifti.zig
+NIfTI neuroimaging parser (3D/4D voxel data).
+- `parseNifti(allocator, data) !ParsedNifti` — parse NIfTI → voxels + 348-byte header
+
+## src/compression_stub.zig
+Compression stub — same API as compression.zig but returns UnsupportedCompression.
+Used when enable_compression=false for downstream consumers.
+
+## src/checksum.zig
+Checksum computation (xxHash64, CRC32, BLAKE3-128).
+- `compute(id, data) [32]u8` — compute checksum
+- `verify(id, data, expected) bool` — verify checksum
+
+## src/encryption.zig
+Archive encryption (AES-256-GCM, ChaCha20-Poly1305) with Argon2id/PBKDF2 KDF.
+
+## src/zip.zig
+ZIP container reader/writer for container expansion.
+- `readEntries(allocator, buf) ![]ZipEntry` — parse ZIP central directory
+- `extractEntry(allocator, entry) ![]u8` — decompress a ZIP entry
+- `createZip(allocator, entries) ![]u8` — create a ZIP from entries
+
+## src/lzma2.zig
+LZMA2 compression integration (via z7z dependency).
+
+## src/blar_common.h
+C wiring layer — connects CLI/GUI to Zig core via FFI.
+- `entry_list_t` — file/dir collection with metadata_only streaming support
+- `expand_via_zig()` — routes all container expansion through blip_expand_file FFI
+- `blar_extract_to_dir()` — extraction with Zig collapse bridge for all formats
+- `expand_containers_pass()` — parallel expansion with work-stealing queue
+
+## src/blar.c
+C CLI — `blar create/extract/list/verify/info` with --streaming flag.
+
+## src/blip.h
+C FFI header — declares all Zig-exported functions for C consumers.
+
+## bench/archive_bench.sh
+Archive creation benchmarks (small/medium/large, in-memory vs streaming, with/without expansion).

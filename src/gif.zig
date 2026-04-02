@@ -331,7 +331,7 @@ pub fn parseGif(allocator: Allocator, data: []const u8) (GifError || Allocator.E
                 const lct_size_bits: u3 = @truncate(img_packed & 0x07);
                 const lct_entries: usize = if (has_lct) @as(usize, 1) << (@as(u4, lct_size_bits) + 1) else 0;
                 const is_interlaced = (img_packed & 0x40) != 0;
-                if (is_interlaced) return GifError.UnsupportedGif; // TODO: handle interlaced
+                if (is_interlaced) return GifError.UnsupportedGif; // Interlaced GIFs not yet supported (L1)
 
                 // Local color table overrides global
                 var color_table: *const [256][3]u8 = &gct;
