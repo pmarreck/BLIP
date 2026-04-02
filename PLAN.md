@@ -195,7 +195,7 @@
 ### HIGH — Fix Soon
 - [x] H1: FlateDecode PDF image collapse is a no-op in Zig path (`expansion.zig:796`) — images silently zeroed
 - [x] H2: Gzip collapse hardcodes level 6, ignores stored gz_level (`expansion.zig:932`)
-- [ ] H3: ZIP collapse zeroes all modification timestamps and external_attributes (`expansion.zig:748`)
+- [x] H3: ZIP collapse zeroes all modification timestamps and external_attributes (`expansion.zig:748`)
 - [x] H4: O(D×N) Merkle hash computation — nested loop scans all entries per DIR (`mini_blar.zig:789`)
 - [x] H5: Same O(D×N) Merkle pattern in streaming path (`streaming.zig:317`)
 - [x] H6: O(C×N) child collection in extract Pass 3 (`blar_common.h:1762`)
@@ -212,9 +212,9 @@
 - [x] M2: Expanded child entries lose ctime/birthtime/uid/gid/username in streaming (`streaming.zig:92`)
 - [x] M3: `--about` flag missing from `blar.c` CLI (required by CLAUDE.md)
 - [x] M4: Hardcoded `/tmp/blar_streaming_spill.tmp` — not unique, ignores TMPDIR (`streaming.zig:157`)
-- [ ] M5 (deferred): 6 format parsers hand-roll readU16LE/readU32LE — replace with `std.mem.readInt` (~60 lines)
-- [ ] M6: 44 runtime `std.mem.eql` string comparisons — introduce `CodecId` enum with switch dispatch
-- [ ] M7: Duplicated C→Zig metadata conversion in lib.zig (create_full vs streaming, ~80 lines)
+- [x] M5 (deferred): 6 format parsers hand-roll readU16LE/readU32LE — replace with `std.mem.readInt` (~60 lines)
+- [x] M6: 44 runtime `std.mem.eql` string comparisons — introduce `CodecId` enum with switch dispatch
+- [x] M7 (acceptable duplication): Duplicated C→Zig metadata conversion in lib.zig (create_full vs streaming, ~80 lines)
 - [x] M8: O(B×E) content ownership transfer after expansion (`blar_common.h:6734`) — use hashset
 - [ ] M9: CODE_MINIMAP.md missing 23 source files
 - [x] M10: `bench_helpers.zig` is orphaned (never imported)
@@ -222,9 +222,9 @@
 - [x] M12: Flate metadata (predictor/columns/colors/bpc) not propagated from Zig expansion path
 
 ### LOW — Nice to Have
-- [ ] L1: Interlaced GIF unhandled (returns UnsupportedGif error)
+- [x] L1: Interlaced GIF unhandled (returns UnsupportedGif error)
 - [x] L2: `createArchiveStreamingToFile` mentioned as "(future)" but unimplemented
 - [x] L3: No Unicode filename tests
 - [x] L4: No streaming + encryption combo test
 - [x] L5: `CURRENT_GOALS.md` is stale — consolidate into PLAN.md or remove
-- [ ] L6: Inconsistent `ArrayList` vs `ArrayListUnmanaged` naming (same type in 0.15)
+- [x] L6: Inconsistent `ArrayList` vs `ArrayListUnmanaged` naming (same type in 0.15)
