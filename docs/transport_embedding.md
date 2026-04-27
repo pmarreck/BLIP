@@ -255,6 +255,108 @@ All segments of a stream MUST agree on `N`. If a producer can't decide between n
 | UDP / MQTT | Packet/message order | N/A | Yes (live transports) | Yes |
 | Multipart HTTP | Part order | N/A | Yes | Yes |
 
+## 9. Comparison with existing segmentation / fragmentation solutions
+
+This section evaluates BLIP SEGMENT against the most relevant prior art across network, file-format, and transport-embedded contexts. The honest summary: **BLIP SEGMENT is uniquely superior at *scope unification*** — one primitive that subsumes archival, streaming, transport-embedded, and disk-files use cases. On individual quality axes it is sometimes superior, sometimes comparable, and sometimes inferior to specialized solutions.
+
+### Network / protocol layer
+
+| System | What it does | vs. BLIP SEGMENT |
+|--------|--------------|------------------|
+| **IPv4 fragmentation** | Routers split datagrams; reassembled by destination via 16-bit ID + 13-bit offset | BLIP wins on per-fragment integrity (IPv4 has none), self-describing payload (IPv4 fragments are opaque), and unbounded N (IPv4 caps at 65535 bytes total). Deprecated in IPv6 for reasons that don't apply to BLIP (BLIP is application-layer, doesn't share IPv4's MTU pain). |
+| **IPv6 fragmentation** | Source-only fragmentation; 32-bit ID, 13-bit offset | BLIP wins on integrity + self-description; IPv6 wins on no-reassembly-state-explosion (it's stateless across the network). Different layer; not a fair fight. |
+| **TCP segmentation** | Continuous byte stream with sequence numbers + ACKs + retransmits | TCP is online; BLIP's reassembly is offline. TCP wins on flow control, congestion control, retransmission. BLIP wins on application-layer transparency (you can stick TCP-segmented BLIP segments inside another transport). Different problem. |
+| **QUIC streams** | Multiplexed, retransmit-aware, encrypted | QUIC is online and connection-oriented. BLIP SEGMENT carries the same identity primitives (stream-id, offset-equivalent in M) but at archival rest. QUIC wins for live transport; BLIP wins for transport-agnostic embedding. |
+| **SCTP chunks** | TSN-numbered chunks with selective retransmit | SCTP is online; same difference as TCP. |
+
+**Verdict (network layer):** Different problem domain. BLIP is application-layer and offline-reassembly; networks solve online, link-layer reassembly. Not directly comparable.
+
+### File-format / archival layer
+
+| System | What it does | vs. BLIP SEGMENT |
+|--------|--------------|------------------|
+| **PAR2** | Forward-error-correction (Reed-Solomon recovery slices) over a base file set | **PAR2 wins for FEC use cases** — you can lose K of N PAR2 blocks and still recover the original. BLIP SEGMENT has no FEC; lose one numeric-N segment and reassembly fails. PAR2 also has a complex packet-typed format. BLIP wins on simplicity, transport-embedding, and that BLIP SEGMENT can carry a PAR2 payload as VAL. The two compose well. |
+| **ZIP multi-volume (.z01/.z02/.zip)** | Splits archive across N files; central directory in last volume | BLIP wins on per-segment integrity (ZIP multi-volume has none), naming flexibility (BLIP doesn't require last-volume sentinel), and order-independence (ZIP requires sequential read). ZIP wins on tooling ubiquity. |
+| **7-Zip multi-volume (.001/.002)** | Dumb byte split of a single archive across files | BLIP wins on every axis except tooling ubiquity: BLIP has per-segment identity, integrity, ordering, order-independence; 7z has none of these — recover-from-loss is impossible without a separate sidecar. |
+| **RAR multi-volume + Recovery Record** | Volumes with optional XOR-based recovery records | RAR's recovery record is roughly PAR2-lite. Same FEC trade-off as PAR2 above. BLIP unifies the multi-volume case more cleanly. |
+| **Unix `split` / `cat`** | Byte-level split, blind reassembly via `cat` | BLIP wins on all metadata axes. `split` is the lowest baseline. |
+
+**Verdict (file-format layer):** BLIP SEGMENT is strictly better than dumb-split formats (ZIP/7z/RAR multi-volume). It is *worse* than PAR2/RAR-recovery for FEC scenarios — but those compose orthogonally (a PAR2-protected archive can be carried as BLIP SEGMENT VAL).
+
+### Streaming media layer
+
+| System | What it does | vs. BLIP SEGMENT |
+|--------|--------------|------------------|
+| **HLS (.m3u8 + .ts segments)** | Time-indexed media segments + master playlist; supports byte-range requests, encryption keys per segment | HLS wins for **random-access media playback** — you can fetch and decode segment K without segments 0..K-1. BLIP SEGMENT requires sequential reassembly. HLS is media-format-coupled; BLIP is content-agnostic. |
+| **DASH (.mpd + segment URLs)** | Manifest-driven adaptive bitrate streaming | Same as HLS: better for random-access media, worse for general byte-stream segmentation. |
+| **HTTP chunked transfer** | Length-prefixed chunks with no integrity | BLIP wins on every quality axis; HTTP chunked is the absolute minimum (just framing). |
+| **MIME multipart** | Boundary-delimited parts with optional Content-MD5 per part | BLIP wins on length-prefix vs boundary-scanning (no false-positive worry), unlimited part counts, and integrated dedup-on-retransmit. MIME wins on tooling ubiquity in email/HTTP. |
+
+**Verdict (streaming layer):** BLIP SEGMENT is better than primitive framing (HTTP chunked) and at least equivalent to MIME multipart on integrity. For random-access media playback specifically, HLS/DASH win — they index *into* media time, not byte-stream offsets.
+
+### Transport-embedded (the original motivation)
+
+| System | What it does | vs. BLIP SEGMENT |
+|--------|--------------|------------------|
+| **JPEG ICC profile chunking** | APP2 markers with `chunk_num` (u8) + `total_chunks` (u8). 254-chunk cap (one byte for 1-based count). | BLIP wins on: unbounded N (BLIP integers vs ICC's u8); 0-based indexing (cleaner validation); per-chunk integrity (ICC has none); applies to *any* host (ICC is JPEG-only). |
+| **JPEG XMP / Extended XMP** | APP1 with NUL-terminated namespace strings + tiny ad-hoc continuation protocol (MD5 + offset + length per packet) | BLIP wins on: cleaner spec (XMP's continuation is barely standardized); standard 64-bit fields (XMP truncates to 32-bit lengths); composability with other BLIP attrs. |
+| **JPEG EXIF Extended** | Underspecified APP1 continuation; in practice almost no readers handle it correctly | BLIP wins by simply existing as a single coherent spec rather than three incompatible ad-hocs (EXIF/ICC/XMP). |
+| **PNG ancillary chunks (4-char codes)** | `chunkType` + length per chunk | Single-chunk PNG ancillary is fine; multi-chunk requires a layer above (which is what BLIP SEGMENT *is*). |
+| **ISOBMFF `uuid` boxes** | UUID-tagged boxes inside MP4/HEIC/MOV | Single-box is fine; multi-box requires a layer above. BLIP SEGMENT IS that layer. |
+
+**Verdict (transport-embedded):** **BLIP SEGMENT is unambiguously superior here**, because the existing solutions are either inconsistent within one host format (JPEG) or single-payload-only (PNG/ISOBMFF). One canonical primitive replaces three JPEG-specific protocols.
+
+### Distributed systems
+
+| System | What it does | vs. BLIP SEGMENT |
+|--------|--------------|------------------|
+| **IPFS chunks (Merkle DAG)** | Content-addressed chunks in a Merkle tree; native deduplication | IPFS wins for **dedup and content-addressing**. BLIP SEGMENT has neither — two segments with identical VAL are stored twice. Different design goal: IPFS is a storage layer; BLIP SEGMENT is a transport-framing layer. They compose. |
+| **BitTorrent pieces** | Fixed-size pieces with SHA-1 hash per piece, indexed by .torrent file | BitTorrent wins for swarm/peer-to-peer scenarios (it has a tracker/DHT layer). BLIP SEGMENT has none. Different domain. |
+| **Git pack files** | Delta-compressed object database | Different problem; not segmentation. |
+| **Kafka partitions** | Per-topic ordered logs with offsets | Online streaming with consumer-group coordination. BLIP SEGMENT is offline. Different problem. |
+
+**Verdict (distributed):** BLIP SEGMENT does not compete with content-addressed or peer-to-peer systems. It composes with them (you can BitTorrent BLIP SEGMENT files; you can IPFS-store reassembled BLIP archives).
+
+### Score card
+
+| Axis | Winner | Notes |
+|------|--------|-------|
+| **Per-segment self-description** | BLIP SEGMENT (tied with HLS, MIME) | Each segment is parseable standalone via SEG attribute |
+| **Per-segment integrity** | BLIP SEGMENT (tied with PAR2) | xxHash64/BLAKE3 native, optional |
+| **Order-independence on disk** | BLIP SEGMENT | Sort-by-M after collection, no required ordering on the wire |
+| **Streaming and archival in one primitive** | BLIP SEGMENT | NIL N for streaming, numeric N for archival — most formats specialize |
+| **Transport-agnostic** | BLIP SEGMENT | One spec for JPEG / ISOBMFF / PNG / disk / network |
+| **Forward-error-correction** | PAR2 / RAR | BLIP has none; compose at a different layer |
+| **Random-access into a long stream** | HLS / DASH | BLIP requires sequential reassembly; HLS supports independent decoding per segment |
+| **Content-addressed dedup** | IPFS | BLIP has none |
+| **Tooling / ecosystem** | ZIP / TCP / MIME | BLIP is new |
+| **Spec simplicity** | BLIP SEGMENT (tied with HTTP chunked) | One LP envelope, three integer fields, one optional checksum |
+| **Composability with other attributes** | BLIP SEGMENT | Native COMP/CSUM/ENC stack; per-segment and whole-stream attribute layers don't interfere |
+| **Unbounded segment count** | BLIP SEGMENT | BLIP integers vs ICC's u8 cap (254) or some legacy formats' u16 caps (65535) |
+| **Forward-compat with old parsers** | BLIP SEGMENT | v2 readers skip TYPE=9 cleanly via Length; many other formats panic on unknown types |
+| **Duplicate-on-retransmit safety** | BLIP SEGMENT | Checksum-aware dedup rule (matching VAL coalesces, mismatching errors) is novel as a *spec-level* guarantee |
+
+### Final assessment
+
+The design **is superior** in:
+- The transport-embedded / JPEG-host segmentation niche (no contest — existing solutions are fragmented across three incompatible JPEG sub-protocols).
+- Scope unification: one primitive serving archival + streaming + transport-embedded + disk-files. No other format covers all of this.
+- Composability: per-segment vs whole-stream attributes are independently meaningful, not entangled.
+- Spec simplicity for the value delivered.
+
+The design **is comparable** in:
+- Per-segment integrity (PAR2, MIME's Content-MD5, HLS).
+- Self-describing per-segment metadata (HLS playlist entries, gRPC frames).
+- Order-independence (PAR2, MIME).
+
+The design **is inferior** in:
+- FEC use cases (PAR2 wins; compose at a different layer rather than competing).
+- Random-access media (HLS/DASH win; BLIP requires sequential reassembly).
+- Content-addressed dedup (IPFS wins; different design goal).
+- Tooling ubiquity (everything wins; BLIP is new).
+
+The honest claim is therefore: **superior unification of scope** rather than "superior on every axis." The unification is itself a meaningful contribution because it lets one tool (`blar`) handle JPEG embedding, network transport, multi-file archives, and live streams without inventing four different sub-protocols.
+
 ## License
 
 MIT — see [LICENSE](../LICENSE).
