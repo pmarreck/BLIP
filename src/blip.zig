@@ -221,6 +221,85 @@ pub fn endianOf(buf: []const u8) ?Endian {
     return @enumFromInt((buf[0] >> 6) & 1);
 }
 
+// ---------------------------------------------------------------------------
+// BLIP Spec v1.2 — Scalar sentinels (NIL / TRUE / FALSE)
+//
+// Reserved 2-byte BLIP sentinels at the top of the sentinel range, used to
+// represent nil / boolean values in attribute positions where the surrounding
+// format explicitly permits a scalar sentinel (see SEG attribute in
+// BLIP_CONTAINER_SPEC.md).  Restricted-position rule: callers MUST use
+// decodeScalar() only at positions whose spec allows a sentinel; integer-only
+// positions continue to use decode().
+// ---------------------------------------------------------------------------
+
+/// 2-byte sentinel marking the boolean TRUE value.
+pub const SCALAR_TRUE_BYTES: [2]u8 = .{ 0x81, 0x7C };
+/// 2-byte sentinel marking the boolean FALSE value.
+pub const SCALAR_FALSE_BYTES: [2]u8 = .{ 0x81, 0x7D };
+/// 2-byte sentinel marking the NIL value.
+pub const SCALAR_NIL_BYTES: [2]u8 = .{ 0x81, 0x7E };
+
+/// A BLIP scalar value. Used by decoders/encoders at positions that explicitly
+/// permit nil/bool sentinels (e.g., the N field of the SEG attribute).
+pub const Scalar = union(enum) {
+    integer: u64,
+    nil,
+    boolean: bool,
+};
+
+pub const ScalarResult = struct {
+    scalar: Scalar,
+    bytes_read: usize,
+};
+
+/// Decode a BLIP value at a position that may be NIL, TRUE, FALSE, or an integer.
+/// Other length-prefixed sentinels (0x81 0x00-0x7B and 0x7F) are surfaced as their
+/// integer face value here; their interpretation is the caller's responsibility
+/// (e.g., LP-envelope parsers treat 0x7F as the VAL sigil contextually, not via
+/// this function).
+pub fn decodeScalar(buf: []const u8) Error!ScalarResult {
+    if (buf.len == 0) return Error.UnexpectedEndOfInput;
+    if (buf.len >= 2 and buf[0] == 0x81) {
+        switch (buf[1]) {
+            0x7C => return ScalarResult{ .scalar = .{ .boolean = true }, .bytes_read = 2 },
+            0x7D => return ScalarResult{ .scalar = .{ .boolean = false }, .bytes_read = 2 },
+            0x7E => return ScalarResult{ .scalar = .nil, .bytes_read = 2 },
+            else => {},
+        }
+    }
+    const r = try decode(buf);
+    return ScalarResult{ .scalar = .{ .integer = r.value }, .bytes_read = r.bytes_read };
+}
+
+/// Encode a BLIP scalar value (integer, nil, or boolean) into `buf`.
+/// Returns number of bytes written. nil/bool always emit 2-byte canonical form.
+pub fn encodeScalar(scalar: Scalar, buf: []u8) Error!usize {
+    switch (scalar) {
+        .integer => |v| return encode(v, buf),
+        .nil => {
+            if (buf.len < 2) return Error.BufferTooSmall;
+            buf[0] = SCALAR_NIL_BYTES[0];
+            buf[1] = SCALAR_NIL_BYTES[1];
+            return 2;
+        },
+        .boolean => |b| {
+            if (buf.len < 2) return Error.BufferTooSmall;
+            const bytes = if (b) SCALAR_TRUE_BYTES else SCALAR_FALSE_BYTES;
+            buf[0] = bytes[0];
+            buf[1] = bytes[1];
+            return 2;
+        },
+    }
+}
+
+/// Returns the encoded size of a Scalar without writing anything.
+pub fn encodedScalarSize(scalar: Scalar) usize {
+    return switch (scalar) {
+        .integer => |v| encodedSize(v),
+        .nil, .boolean => 2,
+    };
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -824,6 +903,117 @@ test "encodeBE: same-L values sort correctly (the LE failure case)" {
     const slice_511 = encodeBEToSlice(511, &buf_a);
     const slice_512 = encodeBEToSlice(512, &buf_b);
     try testing.expect(std.mem.order(u8, slice_511, slice_512) == .lt);
+}
+
+// ---------------------------------------------------------------------------
+// BLIP Spec v1.2 — Scalar sentinels (NIL / TRUE / FALSE)
+// ---------------------------------------------------------------------------
+
+test "decodeScalar: NIL sentinel (0x81 0x7E) returns .nil" {
+    const result = try decodeScalar(&[_]u8{ 0x81, 0x7E });
+    try testing.expectEqual(@as(usize, 2), result.bytes_read);
+    try testing.expect(result.scalar == .nil);
+}
+
+test "decodeScalar: FALSE sentinel (0x81 0x7D) returns .boolean = false" {
+    const result = try decodeScalar(&[_]u8{ 0x81, 0x7D });
+    try testing.expectEqual(@as(usize, 2), result.bytes_read);
+    try testing.expectEqual(false, result.scalar.boolean);
+}
+
+test "decodeScalar: TRUE sentinel (0x81 0x7C) returns .boolean = true" {
+    const result = try decodeScalar(&[_]u8{ 0x81, 0x7C });
+    try testing.expectEqual(@as(usize, 2), result.bytes_read);
+    try testing.expectEqual(true, result.scalar.boolean);
+}
+
+test "decodeScalar: immediate integer 42 returns .integer = 42" {
+    const result = try decodeScalar(&[_]u8{0x2A});
+    try testing.expectEqual(@as(usize, 1), result.bytes_read);
+    try testing.expectEqual(@as(u64, 42), result.scalar.integer);
+}
+
+test "decodeScalar: length-prefixed integer 1000 returns .integer = 1000" {
+    const result = try decodeScalar(&[_]u8{ 0x82, 0xE8, 0x03 });
+    try testing.expectEqual(@as(usize, 3), result.bytes_read);
+    try testing.expectEqual(@as(u64, 1000), result.scalar.integer);
+}
+
+test "encodeScalar: NIL produces [0x81, 0x7E]" {
+    var buf: [4]u8 = undefined;
+    const n = try encodeScalar(.nil, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x7E }, buf[0..n]);
+}
+
+test "encodeScalar: FALSE produces [0x81, 0x7D]" {
+    var buf: [4]u8 = undefined;
+    const n = try encodeScalar(.{ .boolean = false }, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x7D }, buf[0..n]);
+}
+
+test "encodeScalar: TRUE produces [0x81, 0x7C]" {
+    var buf: [4]u8 = undefined;
+    const n = try encodeScalar(.{ .boolean = true }, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x7C }, buf[0..n]);
+}
+
+test "encodeScalar: integer 42 produces [0x2A] (immediate)" {
+    var buf: [16]u8 = undefined;
+    const n = try encodeScalar(.{ .integer = 42 }, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{0x2A}, buf[0..n]);
+}
+
+test "encodeScalar: integer 1000 produces [0x82, 0xE8, 0x03]" {
+    var buf: [16]u8 = undefined;
+    const n = try encodeScalar(.{ .integer = 1000 }, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x82, 0xE8, 0x03 }, buf[0..n]);
+}
+
+test "encodeScalar/decodeScalar roundtrip: nil, true, false, integers" {
+    var buf: [16]u8 = undefined;
+    const cases = [_]Scalar{
+        .nil,
+        .{ .boolean = true },
+        .{ .boolean = false },
+        .{ .integer = 0 },
+        .{ .integer = 127 },
+        .{ .integer = 128 },
+        .{ .integer = 1000 },
+        .{ .integer = std.math.maxInt(u32) },
+        .{ .integer = std.math.maxInt(u64) },
+    };
+    for (cases) |s| {
+        const n = try encodeScalar(s, &buf);
+        const r = try decodeScalar(buf[0..n]);
+        try testing.expectEqual(@as(usize, n), r.bytes_read);
+        try testing.expect(std.meta.eql(s, r.scalar));
+    }
+}
+
+test "decodeScalar: integer at scalar-sentinel-adjacent values still decodes as integer" {
+    // 0x81 0x7B is a non-reserved sentinel slot. decodeScalar treats it as an integer
+    // (overlong encoding of 123) only because the spec defers application-level
+    // sentinel handling to higher layers; new SCALAR sentinels are exactly 0x7C/0x7D/0x7E.
+    const r1 = try decodeScalar(&[_]u8{ 0x81, 0x7B });
+    try testing.expectEqual(@as(u64, 123), r1.scalar.integer);
+    const r2 = try decodeScalar(&[_]u8{ 0x81, 0x7F });
+    // 0x7F is the VAL sigil byte; decodeScalar still surfaces it as integer 127 here
+    // because attribute-sigil interpretation is contextual to LP envelope parsing.
+    try testing.expectEqual(@as(u64, 127), r2.scalar.integer);
+}
+
+test "decodeScalar: empty buffer returns UnexpectedEndOfInput" {
+    try testing.expectError(Error.UnexpectedEndOfInput, decodeScalar(&[_]u8{}));
+}
+
+test "encodeScalar: integer encoding matches plain encode" {
+    var buf_a: [16]u8 = undefined;
+    var buf_b: [16]u8 = undefined;
+    for ([_]u64{ 0, 1, 127, 128, 1000, 65535, 1_000_000 }) |v| {
+        const n_scalar = try encodeScalar(.{ .integer = v }, &buf_a);
+        const n_plain = try encode(v, &buf_b);
+        try testing.expectEqualSlices(u8, buf_b[0..n_plain], buf_a[0..n_scalar]);
+    }
 }
 
 // ---------------------------------------------------------------------------

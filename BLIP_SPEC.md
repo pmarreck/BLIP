@@ -3,7 +3,7 @@
 A variable-length integer encoding optimized for CPU-friendly decoding of small values, with a built-in sentinel channel for format extensibility and optional padding support for streaming writers.
 
 **Author:** Peter Marreck
-**Version:** 1.1 (2026-02-23)
+**Version:** 1.2 (2026-04-26)
 
 ## Motivation
 
@@ -221,12 +221,29 @@ Padded BLIPs (P=1) with small values are NOT sentinels — they are legitimate p
 ### Reserved sentinel assignments
 
 ```
-0x81 0x00 = PAD_END    End of a padded BLIP's trailing padding.
-                        Only appears after 0+ padding bytes (0x00)
-                        following a padded BLIP's value.
-0x81 0x01 - 0x81 0x7F  Available for application-defined types,
-                        version markers, section delimiters, etc.
+0x81 0x00            = PAD_END    End of a padded BLIP's trailing padding.
+                                   Only appears after 0+ padding bytes (0x00)
+                                   following a padded BLIP's value.
+0x81 0x01 - 0x81 0x7B            Available for application-defined types,
+                                   version markers, section delimiters, etc.
+0x81 0x7C            = TRUE       Boolean true scalar (v1.2).
+0x81 0x7D            = FALSE      Boolean false scalar (v1.2).
+0x81 0x7E            = NIL        Nil / absent value scalar (v1.2).
+0x81 0x7F                         Reserved by the BLIP Container Format
+                                   (used as the VAL attribute sigil — see
+                                   BLIP_CONTAINER_SPEC.md). Not available
+                                   for new BLIP-level scalar assignments.
 ```
+
+### Scalar Sentinels (v1.2)
+
+The TRUE, FALSE, and NIL sentinels (`0x81 0x7C`, `0x81 0x7D`, `0x81 0x7E`) are reserved as BLIP **scalar values** — drop-in replacements for an integer in any position where the surrounding format explicitly permits them. They are encoded as 2-byte sentinels and consumed by an integer decoder that has been told "this position may also be NIL/TRUE/FALSE."
+
+**Restricted-position rule.** Decoders MUST NOT silently accept TRUE / FALSE / NIL in positions where the containing format expects only an integer. Each format that wants to permit a scalar sentinel at a given position MUST say so explicitly in its own spec text (e.g., "the `N` field of the SEG attribute MAY be NIL, meaning streaming/unknown-total"). A scalar sentinel encountered in an unprivileged position MUST be rejected as malformed input. This keeps homogeneous container element types (e.g., ARRAY-of-int) tight by default.
+
+**No nesting / no growth.** TRUE, FALSE, and NIL are atomic and exactly 2 bytes. They cannot wrap other values, cannot be padded, and cannot be encoded in a longer form. Encoders MUST emit the canonical 2-byte form.
+
+**Why the high bytes.** Placing scalar sentinels at the top of the sentinel range (growing downward from 0x7E) keeps the low end stable for existing attribute sigils and application sentinels in the BLIP Container Format. The 0x7F slot is left untouched because the Container Format uses it as the VAL attribute sigil.
 
 ## Padded BLIPs
 

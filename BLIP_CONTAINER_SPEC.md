@@ -3,8 +3,8 @@
 A recursive, typed, self-indexed binary container format built on [BLIP encoding](BLIP_SPEC.md). Designed as a compact, deterministic, integrity-verified alternative to tar and similar archive formats.
 
 **Author:** Peter Marreck
-**Version:** 2.0 (2026-02-28)
-**Depends on:** BLIP Spec v1.1
+**Version:** 3.0 (2026-04-26)
+**Depends on:** BLIP Spec v1.2
 
 ## Overview
 
@@ -73,6 +73,7 @@ Each attribute is a 2-byte sentinel (`0x81` + sigil byte) followed by attribute-
 | `0x11` | `0x81 0x11` | DECOMP_LEN | Decompressed payload length (required when COMP present) |
 | `0x12` | `0x81 0x12` | CSUM | Checksum algorithm ID |
 | `0x13` | `0x81 0x13` | ENC | Encryption algorithm, KDF, salt, nonce |
+| `0x14` | `0x81 0x14` | SEG | Segmentation metadata: stream ID, segment index, total (see §Segmentation) |
 | `0x20` | `0x81 0x20` | SIG | Digital signature (reserved, future) |
 | `0x7F` | `0x81 0x7F` | VAL | Value/payload marker (required) |
 
@@ -87,6 +88,7 @@ Each attribute is a 2-byte sentinel (`0x81` + sigil byte) followed by attribute-
 | 5 | FILE | File container (ARRAY layout: metadata + content) |
 | 6 | MAP | Unsorted key-value pairs (insertion order) |
 | 7 | DIR | Directory container (sorted 2-char keys) |
+| 9 | SEGMENT | Transport-layer wrapper around a slice of a larger BLIP byte stream (v3 — see §Segmentation) |
 
 ### Compression (COMP Attribute)
 
@@ -188,8 +190,9 @@ Sentinel        Type            Description
 0x81 0x06       MAP             Unsorted key-value pairs, indexed + hashed (insertion order)
 0x81 0x07       DIR             Specialized sorted dictionary (2-char keys: pa, xh, md, mt, etc.)
 0x81 0x08       DATA            Checksummed binary data (raw bytes + embedded xxHash64)
-0x81 0x09 - 0x81 0x0F          Reserved (future container types)
-0x81 0x10 - 0x81 0x7F          Application-defined types
+0x81 0x09       SEGMENT         (v3) Transport-layer segmentation wrapper. Only addressable via the v2+ LP envelope's TYPE attribute — no v1 inline-sentinel form.
+0x81 0x0A - 0x81 0x0F          Reserved (future container types)
+0x81 0x10 - 0x81 0x7F          Application-defined types (v1 only)
 ```
 
 ## Offset Convention
@@ -699,6 +702,150 @@ Note: When reading a padded BLIP index offset, the parser reads the BLIP header,
 ```
 
 For frequent lookups, cache the path→element mapping after first scan.
+
+## Segmentation (v3)
+
+A SEGMENT container wraps a contiguous slice of a larger BLIP byte stream that has been split across N transport units. Multiple SEGMENT containers, when reassembled in order, produce the original inner container's wire encoding.
+
+### Motivation
+
+Some host environments cap individual record sizes — JPEG APP markers cap at 64 KiB, UDP datagrams at 64 KiB, multipart uploads at chunk-defined limits. Without a BLIP-level segmentation primitive, every host adapter has to invent its own reassembly protocol. JPEG alone has three incompatible patterns (EXIF, ICC, XMP), each with different bit widths, signatures, and failure modes. SEGMENT provides one canonical mechanism every host adapter can reuse.
+
+### Wire format
+
+A SEGMENT container uses the standard v2 LP envelope:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Length:    BLIP(total)                                           │
+│ Attributes (sorted by sigil):                                    │
+│   TYPE:    0x81 0x01 BLIP(9)               SEGMENT type          │
+│   COMP:    0x81 0x10 BLIP(comp_id)         optional, per-segment │
+│   CSUM:    0x81 0x12 BLIP(csum_id)         optional, per-segment │
+│   ENC:     0x81 0x13 ...                   optional, per-segment │
+│   SEG:     0x81 0x14 BLIP(I) BLIP(M) BLIP(N | NIL)               │
+│   VAL:     0x81 0x7F <payload slice>                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### SEG attribute payload
+
+The SEG attribute payload is exactly **three** BLIP scalar values, in order:
+
+| Field | Type | Semantics |
+|-------|------|-----------|
+| `I` | BLIP integer (u64 domain) | Stream ID. `0` is reserved with the meaning "default / unnamed stream" — use when a host carries only one logical BLIP payload. `I > 0` is caller-chosen. Uniqueness scope: one host container. |
+| `M` | BLIP integer (u64 domain) | 0-based index of this segment within stream `I`. |
+| `N` | BLIP integer **or** NIL scalar (`0x81 0x7E`) | Total segment count in stream `I`, or **NIL** for streaming / unknown-total. |
+
+`M` is **0-based** to align with array and byte indexing.
+
+`N = NIL` (the BLIP scalar sentinel from BLIP Spec §Scalar Sentinels) signals that the stream is being emitted incrementally and the total is not known until the host signals end-of-stream. `N = 0` is **not** a valid streaming sentinel — if a SEGMENT exists, then either `N >= 1` or `N = NIL`.
+
+`N = 1` (single-segment stream) is legal; useful for hosts that wrap every payload in SEGMENT for pipeline uniformity, even when no splitting was needed.
+
+The SEG attribute payload is a **fixed arity** — always three values. The N slot uses the NIL scalar from BLIP Spec v1.2 to express "unknown" without changing the number of fields.
+
+### Reassembly algorithm
+
+```
+function reassemble(segments: list[SEGMENT], expected_I: int) -> bytes:
+    # 1. Filter by stream ID
+    mine = [s for s in segments if s.I == expected_I]
+
+    # 2. Verify per-segment CSUM if present; drop segments that fail
+    survivors = []
+    for s in mine:
+        if s.has_csum and not verify_csum(s):
+            continue                          # corrupt copy; drop silently
+        survivors.append(s)
+    mine = survivors
+
+    # 3. Check totals (N must be consistent across all members)
+    N = mine[0].N                              # may be a number or NIL
+    if any(s.N != N for s in mine):
+        error InconsistentTotal(I)
+
+    # 4. Coalesce duplicate M
+    by_M: dict[int, list[SEGMENT]] = {}
+    for s in mine:
+        by_M.setdefault(s.M, []).append(s)
+    deduped = []
+    for M, candidates in by_M.items():
+        if len(candidates) == 1:
+            deduped.append(candidates[0])
+        else:
+            ref = candidates[0].VAL
+            if all(c.VAL == ref for c in candidates):
+                deduped.append(candidates[0])  # safe transport retransmit
+            else:
+                error DuplicateSegmentValueMismatch(I, M)
+    mine = deduped
+
+    # 5. For numeric N, verify count and density
+    if N is not NIL:
+        if len(mine) != N:
+            seen = {s.M for s in mine}
+            error MissingSegments(I, set(range(N)) - seen)
+        mine.sort(key=lambda s: s.M)
+        for i, s in enumerate(mine):
+            if s.M != i:
+                error SequenceGap(I, expected=i, got=s.M)
+    else:
+        mine.sort(key=lambda s: s.M)           # streaming: missing detection N/A
+
+    # 6. Concatenate VAL payloads
+    return b"".join(s.VAL for s in mine)
+```
+
+**Duplicate-M rule.** If two segments share `(I, M)`:
+1. Each must verify against its own CSUM (if present); failing copies are silently dropped.
+2. Among survivors, their VAL payloads MUST agree byte-for-byte.
+3. If they agree, accept any single copy.
+4. If they disagree, error `DuplicateSegmentValueMismatch`.
+
+This makes duplicate-M safe in transport scenarios with retransmits — the only error case is genuinely conflicting good data.
+
+### Streaming mode (N = NIL)
+
+- The producer MAY emit segments incrementally without knowing the eventual total.
+- The consumer accepts segments as they arrive until the host signals end-of-stream.
+- **Missing-segment detection is not possible in streaming mode** — applications that need loss detection MUST use a numeric `N` (the producer can buffer or pre-count if necessary).
+- All other rules (sort-by-M, dedup-by-checksum) still apply.
+
+### Nested segmentation
+
+If the reassembled VAL is itself a SEGMENT container (i.e., the reassembled bytes parse as a BLIP container with TYPE=9), the consumer parses it again recursively. SEGMENT-wrapping-SEGMENT is legal — useful for multi-hop transport where each hop adds its own framing layer.
+
+### Attribute interaction
+
+| Attribute | Meaning when on SEGMENT | Notes |
+|-----------|-------------------------|-------|
+| COMP | Compresses **this segment's** VAL independently | Rarely useful — per-segment compression beats nothing; usually the caller should compress the inner container instead for better ratio. |
+| CSUM | Integrity check over **this segment's** VAL | RECOMMENDED — enables precise corruption reporting and the duplicate-M dedup rule. |
+| ENC | AEAD encryption of **this segment's** VAL | Useful for transport-layer auth; each segment gets its own nonce/tag. |
+| SIG (future) | Per-segment signature | Reserved. |
+
+Attributes on the **inner reassembled container** are independent of per-segment attributes. A typical encrypted segmented archive looks like:
+
+- Each SEGMENT carries its own optional CSUM (xxHash64) for per-segment corruption detection.
+- The inner container (typically an ARRAY) carries COMP + ENC + CSUM (BLAKE3-128) for whole-archive compression, encryption, and integrity.
+
+These two attribute layers do not interfere.
+
+### Whole-stream vs per-segment checksums
+
+If the inner reassembled container also carries a CSUM (e.g., BLAKE3-128 over its full payload), that whole-stream checksum is the canonical authenticator of the reassembled bytes. Per-segment CSUMs are a transport-layer concern — they catch corruption on a single segment and enable the duplicate-M dedup rule, but a successful full reassembly is independently authenticated by the inner CSUM. The two checksums are independent and both useful.
+
+The spec does not require any algebraic relationship between per-segment and whole-stream checksums. Implementations MAY use BLAKE3 in tree mode at both layers so the whole-stream BLAKE3 is exactly computable from per-segment BLAKE3s, but this is an implementation choice — not a normative requirement.
+
+### Forward compatibility with v2 parsers
+
+A pure v2 parser encountering a SEGMENT container (TYPE=9) reads its Length correctly via the standard LP envelope and can SKIP it cleanly. It cannot reassemble the stream, but it will not crash, misparse, or follow any pointer into the segment. Applications that emit SEGMENT containers SHOULD include a v3 marker in surrounding metadata so v2 readers can produce a useful "segmented data, requires v3 parser" diagnostic.
+
+### Implementation note: miniblar
+
+The reference miniblar parser is **not required** to support SEGMENT reassembly. miniblar MUST recognize TYPE=9 sufficiently to skip the container cleanly via its Length, but reassembly is reserved to the full blar implementation. Streaming writers that target miniblar consumers SHOULD NOT use SEGMENT.
 
 ## Streaming Writes
 
