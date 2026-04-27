@@ -1049,6 +1049,7 @@ pub const nifti_mod = @import("nifti.zig");
 pub const dicom_mod = @import("dicom.zig");
 pub const expansion_mod = @import("expansion.zig");
 pub const streaming_mod = @import("streaming.zig");
+pub const segmentation_mod = @import("segmentation.zig");
 pub const fits_mod = @import("fits.zig");
 pub const aiff_mod = @import("aiff.zig");
 
@@ -1097,4 +1098,5 @@ test {
     _ = @import("dicom.zig");
     _ = @import("expansion.zig");
     _ = @import("streaming.zig");
+    _ = @import("segmentation.zig");
 }
