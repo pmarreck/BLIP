@@ -379,6 +379,19 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                 enc_nonce = nonce_buf;
                 pos += nonce_len;
             },
+            .seg => {
+                // SEG payload is exactly 3 BLIP scalars: I, M, N (where N may be NIL).
+                // Skip past all three; the actual values are parsed by Layer-3
+                // segmentation reassembly code, not the LP-walk here.
+                inline for (0..3) |_| {
+                    const r = blip.decodeScalar(container_buf[pos..]) catch |e| switch (e) {
+                        error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
+                        error.Overflow => return ContainerError.Overflow,
+                        error.BufferTooSmall => return ContainerError.BufferTooSmall,
+                    };
+                    pos += r.bytes_read;
+                }
+            },
             .sig => {
                 // Future: skip sig bytes. For now, we don't know the length
                 // so we can't parse past it. Return error.

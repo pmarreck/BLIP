@@ -20,6 +20,8 @@ pub const AttributeSigil = enum(u7) {
     csum = 0x12,
     /// Encryption algorithm ID
     enc = 0x13,
+    /// Segmentation metadata (v3): stream ID, segment index, total (or NIL)
+    seg = 0x14,
     /// Digital signature (future)
     sig = 0x20,
     /// Value/payload (required, always last attribute)
@@ -37,6 +39,8 @@ pub const ContainerTypeId = enum(u7) {
     file = 5,
     map = 6,
     dir = 7,
+    /// Transport-layer wrapper around a slice of a larger BLIP byte stream (v3)
+    segment = 9,
 };
 
 /// Compression algorithm IDs — the value after a COMP attribute sigil.
@@ -228,5 +232,32 @@ test "authTagLength returns correct sizes" {
 test "encNonceLength returns correct sizes" {
     try testing.expectEqual(@as(u8, 12), encNonceLength(.aes_256_gcm));
     try testing.expectEqual(@as(u8, 12), encNonceLength(.chacha20_poly1305));
+}
+
+// ---------------------------------------------------------------------------
+// v3: SEGMENT type + SEG attribute sigil
+// ---------------------------------------------------------------------------
+
+test "SEG attribute sigil is 0x14" {
+    try testing.expectEqual(@as(u7, 0x14), @intFromEnum(AttributeSigil.seg));
+}
+
+test "SEG sentinel is 0x81 0x14" {
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x14 }, &attrSentinel(.seg));
+}
+
+test "SEG sigil sort-order: ENC < SEG < SIG < VAL" {
+    try testing.expect(@intFromEnum(AttributeSigil.enc) < @intFromEnum(AttributeSigil.seg));
+    try testing.expect(@intFromEnum(AttributeSigil.seg) < @intFromEnum(AttributeSigil.sig));
+    try testing.expect(@intFromEnum(AttributeSigil.sig) < @intFromEnum(AttributeSigil.val));
+}
+
+test "parseAttrSigil round-trips SEG sigil" {
+    const sentinel = attrSentinel(.seg);
+    try testing.expectEqual(AttributeSigil.seg, parseAttrSigil(&sentinel).?);
+}
+
+test "ContainerTypeId.segment is 9" {
+    try testing.expectEqual(@as(u7, 9), @intFromEnum(ContainerTypeId.segment));
 }
 

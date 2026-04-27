@@ -153,7 +153,7 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
                         const val_view = try container.parseLPHeader(val_container);
                         current = current[val_offset..][0..@intCast(val_view.total_length)];
                     },
-                    .utf8, .data => return ContainerError.InvalidContainerType,
+                    .utf8, .data, .segment => return ContainerError.InvalidContainerType,
                 }
             },
             .key => |key_bytes| {
@@ -167,7 +167,7 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
                         const val_view = try container.parseLPHeader(val_container);
                         current = current[val_offset..][0..@intCast(val_view.total_length)];
                     },
-                    .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
+                    .array, .file, .utf8, .data, .segment => return ContainerError.InvalidContainerType,
                 }
             },
         }
@@ -194,7 +194,7 @@ pub fn containerCount(buf: []const u8) ContainerError!u64 {
             const reader = try dict_mod.DictReader.init(buf[0..@intCast(view.total_length)]);
             return reader.pairCount();
         },
-        .utf8, .data => return ContainerError.InvalidContainerType,
+        .utf8, .data, .segment => return ContainerError.InvalidContainerType,
     }
 }
 
@@ -221,7 +221,7 @@ pub fn containerKeyAt(buf: []const u8, index: u64) ContainerError![]const u8 {
             const key_container = try reader.keyAt(index);
             return dict_mod.extractKeyBytes(key_container);
         },
-        .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
+        .array, .file, .utf8, .data, .segment => return ContainerError.InvalidContainerType,
     }
 }
 
@@ -233,7 +233,7 @@ pub fn containerKeyCount(buf: []const u8) ContainerError!u64 {
             const reader = try dict_mod.DictReader.init(buf[0..@intCast(view.total_length)]);
             return reader.pairCount();
         },
-        .array, .file, .utf8, .data => return ContainerError.InvalidContainerType,
+        .array, .file, .utf8, .data, .segment => return ContainerError.InvalidContainerType,
     }
 }
 
@@ -248,6 +248,7 @@ pub fn containerTypeName(buf: []const u8) ContainerError![]const u8 {
         .file => "FILE",
         .map => "MAP",
         .dir => "DIR",
+        .segment => "SEGMENT",
     };
 }
 
@@ -281,7 +282,7 @@ pub fn extractPayload(buf: []const u8) ContainerError![]const u8 {
     const view = try container.parseLPHeader(buf);
     switch (view.type_id) {
         .utf8, .data => return view.payloadSlice(),
-        .array, .dict, .file, .map, .dir => return ContainerError.InvalidContainerType,
+        .array, .dict, .file, .map, .dir, .segment => return ContainerError.InvalidContainerType,
     }
 }
 
@@ -587,6 +588,10 @@ fn handleRawMode(
             // Container type: output raw container bytes
             try stdout_list.appendSlice(allocator, target);
         },
+        .segment => {
+            // SEGMENT containers are transport-layer wrappers; raw mode emits them as-is.
+            try stdout_list.appendSlice(allocator, target);
+        },
     }
 }
 
@@ -597,7 +602,7 @@ fn handleHexMode(
     stdout_list: *std.ArrayListUnmanaged(u8),
 ) !void {
     switch (ctype) {
-        .utf8, .data => {
+        .utf8, .data, .segment => {
             const payload = try extractPayload(target);
             const hex = try formatHex(allocator, payload);
             defer allocator.free(hex);
@@ -711,6 +716,20 @@ fn handleDefaultMode(
                 try stdout_list.appendSlice(allocator, s);
             } else {
                 const s = try std.fmt.allocPrint(allocator, "{s} ({d} pairs)\n", .{ name, count });
+                defer allocator.free(s);
+                try stdout_list.appendSlice(allocator, s);
+            }
+        },
+        .segment => {
+            // SEGMENT containers are transport-layer wrappers; default display
+            // just identifies them — full reassembly is the caller's job.
+            const name = containerTypeName(target) catch "SEGMENT";
+            if (flags.json) {
+                const s = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\"}}\n", .{name});
+                defer allocator.free(s);
+                try stdout_list.appendSlice(allocator, s);
+            } else {
+                const s = try std.fmt.allocPrint(allocator, "{s} (transport segment)\n", .{name});
                 defer allocator.free(s);
                 try stdout_list.appendSlice(allocator, s);
             }
