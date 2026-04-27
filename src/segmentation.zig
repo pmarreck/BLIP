@@ -308,6 +308,44 @@ pub fn reassemble(
     return out;
 }
 
+/// Split `raw` bytes into N SEGMENT containers, each carrying at most
+/// `max_payload` bytes of VAL.  Caller owns the returned slice of slices and
+/// each inner slice (free both individually).
+/// `stream_id` is typically 0 for single-stream archives.
+/// Empty input still produces 1 SEGMENT (with empty VAL, N=1) so the
+/// reassembly invariant — at least one segment per archive — holds.
+pub fn chunkBytes(
+    allocator: Allocator,
+    raw: []const u8,
+    max_payload: usize,
+    stream_id: u64,
+    csum_id: ?ct.ChecksumId,
+) SegError![][]u8 {
+    if (max_payload == 0) return error.InvalidSegment;
+    const N: usize = if (raw.len == 0) 1 else (raw.len + max_payload - 1) / max_payload;
+    const segments = try allocator.alloc([]u8, N);
+    var emitted: usize = 0;
+    errdefer {
+        for (segments[0..emitted]) |s| allocator.free(s);
+        allocator.free(segments);
+    }
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const start = i * max_payload;
+        const end = @min(start + max_payload, raw.len);
+        const slice = if (raw.len == 0) raw[0..0] else raw[start..end];
+        segments[i] = try serializeSegment(allocator, stream_id, i, N, slice, csum_id);
+        emitted += 1;
+    }
+    return segments;
+}
+
+/// Free a slice-of-slices returned by `chunkBytes`.
+pub fn freeSegmentList(allocator: Allocator, segments: [][]u8) void {
+    for (segments) |s| allocator.free(s);
+    allocator.free(segments);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -506,4 +544,60 @@ test "parseSegment: rejects non-SEGMENT containers with NotASegment" {
     @memcpy(buf[pos..][0..3], "abc");
     pos += 3;
     try testing.expectError(SegError.NotASegment, parseSegment(buf[0..pos]));
+}
+
+test "chunkBytes: 100 bytes max=30 -> 4 segments" {
+    var raw: [100]u8 = undefined;
+    for (raw[0..], 0..) |*b, i| b.* = @intCast(i);
+    const segs = try chunkBytes(testing.allocator, &raw, 30, 0, null);
+    defer freeSegmentList(testing.allocator, segs);
+    try testing.expectEqual(@as(usize, 4), segs.len);
+    // Verify each segment carries the expected slice
+    const sizes = [_]usize{ 30, 30, 30, 10 };
+    for (segs, 0..) |seg, i| {
+        const info = try parseSegment(seg);
+        try testing.expectEqual(@as(u64, 0), info.stream_id);
+        try testing.expectEqual(@as(u64, i), info.seg_index);
+        try testing.expectEqual(@as(?u64, 4), info.total);
+        try testing.expectEqual(sizes[i], info.val.len);
+    }
+}
+
+test "chunkBytes + reassemble = original bytes" {
+    var raw: [1024]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    rng.fill(&raw);
+    const segs = try chunkBytes(testing.allocator, &raw, 100, 0, .xxhash64);
+    defer freeSegmentList(testing.allocator, segs);
+    try testing.expectEqual(@as(usize, 11), segs.len); // ceil(1024/100)
+
+    // Cast [][]u8 to []const []const u8 for reassemble's signature.
+    var const_segs = try testing.allocator.alloc([]const u8, segs.len);
+    defer testing.allocator.free(const_segs);
+    for (segs, 0..) |s, i| const_segs[i] = s;
+
+    const out = try reassemble(testing.allocator, const_segs, 0);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u8, &raw, out);
+}
+
+test "chunkBytes: empty input produces 1 empty segment with N=1" {
+    const segs = try chunkBytes(testing.allocator, &.{}, 100, 0, null);
+    defer freeSegmentList(testing.allocator, segs);
+    try testing.expectEqual(@as(usize, 1), segs.len);
+    const info = try parseSegment(segs[0]);
+    try testing.expectEqual(@as(?u64, 1), info.total);
+    try testing.expectEqual(@as(usize, 0), info.val.len);
+}
+
+test "chunkBytes: max_payload = 0 -> InvalidSegment" {
+    try testing.expectError(SegError.InvalidSegment, chunkBytes(testing.allocator, "x", 0, 0, null));
+}
+
+test "chunkBytes: exact multiple does not produce empty trailing segment" {
+    var raw: [60]u8 = undefined;
+    @memset(&raw, 0xAB);
+    const segs = try chunkBytes(testing.allocator, &raw, 30, 0, null);
+    defer freeSegmentList(testing.allocator, segs);
+    try testing.expectEqual(@as(usize, 2), segs.len);
 }
