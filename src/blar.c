@@ -46,6 +46,11 @@ static int cmd_explode(int argc, char **argv);
 static int cmd_implode(int argc, char **argv);
 static int cmd_segment(int argc, char **argv);
 static int cmd_join(int argc, char **argv);
+static int parse_size_arg(const char *s, size_t *out);
+static int min_decimal_width(uint64_t n);
+static int write_archive_or_segments(const char *out_path,
+                                      const uint8_t *archive_buf, size_t archive_len,
+                                      size_t segment_size, uint64_t segment_count);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -180,7 +185,7 @@ static void print_usage(FILE *out) {
         "For flat file-only archives, use 'miniblar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-z [algo]] [-e [cipher]] [-o <archive>] <files/dirs...>  Create archive\n"
+        "  create [-z [algo]] [-e [cipher]] [-o <archive>] [--segment-size=SIZE|--segment-count=N] <files/dirs...>  Create\n"
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
@@ -293,6 +298,8 @@ static int cmd_create(int argc, char **argv) {
     bool no_expand = false;     /* --no-expand-containers */
     bool use_streaming = false; /* --streaming */
     bool expand_all = false;    /* --expand-all-zips */
+    size_t segment_size = 0;    /* --segment-size=SIZE (0 = disabled) */
+    uint64_t segment_count = 0; /* --segment-count=N   (0 = disabled) */
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
@@ -425,7 +432,32 @@ static int cmd_create(int argc, char **argv) {
             for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
             argc -= 2;
             i--;
+        } else if (strncmp(argv[i], "--segment-size=", 15) == 0) {
+            if (parse_size_arg(argv[i] + 15, &segment_size) != 0 || segment_size == 0) {
+                fprintf(stderr, "blar: create: invalid --segment-size '%s'\n", argv[i] + 15);
+                return EXIT_USAGE;
+            }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (strncmp(argv[i], "--segment-count=", 16) == 0) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(argv[i] + 16, &end, 10);
+            if (errno || end == argv[i] + 16 || *end != '\0' || v == 0) {
+                fprintf(stderr, "blar: create: invalid --segment-count '%s'\n", argv[i] + 16);
+                return EXIT_USAGE;
+            }
+            segment_count = (uint64_t)v;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
         }
+    }
+
+    if (segment_size > 0 && segment_count > 0) {
+        fprintf(stderr, "blar: create: --segment-size and --segment-count are mutually exclusive\n");
+        return EXIT_USAGE;
     }
 
     /* If no -o was given, check if first arg is a non-existent path
@@ -584,15 +616,18 @@ static int cmd_create(int argc, char **argv) {
             return EXIT_IO;
         }
 
-        /* Write to output */
-        if (!write_file(out_path, archive_buf, archive_len)) {
-            fprintf(stderr, "blar: create: cannot write '%s': %s\n", out_path, strerror(errno));
+        /* Write to output (possibly segmented). */
+        int wrc = write_archive_or_segments(out_path, archive_buf, archive_len,
+                                             segment_size, segment_count);
+        if (wrc != EXIT_OK) {
             blip_free(archive_buf, archive_len);
-            return EXIT_IO;
+            return wrc;
         }
 
-        fprintf(stderr, "Created %s (%s, streaming mode)\n", out_path,
-                format_size(archive_len, (char[32]){0}, 32));
+        if (segment_size == 0 && segment_count == 0) {
+            fprintf(stderr, "Created %s (%s, streaming mode)\n", out_path,
+                    format_size(archive_len, (char[32]){0}, 32));
+        }
         blip_free(archive_buf, archive_len);
         return EXIT_OK;
     }
@@ -708,8 +743,17 @@ static int cmd_create(int argc, char **argv) {
         progrez_update(progress, 0, 0);
     }
 
-    if (!(progress ? write_file_progress(out_path, archive_buf, archive_len, write_progress_cb, progress)
-                   : write_file(out_path, archive_buf, archive_len))) {
+    if (segment_size > 0 || segment_count > 0) {
+        /* Segmentation requested -- progress bar finishes here, then chunk+write. */
+        if (progress) { progrez_finish(progress); progrez_destroy(progress); progress = NULL; }
+        int wrc = write_archive_or_segments(out_path, archive_buf, archive_len,
+                                             segment_size, segment_count);
+        if (wrc != EXIT_OK) {
+            blip_free(archive_buf, archive_len);
+            return wrc;
+        }
+    } else if (!(progress ? write_file_progress(out_path, archive_buf, archive_len, write_progress_cb, progress)
+                          : write_file(out_path, archive_buf, archive_len))) {
         if (progress) { progrez_finish(progress); progrez_destroy(progress); }
         fprintf(stderr, "blar: create: cannot write '%s': %s\n",
                 out_path, strerror(errno));
@@ -719,7 +763,9 @@ static int cmd_create(int argc, char **argv) {
 
     if (progress) { progrez_finish(progress); progrez_destroy(progress); }
     char size_buf[32];
-    if (original_bytes > 0 && archive_len < original_bytes) {
+    if (segment_size > 0 || segment_count > 0) {
+        /* write_archive_or_segments already printed a per-segment summary. */
+    } else if (original_bytes > 0 && archive_len < original_bytes) {
         char orig_buf[32];
         double pct = (double)archive_len / (double)original_bytes * 100.0;
         fprintf(stderr, "Created %s (%s -> %s, %.2f%% of original)\n", out_path,
@@ -2889,6 +2935,67 @@ static int min_decimal_width(uint64_t n) {
     int w = 0;
     while (n > 0) { w++; n /= 10; }
     return w;
+}
+
+/* Write a finalized archive buffer either as one file or as N segment files.
+ * If both segment_size and segment_count are 0, behaves identically to write_file. */
+static int write_archive_or_segments(const char *out_path,
+                                      const uint8_t *archive_buf, size_t archive_len,
+                                      size_t segment_size, uint64_t segment_count) {
+    if (segment_size == 0 && segment_count == 0) {
+        if (!write_file(out_path, archive_buf, archive_len)) {
+            fprintf(stderr, "blar: create: cannot write '%s': %s\n",
+                    out_path, strerror(errno));
+            return EXIT_IO;
+        }
+        return EXIT_OK;
+    }
+
+    size_t max_payload = segment_size;
+    if (segment_count > 0) {
+        if (archive_len == 0) {
+            max_payload = 1;
+        } else {
+            max_payload = (archive_len + segment_count - 1) / (size_t)segment_count;
+            if (max_payload == 0) max_payload = 1;
+        }
+    }
+
+    blip_segment_t *segs = NULL;
+    size_t seg_count = 0;
+    int32_t rc = blip_segment_chunk(archive_buf, archive_len, max_payload,
+                                     /* stream_id */ 0,
+                                     /* csum_id   */ 2 /* xxhash64 */,
+                                     &segs, &seg_count);
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: create: segmentation failed: %s\n", blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    int width = min_decimal_width((uint64_t)seg_count);
+    size_t out_path_cap = strlen(out_path) + 64;
+    char *seg_path = (char *)malloc(out_path_cap);
+    if (!seg_path) {
+        blip_segment_array_free(segs, seg_count);
+        fprintf(stderr, "blar: create: out of memory\n");
+        return EXIT_IO;
+    }
+    int err = 0;
+    for (size_t i = 0; i < seg_count; i++) {
+        snprintf(seg_path, out_path_cap, "%s.%0*zu-of-%0*zu.seg",
+                 out_path, width, (size_t)(i + 1), width, seg_count);
+        if (!write_file(seg_path, segs[i].data, segs[i].len)) {
+            fprintf(stderr, "blar: create: cannot write '%s': %s\n",
+                    seg_path, strerror(errno));
+            err = 1;
+            break;
+        }
+    }
+    fprintf(stderr, "Created %zu segment files: %s.{1..%zu}-of-%zu.seg\n",
+            seg_count, out_path, seg_count, seg_count);
+    free(seg_path);
+    blip_segment_array_free(segs, seg_count);
+    return err ? EXIT_IO : EXIT_OK;
 }
 
 /* Parse a path that ends in ".{M}-of-{N}.seg" into its components.

@@ -254,6 +254,77 @@ else
   fail "header-scan fallback failed (renamed segments not detected)"
 fi
 
+# ----- 13. blar create --segment-size produces .seg files (Layer 5b) -----
+SEG_DIR_11="$TMPDIR_TEST/seg11"
+mkdir -p "$SEG_DIR_11/src"
+echo "alpha file" > "$SEG_DIR_11/src/a.txt"
+echo "beta file"  > "$SEG_DIR_11/src/b.txt"
+dd if=/dev/urandom of="$SEG_DIR_11/src/big.bin" bs=4096 count=4 2>/dev/null
+
+if "$BLAR" create "$SEG_DIR_11/src" -o "$SEG_DIR_11/out.blar" --segment-size=2048 >/dev/null 2>&1; then
+  pass "blar create --segment-size exits 0"
+else
+  fail "blar create --segment-size did not exit 0"
+fi
+
+# Bare archive should NOT exist (only segments)
+if [[ ! -f "$SEG_DIR_11/out.blar" ]]; then
+  pass "create --segment-size does not write the bare archive file"
+else
+  fail "create --segment-size also wrote the bare archive (should write only .seg)"
+fi
+
+# At least one .seg file should exist
+seg_files=$(ls "$SEG_DIR_11"/out.blar.*.seg 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$seg_files" -ge 1 ]]; then
+  pass "create --segment-size wrote $seg_files .seg files"
+else
+  fail "create --segment-size produced no .seg files"
+fi
+
+# Joining the segments and listing the result should yield a working archive
+"$BLAR" join "$SEG_DIR_11"/out.blar.*-of-*.seg -o "$SEG_DIR_11/rejoined.blar" >/dev/null 2>&1 || \
+  "$BLAR" join $(ls "$SEG_DIR_11"/out.blar.*-of-*.seg | head -1) -o "$SEG_DIR_11/rejoined.blar" >/dev/null 2>&1
+if [[ -f "$SEG_DIR_11/rejoined.blar" ]] && "$BLAR" list "$SEG_DIR_11/rejoined.blar" >/dev/null 2>&1; then
+  pass "rejoined archive is listable"
+else
+  fail "rejoined archive could not be listed"
+fi
+
+# Extract the rejoined archive and verify a known file matches.
+# (Archive paths reflect the absolute input path; locate by basename.)
+EXTRACT_DIR_11="$SEG_DIR_11/extracted"
+mkdir -p "$EXTRACT_DIR_11"
+"$BLAR" extract "$SEG_DIR_11/rejoined.blar" -C "$EXTRACT_DIR_11" >/dev/null 2>&1
+extracted_a=$(find "$EXTRACT_DIR_11" -type f -name a.txt | head -1)
+if [[ -n "$extracted_a" ]] && cmp -s "$SEG_DIR_11/src/a.txt" "$extracted_a"; then
+  pass "extracted file from rejoined archive matches original"
+else
+  fail "extracted file from rejoined archive does not match"
+fi
+
+# ----- 14. blar create --segment-count produces exactly N .seg files -----
+SEG_DIR_12="$TMPDIR_TEST/seg12"
+mkdir -p "$SEG_DIR_12/src"
+dd if=/dev/urandom of="$SEG_DIR_12/src/data.bin" bs=2048 count=5 2>/dev/null
+
+"$BLAR" create "$SEG_DIR_12/src" -o "$SEG_DIR_12/out.blar" --segment-count=3 >/dev/null 2>&1
+seg_count_actual=$(ls "$SEG_DIR_12"/out.blar.*-of-3.seg 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$seg_count_actual" == "3" ]]; then
+  pass "create --segment-count=3 produces exactly 3 segments"
+else
+  fail "create --segment-count=3 produced $seg_count_actual segments"
+fi
+
+# ----- 15. create rejects --segment-size combined with --segment-count -----
+SEG_DIR_13="$TMPDIR_TEST/seg13"
+mkdir -p "$SEG_DIR_13/src"
+echo "x" > "$SEG_DIR_13/src/a.txt"
+if "$BLAR" create "$SEG_DIR_13/src" -o "$SEG_DIR_13/out.blar" --segment-size=128 --segment-count=4 >/dev/null 2>&1; then
+  fail "create accepted both --segment-size AND --segment-count"
+else
+  pass "create rejects --segment-size combined with --segment-count"
+fi
 # =============================================================================
 # Summary
 # =============================================================================
