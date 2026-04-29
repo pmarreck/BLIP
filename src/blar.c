@@ -50,7 +50,8 @@ static int parse_size_arg(const char *s, size_t *out);
 static int min_decimal_width(uint64_t n);
 static int write_archive_or_segments(const char *out_path,
                                       const uint8_t *archive_buf, size_t archive_len,
-                                      size_t segment_size, uint64_t segment_count);
+                                      size_t segment_size, uint64_t segment_count,
+                                      bool emit_manifest);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -185,7 +186,7 @@ static void print_usage(FILE *out) {
         "For flat file-only archives, use 'miniblar'.\n"
         "\n"
         "Commands:\n"
-        "  create [-z [algo]] [-e [cipher]] [-o <archive>] [--segment-size=SIZE|--segment-count=N] <files/dirs...>  Create\n"
+        "  create [-z [algo]] [-e [cipher]] [-o <archive>] [--segment-size=SIZE|--segment-count=N] [--manifest] <files/dirs...>  Create\n"
         "  list <archive>                         List entries in archive\n"
         "  extract <archive> [-C <dir>]           Extract archive contents\n"
         "  verify <archive>                       Verify archive integrity\n"
@@ -300,6 +301,7 @@ static int cmd_create(int argc, char **argv) {
     bool expand_all = false;    /* --expand-all-zips */
     size_t segment_size = 0;    /* --segment-size=SIZE (0 = disabled) */
     uint64_t segment_count = 0; /* --segment-count=N   (0 = disabled) */
+    bool emit_manifest = false; /* --manifest: emit `<out>.SUMS` next to segments */
 
     if (argc < 1) {
         fprintf(stderr, "blar: create: missing arguments\n");
@@ -452,11 +454,20 @@ static int cmd_create(int argc, char **argv) {
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--;
             i--;
+        } else if (strcmp(argv[i], "--manifest") == 0) {
+            emit_manifest = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
         }
     }
 
     if (segment_size > 0 && segment_count > 0) {
         fprintf(stderr, "blar: create: --segment-size and --segment-count are mutually exclusive\n");
+        return EXIT_USAGE;
+    }
+    if (emit_manifest && segment_size == 0 && segment_count == 0) {
+        fprintf(stderr, "blar: create: --manifest requires --segment-size or --segment-count\n");
         return EXIT_USAGE;
     }
 
@@ -618,7 +629,7 @@ static int cmd_create(int argc, char **argv) {
 
         /* Write to output (possibly segmented). */
         int wrc = write_archive_or_segments(out_path, archive_buf, archive_len,
-                                             segment_size, segment_count);
+                                             segment_size, segment_count, emit_manifest);
         if (wrc != EXIT_OK) {
             blip_free(archive_buf, archive_len);
             return wrc;
@@ -747,7 +758,7 @@ static int cmd_create(int argc, char **argv) {
         /* Segmentation requested -- progress bar finishes here, then chunk+write. */
         if (progress) { progrez_finish(progress); progrez_destroy(progress); progress = NULL; }
         int wrc = write_archive_or_segments(out_path, archive_buf, archive_len,
-                                             segment_size, segment_count);
+                                             segment_size, segment_count, emit_manifest);
         if (wrc != EXIT_OK) {
             blip_free(archive_buf, archive_len);
             return wrc;
@@ -2941,7 +2952,8 @@ static int min_decimal_width(uint64_t n) {
  * If both segment_size and segment_count are 0, behaves identically to write_file. */
 static int write_archive_or_segments(const char *out_path,
                                       const uint8_t *archive_buf, size_t archive_len,
-                                      size_t segment_size, uint64_t segment_count) {
+                                      size_t segment_size, uint64_t segment_count,
+                                      bool emit_manifest) {
     if (segment_size == 0 && segment_count == 0) {
         if (!write_file(out_path, archive_buf, archive_len)) {
             fprintf(stderr, "blar: create: cannot write '%s': %s\n",
@@ -2980,7 +2992,38 @@ static int write_archive_or_segments(const char *out_path,
         fprintf(stderr, "blar: create: out of memory\n");
         return EXIT_IO;
     }
+
+    /* Optionally open manifest file (xxhsum -c compatible). */
+    FILE *manifest = NULL;
+    char *manifest_path = NULL;
+    if (emit_manifest) {
+        size_t mp_cap = strlen(out_path) + 16;
+        manifest_path = (char *)malloc(mp_cap);
+        if (!manifest_path) {
+            free(seg_path);
+            blip_segment_array_free(segs, seg_count);
+            fprintf(stderr, "blar: create: out of memory\n");
+            return EXIT_IO;
+        }
+        snprintf(manifest_path, mp_cap, "%s.SUMS", out_path);
+        manifest = fopen(manifest_path, "w");
+        if (!manifest) {
+            fprintf(stderr, "blar: create: cannot open manifest '%s': %s\n",
+                    manifest_path, strerror(errno));
+            free(seg_path);
+            free(manifest_path);
+            blip_segment_array_free(segs, seg_count);
+            return EXIT_IO;
+        }
+    }
+
     int err = 0;
+    /* Find the basename of out_path (for manifest entries; xxhsum convention is
+     * "<hash>  <filename>" with filenames relative to the manifest's directory). */
+    const char *out_basename = out_path;
+    const char *last_slash = strrchr(out_path, '/');
+    if (last_slash) out_basename = last_slash + 1;
+
     for (size_t i = 0; i < seg_count; i++) {
         snprintf(seg_path, out_path_cap, "%s.%0*zu-of-%0*zu.seg",
                  out_path, width, (size_t)(i + 1), width, seg_count);
@@ -2990,10 +3033,25 @@ static int write_archive_or_segments(const char *out_path,
             err = 1;
             break;
         }
+        if (manifest) {
+            uint64_t h = blip_xxhash64(segs[i].data, segs[i].len);
+            fprintf(manifest, "%016llx  %s.%0*zu-of-%0*zu.seg\n",
+                    (unsigned long long)h,
+                    out_basename, width, (size_t)(i + 1), width, seg_count);
+        }
+    }
+    if (manifest) {
+        fclose(manifest);
+        if (err) {
+            unlink(manifest_path);
+        } else {
+            fprintf(stderr, "Wrote manifest: %s\n", manifest_path);
+        }
     }
     fprintf(stderr, "Created %zu segment files: %s.{1..%zu}-of-%zu.seg\n",
             seg_count, out_path, seg_count, seg_count);
     free(seg_path);
+    free(manifest_path);
     blip_segment_array_free(segs, seg_count);
     return err ? EXIT_IO : EXIT_OK;
 }

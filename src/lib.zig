@@ -3953,3 +3953,9 @@ fn segErrorCode(e: anyerror) i32 {
         else => -1,
     };
 }
+
+/// Compute xxhash64 of a byte buffer.  Returns the 64-bit hash (host-native order).
+/// Compatible with `xxhsum -H64`.
+export fn blip_xxhash64(data: [*]const u8, data_len: usize) callconv(.c) u64 {
+    return std.hash.XxHash64.hash(0, data[0..data_len]);
+}

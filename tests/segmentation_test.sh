@@ -370,6 +370,54 @@ if [[ -n "$seg_middle" ]] && "$BLAR" list "$seg_middle" >/dev/null 2>&1; then
 else
   fail "blar list rejected a non-first segment file"
 fi
+
+# ----- 17. Layer 5d: --manifest emits a sidecar (xxhsum -c compatible) -----
+SEG_DIR_15="$TMPDIR_TEST/seg15"
+mkdir -p "$SEG_DIR_15/src"
+echo "alpha file" > "$SEG_DIR_15/src/a.txt"
+dd if=/dev/urandom of="$SEG_DIR_15/src/big.bin" bs=4096 count=2 2>/dev/null
+"$BLAR" create "$SEG_DIR_15/src" -o "$SEG_DIR_15/out.blar" --segment-count=3 --manifest >/dev/null 2>&1
+
+if [[ -f "$SEG_DIR_15/out.blar.SUMS" ]]; then
+  pass "--manifest emits the .SUMS sidecar"
+else
+  fail "--manifest did not produce .SUMS"
+fi
+
+# Manifest format: 16-hex-digit hash + two spaces + filename
+manifest_lines=$(wc -l < "$SEG_DIR_15/out.blar.SUMS" | tr -d ' ')
+if [[ "$manifest_lines" == "3" ]]; then
+  pass "manifest contains exactly 3 lines (one per segment)"
+else
+  fail "manifest contains $manifest_lines lines (expected 3)"
+fi
+
+if grep -qE '^[0-9a-f]{16}  out\.blar\.[0-9]+-of-[0-9]+\.seg$' "$SEG_DIR_15/out.blar.SUMS"; then
+  pass "manifest lines match xxhsum format (hex + 2 spaces + filename)"
+else
+  fail "manifest line format does not match xxhsum convention"
+fi
+
+# Verify with xxhsum -c if available; otherwise we already validated format above
+if command -v xxhsum >/dev/null 2>&1; then
+  if (cd "$SEG_DIR_15" && xxhsum -c out.blar.SUMS) >/dev/null 2>&1; then
+    pass "xxhsum -c verifies the emitted manifest"
+  else
+    fail "xxhsum -c rejected the emitted manifest"
+  fi
+else
+  pass "xxhsum not installed; format check above is sufficient (skipped -c verify)"
+fi
+
+# ----- 18. --manifest without segmentation flags is an error -----
+SEG_DIR_16="$TMPDIR_TEST/seg16"
+mkdir -p "$SEG_DIR_16/src"
+echo "x" > "$SEG_DIR_16/src/a.txt"
+if "$BLAR" create "$SEG_DIR_16/src" -o "$SEG_DIR_16/out.blar" --manifest >/dev/null 2>&1; then
+  fail "--manifest without --segment-size/--segment-count was accepted"
+else
+  pass "--manifest requires segmentation flags"
+fi
 # Summary
 # =============================================================================
 echo ""

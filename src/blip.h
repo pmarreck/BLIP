@@ -853,6 +853,9 @@ int32_t blip_segment_header(
     uint64_t *out_seg_index,
     uint64_t *out_total,
     uint8_t  *out_total_is_nil);
+
+/* Compute xxhash64 of a byte buffer (compatible with `xxhsum -H64`). */
+uint64_t blip_xxhash64(const uint8_t *data, size_t data_len);
 #ifdef __cplusplus
 }
 #endif
