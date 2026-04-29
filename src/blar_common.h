@@ -204,9 +204,113 @@ static uint8_t *read_archive_plain(const char *path, size_t *out_len) {
  * Always returns a malloc'd buffer — caller frees with free().
  * Layering order on disk: compress → encrypt (innermost to outermost).
  * So on read: decrypt (outer) → decompress (inner). */
+/* If `*bufp`/`*lenp` is a SEGMENT container, header-scan the parent directory
+ * of `path`, reassemble all matching segments (stream_id=0), free the original
+ * buffer, and replace `*bufp`/`*lenp` with malloc'd bytes of the reassembled
+ * payload.  Returns true on success (including the "not a segment" no-op case),
+ * false on reassembly failure. */
+static bool maybe_reassemble_segments(uint8_t **bufp, size_t *lenp, const char *path) {
+    if (!*bufp || *lenp == 0) return true;
+    if (blip_segment_is_segment(*bufp, *lenp) != 1) return true;
+
+    /* Find the directory containing `path`. */
+    char dirbuf[4096];
+    const char *last_slash = strrchr(path, '/');
+    if (last_slash) {
+        size_t dlen = (size_t)(last_slash - path);
+        if (dlen >= sizeof(dirbuf)) dlen = sizeof(dirbuf) - 1;
+        memcpy(dirbuf, path, dlen);
+        dirbuf[dlen] = '\0';
+    } else {
+        dirbuf[0] = '.';
+        dirbuf[1] = '\0';
+    }
+
+    DIR *dir = opendir(dirbuf[0] ? dirbuf : ".");
+    if (!dir) {
+        fprintf(stderr, "Cannot open directory '%s' for segment reassembly: %s\n",
+                dirbuf, strerror(errno));
+        return false;
+    }
+
+    blip_segment_t *segs = NULL;
+    size_t seg_cap = 0, seg_count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", dirbuf, name);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        size_t flen = 0;
+        uint8_t *fbuf = read_file(full, &flen);
+        if (!fbuf) continue;
+        if (blip_segment_is_segment(fbuf, flen) != 1) {
+            free(fbuf);
+            continue;
+        }
+        if (seg_count >= seg_cap) {
+            seg_cap = seg_cap ? seg_cap * 2 : 8;
+            blip_segment_t *new_segs = (blip_segment_t *)realloc(segs, seg_cap * sizeof(*segs));
+            if (!new_segs) {
+                free(fbuf);
+                for (size_t i = 0; i < seg_count; i++) free(segs[i].data);
+                free(segs);
+                closedir(dir);
+                fprintf(stderr, "Out of memory during segment reassembly\n");
+                return false;
+            }
+            segs = new_segs;
+        }
+        segs[seg_count].data = fbuf;
+        segs[seg_count].len = flen;
+        seg_count++;
+    }
+    closedir(dir);
+
+    if (seg_count == 0) {
+        fprintf(stderr, "No SEGMENT containers found in '%s'\n", dirbuf);
+        return false;
+    }
+
+    uint8_t *out_data = NULL;
+    size_t out_len = 0;
+    int32_t rc = blip_segment_reassemble(segs, seg_count, /* expected_stream_id */ 0,
+                                          &out_data, &out_len);
+    for (size_t i = 0; i < seg_count; i++) free(segs[i].data);
+    free(segs);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "Segment reassembly failed: %s\n", blip_error_string(rc));
+        return false;
+    }
+
+    /* Copy into malloc'd buffer so callers can free() uniformly. */
+    uint8_t *copy = (uint8_t *)malloc(out_len);
+    if (!copy) {
+        blip_free(out_data, out_len);
+        fprintf(stderr, "Out of memory copying reassembled archive\n");
+        return false;
+    }
+    memcpy(copy, out_data, out_len);
+    blip_free(out_data, out_len);
+
+    free(*bufp);
+    *bufp = copy;
+    *lenp = out_len;
+    return true;
+}
+
 static uint8_t *read_archive(const char *path, size_t *out_len) {
     uint8_t *buf = read_file(path, out_len);
     if (!buf) return NULL;
+
+    /* Auto-reassemble if `path` is a single SEGMENT (header-scan its directory). */
+    if (!maybe_reassemble_segments(&buf, out_len, path)) {
+        free(buf);
+        return NULL;
+    }
 
     /* Check for encrypted LP container (ENC attribute) — outermost layer */
     if (blip_is_encrypted(buf, *out_len)) {

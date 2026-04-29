@@ -325,7 +325,51 @@ if "$BLAR" create "$SEG_DIR_13/src" -o "$SEG_DIR_13/out.blar" --segment-size=128
 else
   pass "create rejects --segment-size combined with --segment-count"
 fi
-# =============================================================================
+
+# ----- 16. Layer 5c: list/extract/verify/info on a segment file -----
+SEG_DIR_14="$TMPDIR_TEST/seg14"
+mkdir -p "$SEG_DIR_14/src"
+echo "alpha file" > "$SEG_DIR_14/src/a.txt"
+echo "beta file"  > "$SEG_DIR_14/src/b.txt"
+dd if=/dev/urandom of="$SEG_DIR_14/src/big.bin" bs=4096 count=2 2>/dev/null
+"$BLAR" create "$SEG_DIR_14/src" -o "$SEG_DIR_14/out.blar" --segment-count=4 >/dev/null 2>&1
+seg_first=$(ls "$SEG_DIR_14"/out.blar.*-of-4.seg | head -1)
+
+if "$BLAR" list "$seg_first" >/dev/null 2>&1; then
+  pass "blar list works directly on a segment file"
+else
+  fail "blar list rejected a segment file"
+fi
+
+if "$BLAR" verify "$seg_first" >/dev/null 2>&1; then
+  pass "blar verify works directly on a segment file"
+else
+  fail "blar verify rejected a segment file"
+fi
+
+if "$BLAR" info "$seg_first" >/dev/null 2>&1; then
+  pass "blar info works directly on a segment file"
+else
+  fail "blar info rejected a segment file"
+fi
+
+EXTRACT_DIR_14="$SEG_DIR_14/extracted"
+mkdir -p "$EXTRACT_DIR_14"
+"$BLAR" extract "$seg_first" -C "$EXTRACT_DIR_14" >/dev/null 2>&1
+extracted_a14=$(find "$EXTRACT_DIR_14" -type f -name a.txt | head -1)
+if [[ -n "$extracted_a14" ]] && cmp -s "$SEG_DIR_14/src/a.txt" "$extracted_a14"; then
+  pass "blar extract works directly on a segment file"
+else
+  fail "blar extract from segment file did not produce expected content"
+fi
+
+# Also confirm a *middle* segment opens the archive (not just the first)
+seg_middle=$(ls "$SEG_DIR_14"/out.blar.*-of-4.seg | sed -n '3p')
+if [[ -n "$seg_middle" ]] && "$BLAR" list "$seg_middle" >/dev/null 2>&1; then
+  pass "blar list works on a non-first segment file (open-any-segment-opens-archive)"
+else
+  fail "blar list rejected a non-first segment file"
+fi
 # Summary
 # =============================================================================
 echo ""
