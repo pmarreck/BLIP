@@ -3834,3 +3834,122 @@ test "C FFI: blip_error_string returns encryption error strings" {
     try std.testing.expectEqualSlices(u8, "encryption failed", std.mem.span(blip_error_string(-30)));
     try std.testing.expectEqualSlices(u8, "decryption failed", std.mem.span(blip_error_string(-31)));
 }
+
+// ---------------------------------------------------------------------------
+// Segmentation C FFI exports (v3)
+// ---------------------------------------------------------------------------
+
+const segmentation_mod = blip.segmentation_mod;
+
+/// C-compatible (data, len) pair used by the segmentation FFI.
+pub const CSegment = extern struct {
+    data: [*]u8,
+    len: usize,
+};
+
+/// Split `data` into SEGMENT containers, each carrying at most `max_payload`
+/// bytes of VAL.
+/// `csum_id`: 0 = no per-segment checksum; otherwise a ChecksumId u8 value.
+/// On success returns 0 and writes:
+///   *out_segments: array of CSegment (length *out_count)
+///   *out_count:    number of segments
+/// Caller must free with blip_segment_array_free(*out_segments, *out_count).
+export fn blip_segment_chunk(
+    data: [*]const u8,
+    data_len: usize,
+    max_payload: usize,
+    stream_id: u64,
+    csum_id: u8,
+    out_segments: *[*]CSegment,
+    out_count: *usize,
+) callconv(.c) i32 {
+    const ChecksumId = mini_blar.container_mod.ChecksumId;
+    const cid: ?ChecksumId = if (csum_id == 0) null else std.meta.intToEnum(ChecksumId, @as(u7, @truncate(csum_id))) catch return -50;
+    const segs = segmentation_mod.chunkBytes(page_allocator, data[0..data_len], max_payload, stream_id, cid) catch |e| return segErrorCode(e);
+    const arr = page_allocator.alloc(CSegment, segs.len) catch {
+        for (segs) |s| page_allocator.free(s);
+        page_allocator.free(segs);
+        return -13;
+    };
+    for (segs, 0..) |s, i| arr[i] = .{ .data = s.ptr, .len = s.len };
+    // Free the outer spine but not the inner buffers (transferred to arr).
+    page_allocator.free(segs);
+    out_segments.* = arr.ptr;
+    out_count.* = arr.len;
+    return 0;
+}
+
+/// Free an array of CSegment returned by blip_segment_chunk, including each
+/// segment's data buffer.
+export fn blip_segment_array_free(segments: [*]CSegment, count: usize) callconv(.c) void {
+    for (0..count) |i| page_allocator.free(segments[i].data[0..segments[i].len]);
+    page_allocator.free(segments[0..count]);
+}
+
+/// Reassemble a list of SEGMENT-container byte slices into the original payload.
+/// On success returns 0 and writes the reassembled bytes to *out_buf / *out_len.
+/// Caller must free with blip_free.
+export fn blip_segment_reassemble(
+    segments: [*]const CSegment,
+    count: usize,
+    expected_stream_id: u64,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) callconv(.c) i32 {
+    if (count == 0) return -51; // MissingSegments
+    const slices = page_allocator.alloc([]const u8, count) catch return -13;
+    defer page_allocator.free(slices);
+    for (0..count) |i| slices[i] = segments[i].data[0..segments[i].len];
+    const out = segmentation_mod.reassemble(page_allocator, slices, expected_stream_id) catch |e| return segErrorCode(e);
+    out_buf.* = out.ptr;
+    out_len.* = out.len;
+    return 0;
+}
+
+/// Quick check: does this byte slice parse as a SEGMENT container?
+/// Returns 0 = not a segment, 1 = is a segment, negative = parse error.
+export fn blip_segment_is_segment(data: [*]const u8, data_len: usize) callconv(.c) i32 {
+    const info = segmentation_mod.parseSegment(data[0..data_len]) catch |e| switch (e) {
+        error.NotASegment => return 0,
+        else => return -50,
+    };
+    _ = info;
+    return 1;
+}
+
+/// Read just the (I, M, N) header from a SEGMENT container, without reassembly.
+/// `out_total` receives the N value; if N is NIL, *out_total_is_nil is set to 1.
+/// Returns 0 on success, negative on error.
+export fn blip_segment_header(
+    data: [*]const u8,
+    data_len: usize,
+    out_stream_id: *u64,
+    out_seg_index: *u64,
+    out_total: *u64,
+    out_total_is_nil: *u8,
+) callconv(.c) i32 {
+    const info = segmentation_mod.parseSegment(data[0..data_len]) catch |e| return segErrorCode(e);
+    out_stream_id.* = info.stream_id;
+    out_seg_index.* = info.seg_index;
+    if (info.total) |n| {
+        out_total.* = n;
+        out_total_is_nil.* = 0;
+    } else {
+        out_total.* = 0;
+        out_total_is_nil.* = 1;
+    }
+    return 0;
+}
+
+fn segErrorCode(e: anyerror) i32 {
+    return switch (e) {
+        error.NotASegment => -50,
+        error.InvalidSegment => -50,
+        error.MissingSegments => -51,
+        error.InconsistentTotal => -52,
+        error.SequenceGap => -53,
+        error.DuplicateSegmentValueMismatch => -54,
+        error.OutOfMemory => -13,
+        else => -1,
+    };
+}

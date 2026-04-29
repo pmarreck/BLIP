@@ -806,6 +806,53 @@ int32_t blip_archive_entry_pdf_length(const uint8_t *buf, size_t buf_len,
 int32_t blip_archive_entry_jxl_source(const uint8_t *buf, size_t buf_len,
     uint64_t index, const char **out_fmt, size_t *out_fmt_len);
 
+/* ---------------------------------------------------------------------------
+ * Segmentation (v3)
+ * --------------------------------------------------------------------------- */
+
+#define BLIP_ERR_INVALID_SEGMENT      -50
+#define BLIP_ERR_MISSING_SEGMENTS     -51
+#define BLIP_ERR_INCONSISTENT_TOTAL   -52
+#define BLIP_ERR_SEQUENCE_GAP         -53
+#define BLIP_ERR_DUPLICATE_MISMATCH   -54
+
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+} blip_segment_t;
+
+/* Split `data` into N SEGMENT containers, each carrying at most max_payload
+ * VAL bytes.  csum_id: 0 = no per-segment checksum; otherwise a ChecksumId u8.
+ * Returns 0 on success.  Caller must free with blip_segment_array_free. */
+int32_t blip_segment_chunk(
+    const uint8_t *data, size_t data_len,
+    size_t max_payload,
+    uint64_t stream_id,
+    uint8_t csum_id,
+    blip_segment_t **out_segments,
+    size_t *out_count);
+
+/* Free an array returned by blip_segment_chunk, including each segment's data. */
+void blip_segment_array_free(blip_segment_t *segments, size_t count);
+
+/* Reassemble SEGMENT containers into the original payload.
+ * Caller must free *out_buf with blip_free. */
+int32_t blip_segment_reassemble(
+    const blip_segment_t *segments, size_t count,
+    uint64_t expected_stream_id,
+    uint8_t **out_buf, size_t *out_len);
+
+/* Returns 1 if the buffer parses as a SEGMENT container, 0 if not, negative on parse error. */
+int32_t blip_segment_is_segment(const uint8_t *data, size_t data_len);
+
+/* Read just the SEG header (I, M, N) without reassembly.
+ * If N is NIL, *out_total is 0 and *out_total_is_nil is 1. */
+int32_t blip_segment_header(
+    const uint8_t *data, size_t data_len,
+    uint64_t *out_stream_id,
+    uint64_t *out_seg_index,
+    uint64_t *out_total,
+    uint8_t  *out_total_is_nil);
 #ifdef __cplusplus
 }
 #endif

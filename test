@@ -56,6 +56,7 @@ run_suite "Streaming Tests" "bash tests/streaming_test.sh"
 run_suite "Compression Tests" "bash tests/compression_test.sh"
 run_suite "Encryption Tests" "bash tests/encryption_test.sh"
 run_suite "MiniBLAR Tests" "bash tests/miniblar_test.sh"
+run_suite "Segmentation Tests" "bash tests/segmentation_test.sh"
 
 # Summary
 echo ""

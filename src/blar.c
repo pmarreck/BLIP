@@ -44,6 +44,8 @@ static int cmd_text(int argc, char **argv);
 static int cmd_from_text(int argc, char **argv);
 static int cmd_explode(int argc, char **argv);
 static int cmd_implode(int argc, char **argv);
+static int cmd_segment(int argc, char **argv);
+static int cmd_join(int argc, char **argv);
 static void print_usage(FILE *out);
 static void print_version(void);
 
@@ -92,6 +94,10 @@ int main(int argc, char **argv) {
     if (strcmp(arg1, "from-text") == 0) return cmd_from_text(argc - 2, argv + 2);
     if (strcmp(arg1, "explode") == 0) return cmd_explode(argc - 2, argv + 2);
     if (strcmp(arg1, "implode") == 0) return cmd_implode(argc - 2, argv + 2);
+    if (strcmp(arg1, "segment") == 0 || strcmp(arg1, "split") == 0)
+        return cmd_segment(argc - 2, argv + 2);
+    if (strcmp(arg1, "join") == 0 || strcmp(arg1, "reassemble") == 0)
+        return cmd_join(argc - 2, argv + 2);
 
     bool has_f = false;
     operation_t op = parse_tar_flags(arg1, &has_f);
@@ -188,6 +194,9 @@ static void print_usage(FILE *out) {
         "  from-text <input.txt> -o <out.blar> [-z]  Rebuild archive from text\n"
         "  explode <archive> -C <output_dir>         Extract to dir tree + __meta__.json\n"
         "  implode <directory> -o <archive> [-z]      Rebuild archive from dir tree\n"
+        "  segment <file> --segment-size=SIZE         Split file into .seg pieces (synonym: split)\n"
+        "  segment <file> --segment-count=N           Split file into exactly N .seg pieces\n"
+        "  join <file.M-of-N.seg> [-o <output>]       Reassemble .seg pieces (synonym: reassemble)\n"
         "\n"
         "Smart defaults (no subcommand needed):\n"
         "  blar mydir/                            Create archive from directory\n"
@@ -2855,3 +2864,353 @@ static int cmd_implode(int argc, char **argv) {
     return EXIT_OK;
 }
 /* rebuild 1774972745 */
+
+/* ── Segmentation helpers (Layer 5a) ──────────────────────────────────── */
+
+/* Parse a size string like "100M", "10K", "1G" or a plain integer into bytes. */
+static int parse_size_arg(const char *s, size_t *out) {
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || end == s) return -1;
+    unsigned long long mult = 1;
+    if (*end == 'K' || *end == 'k') mult = 1024ULL;
+    else if (*end == 'M' || *end == 'm') mult = 1024ULL * 1024ULL;
+    else if (*end == 'G' || *end == 'g') mult = 1024ULL * 1024ULL * 1024ULL;
+    else if (*end != '\0') return -1;
+    *out = (size_t)(v * mult);
+    return 0;
+}
+
+/* Number of decimal digits needed to print n.  Returns 1 for n=0. */
+static int min_decimal_width(uint64_t n) {
+    if (n == 0) return 1;
+    int w = 0;
+    while (n > 0) { w++; n /= 10; }
+    return w;
+}
+
+/* Parse a path that ends in ".{M}-of-{N}.seg" into its components.
+ * On success: *out_stem is malloc'd and includes any leading directory.
+ * Returns 0 on success, -1 on parse failure. */
+static int parse_segment_filename(const char *path,
+                                   char **out_stem,
+                                   uint64_t *out_m,
+                                   uint64_t *out_n) {
+    size_t plen = strlen(path);
+    if (plen < 9) return -1;
+    if (strcmp(path + plen - 4, ".seg") != 0) return -1;
+    /* Walk back from .seg to find the "-of-" anchor. */
+    /* The substring between the last "." before "-of-" and ".seg" is "{M}-of-{N}". */
+    /* Trim ".seg" virtually: search within path[0..plen-4]. */
+    size_t end = plen - 4;
+    /* Find "-of-" by scanning from right to left. */
+    const char *of_p = NULL;
+    for (size_t i = end; i >= 4; i--) {
+        if (path[i - 4] == '-' && path[i - 3] == 'o' && path[i - 2] == 'f' && path[i - 1] == '-') {
+            of_p = path + i - 4;
+            break;
+        }
+        if (i == 4) break;
+    }
+    if (!of_p) return -1;
+    /* Find the "." preceding M (walk backward from of_p). */
+    const char *dot_p = of_p;
+    while (dot_p > path && *dot_p != '.') dot_p--;
+    if (dot_p == path || *dot_p != '.') return -1;
+    /* M is between dot_p+1 and of_p. */
+    char *parse_end = NULL;
+    errno = 0;
+    unsigned long long m = strtoull(dot_p + 1, &parse_end, 10);
+    if (errno || parse_end != of_p) return -1;
+    /* N is between of_p+4 and path+end. */
+    errno = 0;
+    unsigned long long n = strtoull(of_p + 4, &parse_end, 10);
+    if (errno || parse_end != path + end) return -1;
+    /* Stem is path[0..(dot_p - path)]. */
+    size_t stem_len = (size_t)(dot_p - path);
+    char *stem = (char *)malloc(stem_len + 1);
+    if (!stem) return -1;
+    memcpy(stem, path, stem_len);
+    stem[stem_len] = '\0';
+    *out_stem = stem;
+    *out_m = (uint64_t)m;
+    *out_n = (uint64_t)n;
+    return 0;
+}
+
+/* ── cmd_segment ──────────────────────────────────────────────────────── */
+
+static int cmd_segment(int argc, char **argv) {
+    const char *input_path = NULL;
+    size_t segment_size = 0;
+    uint64_t segment_count = 0;
+    bool size_set = false;
+    bool count_set = false;
+
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (strncmp(a, "--segment-size=", 15) == 0) {
+            if (parse_size_arg(a + 15, &segment_size) != 0 || segment_size == 0) {
+                fprintf(stderr, "blar: segment: invalid --segment-size '%s'\n", a + 15);
+                return EXIT_USAGE;
+            }
+            size_set = true;
+        } else if (strncmp(a, "--segment-count=", 16) == 0) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(a + 16, &end, 10);
+            if (errno || end == a + 16 || *end != '\0' || v == 0) {
+                fprintf(stderr, "blar: segment: invalid --segment-count '%s'\n", a + 16);
+                return EXIT_USAGE;
+            }
+            segment_count = (uint64_t)v;
+            count_set = true;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "blar: segment: unknown option '%s'\n", a);
+            return EXIT_USAGE;
+        } else {
+            if (input_path) {
+                fprintf(stderr, "blar: segment: multiple input paths\n");
+                return EXIT_USAGE;
+            }
+            input_path = a;
+        }
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "blar: segment: requires an input file\n");
+        return EXIT_USAGE;
+    }
+    if (size_set && count_set) {
+        fprintf(stderr, "blar: segment: --segment-size and --segment-count are mutually exclusive\n");
+        return EXIT_USAGE;
+    }
+    if (!size_set && !count_set) {
+        fprintf(stderr, "blar: segment: requires --segment-size=SIZE or --segment-count=N\n");
+        return EXIT_USAGE;
+    }
+
+    size_t input_len = 0;
+    uint8_t *input = read_file(input_path, &input_len);
+    if (!input) {
+        fprintf(stderr, "blar: segment: cannot read '%s': %s\n",
+                input_path, strerror(errno));
+        return EXIT_IO;
+    }
+
+    if (count_set) {
+        /* Compute segment size that yields exactly `segment_count` segments. */
+        if (input_len == 0) {
+            segment_size = 1;
+        } else {
+            segment_size = (input_len + segment_count - 1) / segment_count;
+            if (segment_size == 0) segment_size = 1;
+        }
+    }
+
+    blip_segment_t *segs = NULL;
+    size_t seg_count = 0;
+    int32_t rc = blip_segment_chunk(
+        input, input_len,
+        segment_size,
+        /* stream_id */ 0,
+        /* csum_id   */ 2,    /* xxhash64 */
+        &segs, &seg_count);
+    free(input);
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: segment: chunk failed: %s\n", blip_error_string(rc));
+        return EXIT_IO;
+    }
+
+    int width = min_decimal_width((uint64_t)seg_count);
+    size_t input_path_len = strlen(input_path);
+    size_t out_path_cap = input_path_len + 64;
+    char *out_path = (char *)malloc(out_path_cap);
+    if (!out_path) {
+        blip_segment_array_free(segs, seg_count);
+        fprintf(stderr, "blar: segment: out of memory\n");
+        return EXIT_IO;
+    }
+    int err = 0;
+    for (size_t i = 0; i < seg_count; i++) {
+        snprintf(out_path, out_path_cap, "%s.%0*zu-of-%0*zu.seg",
+                 input_path, width, (size_t)(i + 1), width, seg_count);
+        if (!write_file(out_path, segs[i].data, segs[i].len)) {
+            fprintf(stderr, "blar: segment: cannot write '%s': %s\n",
+                    out_path, strerror(errno));
+            err = 1;
+            break;
+        }
+    }
+    free(out_path);
+    blip_segment_array_free(segs, seg_count);
+    return err ? EXIT_IO : EXIT_OK;
+}
+
+/* ── cmd_join ─────────────────────────────────────────────────────────── */
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static int cmd_join(int argc, char **argv) {
+    const char *seg_path = NULL;
+    const char *output = NULL;
+
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "blar: join: -o requires an argument\n");
+                return EXIT_USAGE;
+            }
+            output = argv[++i];
+        } else if (strncmp(a, "-o=", 3) == 0) {
+            output = a + 3;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "blar: join: unknown option '%s'\n", a);
+            return EXIT_USAGE;
+        } else {
+            if (seg_path) {
+                fprintf(stderr, "blar: join: multiple segment paths\n");
+                return EXIT_USAGE;
+            }
+            seg_path = a;
+        }
+    }
+
+    if (!seg_path) {
+        fprintf(stderr, "blar: join: requires a segment file path\n");
+        return EXIT_USAGE;
+    }
+
+    /* Determine the directory and stem.  Naming-based parse is best-effort;
+     * if it fails we still header-scan the directory of seg_path. */
+    char *parsed_stem = NULL;
+    uint64_t M = 0, N = 0;
+    bool naming_ok = (parse_segment_filename(seg_path, &parsed_stem, &M, &N) == 0);
+
+    /* Compute directory portion of seg_path. */
+    char dirbuf[PATH_MAX];
+    const char *last_slash = strrchr(seg_path, '/');
+    if (last_slash) {
+        size_t dlen = (size_t)(last_slash - seg_path);
+        if (dlen >= sizeof(dirbuf)) dlen = sizeof(dirbuf) - 1;
+        memcpy(dirbuf, seg_path, dlen);
+        dirbuf[dlen] = '\0';
+    } else {
+        dirbuf[0] = '.';
+        dirbuf[1] = '\0';
+    }
+
+    /* Header-scan the directory: read each regular file, accept if it parses
+     * as a SEGMENT container. */
+    DIR *dir = opendir(dirbuf[0] ? dirbuf : ".");
+    if (!dir) {
+        fprintf(stderr, "blar: join: cannot open directory '%s': %s\n",
+                dirbuf, strerror(errno));
+        free(parsed_stem);
+        return EXIT_IO;
+    }
+
+    blip_segment_t *segs = NULL;
+    size_t seg_cap = 0, seg_count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dirbuf, name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        size_t flen = 0;
+        uint8_t *fbuf = read_file(path, &flen);
+        if (!fbuf) continue;
+        int32_t isseg = blip_segment_is_segment(fbuf, flen);
+        if (isseg != 1) {
+            free(fbuf);
+            continue;
+        }
+        if (seg_count >= seg_cap) {
+            seg_cap = seg_cap ? seg_cap * 2 : 8;
+            blip_segment_t *new_segs = (blip_segment_t *)realloc(segs, seg_cap * sizeof(*segs));
+            if (!new_segs) {
+                free(fbuf);
+                fprintf(stderr, "blar: join: out of memory\n");
+                for (size_t i = 0; i < seg_count; i++) free(segs[i].data);
+                free(segs);
+                free(parsed_stem);
+                closedir(dir);
+                return EXIT_IO;
+            }
+            segs = new_segs;
+        }
+        segs[seg_count].data = fbuf;
+        segs[seg_count].len = flen;
+        seg_count++;
+    }
+    closedir(dir);
+
+    if (seg_count == 0) {
+        fprintf(stderr, "blar: join: no SEGMENT containers found in '%s'\n", dirbuf);
+        free(parsed_stem);
+        return EXIT_IO;
+    }
+
+    uint8_t *out_data = NULL;
+    size_t out_len = 0;
+    int32_t rc = blip_segment_reassemble(segs, seg_count,
+                                          /* expected_stream_id */ 0,
+                                          &out_data, &out_len);
+    for (size_t i = 0; i < seg_count; i++) free(segs[i].data);
+    free(segs);
+
+    if (rc != BLIP_OK) {
+        fprintf(stderr, "blar: join: reassembly failed: %s\n", blip_error_string(rc));
+        free(parsed_stem);
+        return EXIT_IO;
+    }
+
+    /* Determine output path. */
+    const char *write_to = output;
+    char *fallback = NULL;
+    if (!write_to) {
+        if (naming_ok && parsed_stem) {
+            write_to = parsed_stem;
+        } else {
+            /* Best-effort: strip trailing ".seg" from the input path. */
+            size_t slen = strlen(seg_path);
+            if (slen > 4 && strcmp(seg_path + slen - 4, ".seg") == 0) {
+                fallback = (char *)malloc(slen - 3);
+                if (fallback) {
+                    memcpy(fallback, seg_path, slen - 4);
+                    fallback[slen - 4] = '\0';
+                    write_to = fallback;
+                }
+            }
+        }
+    }
+    if (!write_to) {
+        fprintf(stderr, "blar: join: cannot determine output path; pass -o\n");
+        blip_free(out_data, out_len);
+        free(parsed_stem);
+        free(fallback);
+        return EXIT_USAGE;
+    }
+
+    if (!write_file(write_to, out_data, out_len)) {
+        fprintf(stderr, "blar: join: cannot write '%s': %s\n",
+                write_to, strerror(errno));
+        blip_free(out_data, out_len);
+        free(parsed_stem);
+        free(fallback);
+        return EXIT_IO;
+    }
+
+    blip_free(out_data, out_len);
+    free(parsed_stem);
+    free(fallback);
+    return EXIT_OK;
+}
