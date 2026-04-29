@@ -735,10 +735,10 @@ The SEG attribute payload is exactly **three** BLIP scalar values, in order:
 | Field | Type | Semantics |
 |-------|------|-----------|
 | `I` | BLIP integer (u64 domain) | Stream ID. `0` is reserved with the meaning "default / unnamed stream" — use when a host carries only one logical BLIP payload. `I > 0` is caller-chosen. Uniqueness scope: one host container. |
-| `M` | BLIP integer (u64 domain) | 0-based index of this segment within stream `I`. |
+| `M` | BLIP integer (u64 domain) | 1-based index of this segment within stream `I`. The first segment is `M = 1`; `M = 0` is illegal. |
 | `N` | BLIP integer **or** NIL scalar (`0x81 0x7E`) | Total segment count in stream `I`, or **NIL** for streaming / unknown-total. |
 
-`M` is **0-based** to align with array and byte indexing.
+`M` is **1-based**: it counts segments the way humans count things ("part 1 of 5"), matches the disk-files transport convention (§Transport embedding), and avoids the impedance mismatch of having `M = 0` mean "first segment" while filenames use `1-of-5`.
 
 `N = NIL` (the BLIP scalar sentinel from BLIP Spec §Scalar Sentinels) signals that the stream is being emitted incrementally and the total is not known until the host signals end-of-stream. `N = 0` is **not** a valid streaming sentinel — if a SEGMENT exists, then either `N >= 1` or `N = NIL`.
 
@@ -782,15 +782,15 @@ function reassemble(segments: list[SEGMENT], expected_I: int) -> bytes:
                 error DuplicateSegmentValueMismatch(I, M)
     mine = deduped
 
-    # 5. For numeric N, verify count and density
+    # 5. For numeric N, verify count and density [1..N] (1-based)
     if N is not NIL:
         if len(mine) != N:
             seen = {s.M for s in mine}
-            error MissingSegments(I, set(range(N)) - seen)
+            error MissingSegments(I, set(range(1, N + 1)) - seen)
         mine.sort(key=lambda s: s.M)
         for i, s in enumerate(mine):
-            if s.M != i:
-                error SequenceGap(I, expected=i, got=s.M)
+            if s.M != i + 1:
+                error SequenceGap(I, expected=i + 1, got=s.M)
     else:
         mine.sort(key=lambda s: s.M)           # streaming: missing detection N/A
 

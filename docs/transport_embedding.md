@@ -8,7 +8,7 @@ How to carry a segmented BLIP archive (one or more SEGMENT containers — see [B
 
 ## Scope
 
-A SEGMENT container (TYPE=9) wraps a slice of a larger BLIP byte stream. Each segment carries its identity in the SEG attribute as `(I, M, N)` — stream ID, 0-based segment index, total count (or NIL for streaming). Reassembly only requires that a consumer can collect all the segments belonging to a given stream `I`; *how* it collects them is the transport adapter's job.
+A SEGMENT container (TYPE=9) wraps a slice of a larger BLIP byte stream. Each segment carries its identity in the SEG attribute as `(I, M, N)` — stream ID, 1-based segment index, total count (or NIL for streaming). Reassembly only requires that a consumer can collect all the segments belonging to a given stream `I`; *how* it collects them is the transport adapter's job.
 
 This document covers the most common transports:
 - **Disk files** (multi-file archive on a filesystem)
@@ -26,14 +26,14 @@ The document also covers desktop integration so OS file managers treat segments 
 When `blar` writes a segmented archive to a directory, each SEGMENT container becomes one file:
 
 ```
-archive.blar.seg-{M:06d}-of-{N:06d}     numeric N (most archival cases)
-archive.blar.seg-{M:06d}                streaming, N = NIL (no -of- suffix)
-archive.blar.i{I}.seg-{M:06d}[-of-{N:06d}]   multi-stream host (I != 0)
+archive.blar.{M}-of-{N}.seg     numeric N (most archival cases)
+archive.blar.{M}.seg            streaming, N = NIL (no -of- suffix; M unpadded)
 ```
 
-- `M` and `N` are zero-padded to 6 digits so lexicographic sort matches numeric sort up to ~1 million segments. For larger archives, both fields widen to 9 digits.
-- The `archive.blar` stem is whatever the user named the archive (without segment suffix). The dot separator before `seg-` is significant.
-- The single-stream case (the overwhelmingly common one, `I = 0`) drops the `i{I}` infix.
+- `M` is **1-based**: the first segment is `archive.blar.1-of-N.seg`. `M = 0` does not appear.
+- `M` and `N` are zero-padded to the **minimum width** that fits `N` (i.e. `width = ceil(log10(N + 1))`). For `N = 5` the width is 1 (`1-of-5.seg`); for `N = 28` it's 2 (`02-of-28.seg`); for `N = 1000` it's 4 (`0001-of-1000.seg`). Within a single archive set, every filename has the same width on both sides, so lexicographic sort matches numeric sort.
+- The `archive.blar` stem is whatever the user named the archive (without segment suffix). The trailing `.seg` extension is significant — it lets file managers and find/glob tools locate segments uniformly (`find . -name '*.seg'`).
+- The single-stream case (`I = 0`) is the only documented case in this version. Multi-stream-on-disk (multiple distinct `I` values sharing one directory) is **deferred**; if it's ever needed, this section will gain an `i{I}` infix in a future revision. For now, the SEGMENT container's `I` field is still meaningful in non-disk transports (network, JPEG, etc.).
 
 ### 1.2 Same-directory rule
 
@@ -44,9 +44,9 @@ All segments belonging to one archive **MUST live in the same directory**. The r
 Any operation on a single segment file **MUST behave as if invoked on the whole archive**. Examples:
 
 ```bash
-blar list archive.blar.seg-000003-of-000010
-blar extract archive.blar.seg-000003-of-000010 -o out/
-blar verify  archive.blar.seg-000003-of-000010
+blar list archive.blar.03-of-10.seg
+blar extract archive.blar.03-of-10.seg -o out/
+blar verify  archive.blar.03-of-10.seg
 ```
 
 These are equivalent to operating on the conceptual `archive.blar`. The CLI MUST:
@@ -78,9 +78,9 @@ A manifest is **never required**. SEGMENT containers are self-describing via the
 When present, the manifest is named `archive.blar.SUMS` (matching GNU coreutils / BSD sum-tool conventions) and uses the standard one-line-per-file text format:
 
 ```
-<xxhash64-hex>  archive.blar.seg-000000-of-000010
-<xxhash64-hex>  archive.blar.seg-000001-of-000010
-<xxhash64-hex>  archive.blar.seg-000002-of-000010
+<xxhash64-hex>  archive.blar.01-of-10.seg
+<xxhash64-hex>  archive.blar.02-of-10.seg
+<xxhash64-hex>  archive.blar.03-of-10.seg
 ...
 ```
 
@@ -172,7 +172,7 @@ In the BLIP archive app's `Info.plist`:
     <dict>
       <key>public.filename-extension</key>
       <array>
-        <string>blar.seg-000000</string>   <!-- LaunchServices uses pattern matching -->
+        <string>seg</string>
       </array>
     </dict>
   </dict>
@@ -204,7 +204,7 @@ Register via `~/.local/share/mime/packages/blar.xml` (per-user) or `/usr/share/m
   <mime-type type="application/x-blar">
     <comment>BLIP archive</comment>
     <glob pattern="*.blar"/>
-    <glob pattern="*.blar.seg-*"/>
+    <glob pattern="*.seg"/>
     <magic priority="60">
       <!-- BLIP container LP envelope starts with 0x80-0xFF (BLIP length byte).
            Identification is best done after parsing the LP envelope; magic-number
@@ -219,9 +219,9 @@ Then `update-mime-database ~/.local/share/mime` and create a `blar.desktop` file
 
 ### 6.3 Windows — file associations
 
-Register `.blar` and the `.blar.seg-XXXXXX` family under `HKCR\.blar` and `HKCR\.blar.seg-*` (using a wildcard subkey strategy; Windows file associations don't have native pattern matching, so the app's installer enumerates segment-naming variants up to a reasonable bound, e.g., `.blar.seg-000000` through `.blar.seg-999999` registered as the same ProgID).
+Register `.blar` and `.seg` under `HKCR\.blar` and `HKCR\.seg` respectively. The `.seg` association points at the BLIP archive app, which inspects the file's BLIP header on open to confirm it's a SEGMENT container before performing the same-directory expansion described in §1.3 (a non-BLIP `.seg` file is rejected with an explanatory error).
 
-A simpler alternative: register only `.blar` and have the BLIP archive app present an "Open .blar.seg-* segments" right-click context menu via shell extension.
+A simpler alternative for users who don't want a global `.seg` association: register only `.blar` and have the BLIP archive app present an "Open BLIP segments in this folder…" right-click context menu via shell extension.
 
 ## 7. Cross-cutting requirements (all transports)
 
@@ -248,7 +248,7 @@ All segments of a stream MUST agree on `N`. If a producer can't decide between n
 
 | Transport | Naming/addressing | Manifest? | Streaming N=NIL works? | Segment CSUM recommended? |
 |-----------|-------------------|-----------|-----------------------|---------------------------|
-| Disk files | `archive.blar.seg-{M}-of-{N}` (or header-scan) | Optional `archive.blar.SUMS` | No (use multi-file with numeric N) | Yes |
+| Disk files | `archive.blar.{M}-of-{N}.seg` (or header-scan) | Optional `archive.blar.SUMS` | No (use multi-file with numeric N) | Yes |
 | JPEG APP11 | Marker order, identifier `"BLIP\0\0"` | N/A | No (JPEG is closed-form) | Yes |
 | ISOBMFF uuid | UUID-tagged boxes in box order | N/A | No | Yes |
 | PNG bLIP | Chunk order | N/A | No | Yes |
@@ -298,7 +298,7 @@ This section evaluates BLIP SEGMENT against the most relevant prior art across n
 
 | System | What it does | vs. BLIP SEGMENT |
 |--------|--------------|------------------|
-| **JPEG ICC profile chunking** | APP2 markers with `chunk_num` (u8) + `total_chunks` (u8). 254-chunk cap (one byte for 1-based count). | BLIP wins on: unbounded N (BLIP integers vs ICC's u8); 0-based indexing (cleaner validation); per-chunk integrity (ICC has none); applies to *any* host (ICC is JPEG-only). |
+| **JPEG ICC profile chunking** | APP2 markers with `chunk_num` (u8) + `total_chunks` (u8). 255-chunk cap (one byte for 1-based count). | BLIP wins on: unbounded N (BLIP integers vs ICC's u8); per-chunk integrity (ICC has none); applies to *any* host (ICC is JPEG-only). Both are 1-based. |
 | **JPEG XMP / Extended XMP** | APP1 with NUL-terminated namespace strings + tiny ad-hoc continuation protocol (MD5 + offset + length per packet) | BLIP wins on: cleaner spec (XMP's continuation is barely standardized); standard 64-bit fields (XMP truncates to 32-bit lengths); composability with other BLIP attrs. |
 | **JPEG EXIF Extended** | Underspecified APP1 continuation; in practice almost no readers handle it correctly | BLIP wins by simply existing as a single coherent spec rather than three incompatible ad-hocs (EXIF/ICC/XMP). |
 | **PNG ancillary chunks (4-char codes)** | `chunkType` + length per chunk | Single-chunk PNG ancillary is fine; multi-chunk requires a layer above (which is what BLIP SEGMENT *is*). |

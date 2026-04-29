@@ -28,6 +28,7 @@ pub const SegError = error{
 /// Parsed view of one SEGMENT container.
 pub const SegInfo = struct {
     stream_id: u64,
+    /// 1-based segment index (M=1 is the first segment).  M=0 is illegal in v3.
     seg_index: u64,
     /// total segment count, or null when the SEG N field carries the NIL sentinel
     total: ?u64,
@@ -286,11 +287,11 @@ pub fn reassemble(
         i = j;
     }
 
-    // Step 5: numeric N → require complete + dense range
+    // Step 5: numeric N → require complete + dense range [1..N] (1-based)
     if (N0) |n| {
         if (deduped.items.len != n) return error.MissingSegments;
         for (deduped.items, 0..) |s, idx| {
-            if (s.seg_index != idx) return error.SequenceGap;
+            if (s.seg_index != idx + 1) return error.SequenceGap;
         }
     }
     // streaming (N=null): just sort and concatenate, missing detection N/A
@@ -334,7 +335,7 @@ pub fn chunkBytes(
         const start = i * max_payload;
         const end = @min(start + max_payload, raw.len);
         const slice = if (raw.len == 0) raw[0..0] else raw[start..end];
-        segments[i] = try serializeSegment(allocator, stream_id, i, N, slice, csum_id);
+        segments[i] = try serializeSegment(allocator, stream_id, i + 1, N, slice, csum_id);
         emitted += 1;
     }
     return segments;
@@ -354,11 +355,11 @@ const testing = std.testing;
 
 test "serializeSegment + parseSegment roundtrip: minimal segment, N=1" {
     const val = "hello world";
-    const buf = try serializeSegment(testing.allocator, 0, 0, 1, val, null);
+    const buf = try serializeSegment(testing.allocator, 0, 1, 1, val, null);
     defer testing.allocator.free(buf);
     const info = try parseSegment(buf);
     try testing.expectEqual(@as(u64, 0), info.stream_id);
-    try testing.expectEqual(@as(u64, 0), info.seg_index);
+    try testing.expectEqual(@as(u64, 1), info.seg_index);
     try testing.expectEqual(@as(?u64, 1), info.total);
     try testing.expectEqualSlices(u8, val, info.val);
     try testing.expect(info.csum_id == null);
@@ -377,7 +378,7 @@ test "serializeSegment + parseSegment roundtrip: streaming N=NIL" {
 
 test "serializeSegment + parseSegment roundtrip: with xxhash64 CSUM" {
     const val = "checksummed payload";
-    const buf = try serializeSegment(testing.allocator, 0, 0, 1, val, .xxhash64);
+    const buf = try serializeSegment(testing.allocator, 0, 1, 1, val, .xxhash64);
     defer testing.allocator.free(buf);
     const info = try parseSegment(buf);
     try testing.expectEqual(@as(u64, 0), info.stream_id);
@@ -392,7 +393,7 @@ test "serializeSegment + parseSegment roundtrip: with xxhash64 CSUM" {
 
 test "reassemble: single segment, N=1" {
     const val = "the only piece";
-    const buf = try serializeSegment(testing.allocator, 0, 0, 1, val, null);
+    const buf = try serializeSegment(testing.allocator, 0, 1, 1, val, null);
     defer testing.allocator.free(buf);
     const segs = [_][]const u8{buf};
     const out = try reassemble(testing.allocator, &segs, 0);
@@ -401,9 +402,9 @@ test "reassemble: single segment, N=1" {
 }
 
 test "reassemble: two segments in order, N=2" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a);
-    const b = try serializeSegment(testing.allocator, 0, 1, 2, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 2, "BBB", null);
     defer testing.allocator.free(b);
     const segs = [_][]const u8{ a, b };
     const out = try reassemble(testing.allocator, &segs, 0);
@@ -412,11 +413,11 @@ test "reassemble: two segments in order, N=2" {
 }
 
 test "reassemble: out-of-order segments are sorted by M" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 3, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 3, "AAA", null);
     defer testing.allocator.free(a);
-    const b = try serializeSegment(testing.allocator, 0, 1, 3, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 3, "BBB", null);
     defer testing.allocator.free(b);
-    const c = try serializeSegment(testing.allocator, 0, 2, 3, "CCC", null);
+    const c = try serializeSegment(testing.allocator, 0, 3, 3, "CCC", null);
     defer testing.allocator.free(c);
     const segs = [_][]const u8{ c, a, b }; // out of order
     const out = try reassemble(testing.allocator, &segs, 0);
@@ -425,29 +426,29 @@ test "reassemble: out-of-order segments are sorted by M" {
 }
 
 test "reassemble: missing segment with numeric N -> error" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 3, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 3, "AAA", null);
     defer testing.allocator.free(a);
-    const c = try serializeSegment(testing.allocator, 0, 2, 3, "CCC", null);
+    const c = try serializeSegment(testing.allocator, 0, 3, 3, "CCC", null);
     defer testing.allocator.free(c);
     const segs = [_][]const u8{ a, c };
     try testing.expectError(SegError.MissingSegments, reassemble(testing.allocator, &segs, 0));
 }
 
 test "reassemble: inconsistent N -> error" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a);
-    const b = try serializeSegment(testing.allocator, 0, 1, 3, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 3, "BBB", null);
     defer testing.allocator.free(b);
     const segs = [_][]const u8{ a, b };
     try testing.expectError(SegError.InconsistentTotal, reassemble(testing.allocator, &segs, 0));
 }
 
 test "reassemble: streaming (N=NIL) accepts whatever is present" {
-    const a = try serializeSegment(testing.allocator, 0, 0, null, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, null, "AAA", null);
     defer testing.allocator.free(a);
-    const b = try serializeSegment(testing.allocator, 0, 1, null, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, null, "BBB", null);
     defer testing.allocator.free(b);
-    // Note: missing M=2 is *undetectable* in streaming mode, by design.
+    // Note: missing M=3 is *undetectable* in streaming mode, by design.
     const segs = [_][]const u8{ a, b };
     const out = try reassemble(testing.allocator, &segs, 0);
     defer testing.allocator.free(out);
@@ -455,11 +456,11 @@ test "reassemble: streaming (N=NIL) accepts whatever is present" {
 }
 
 test "reassemble: duplicate-M with matching VAL coalesces" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a);
-    const a_dup = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a_dup = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a_dup);
-    const b = try serializeSegment(testing.allocator, 0, 1, 2, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 2, "BBB", null);
     defer testing.allocator.free(b);
     const segs = [_][]const u8{ a, a_dup, b };
     const out = try reassemble(testing.allocator, &segs, 0);
@@ -468,11 +469,11 @@ test "reassemble: duplicate-M with matching VAL coalesces" {
 }
 
 test "reassemble: duplicate-M with mismatching VAL -> error" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a);
-    const a_evil = try serializeSegment(testing.allocator, 0, 0, 2, "XXX", null);
+    const a_evil = try serializeSegment(testing.allocator, 0, 1, 2, "XXX", null);
     defer testing.allocator.free(a_evil);
-    const b = try serializeSegment(testing.allocator, 0, 1, 2, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 2, "BBB", null);
     defer testing.allocator.free(b);
     const segs = [_][]const u8{ a, a_evil, b };
     try testing.expectError(
@@ -482,11 +483,11 @@ test "reassemble: duplicate-M with mismatching VAL -> error" {
 }
 
 test "reassemble: filters out segments belonging to other streams" {
-    const a = try serializeSegment(testing.allocator, 0, 0, 2, "AAA", null);
+    const a = try serializeSegment(testing.allocator, 0, 1, 2, "AAA", null);
     defer testing.allocator.free(a);
-    const b = try serializeSegment(testing.allocator, 0, 1, 2, "BBB", null);
+    const b = try serializeSegment(testing.allocator, 0, 2, 2, "BBB", null);
     defer testing.allocator.free(b);
-    const noise1 = try serializeSegment(testing.allocator, 99, 0, 1, "WRONG", null);
+    const noise1 = try serializeSegment(testing.allocator, 99, 1, 1, "WRONG", null);
     defer testing.allocator.free(noise1);
     const segs = [_][]const u8{ a, noise1, b };
     const out = try reassemble(testing.allocator, &segs, 0);
@@ -497,7 +498,7 @@ test "reassemble: filters out segments belonging to other streams" {
 test "reassemble: corrupt CSUM copy is silently dropped, valid copy wins" {
     const val_a = "AAA";
     const val_b = "BBB";
-    const a_good = try serializeSegment(testing.allocator, 0, 0, 2, val_a, .xxhash64);
+    const a_good = try serializeSegment(testing.allocator, 0, 1, 2, val_a, .xxhash64);
     defer testing.allocator.free(a_good);
     // tamper a_good's payload: flip a byte in the VAL area while leaving CSUM untouched
     const a_corrupt = try testing.allocator.dupe(u8, a_good);
@@ -507,7 +508,7 @@ test "reassemble: corrupt CSUM copy is silently dropped, valid copy wins" {
     const off = @intFromPtr(info_for_offset.val.ptr) - @intFromPtr(a_corrupt.ptr);
     a_corrupt[off] ^= 0xFF;
 
-    const b = try serializeSegment(testing.allocator, 0, 1, 2, val_b, .xxhash64);
+    const b = try serializeSegment(testing.allocator, 0, 2, 2, val_b, .xxhash64);
     defer testing.allocator.free(b);
 
     const segs = [_][]const u8{ a_corrupt, a_good, b };
@@ -522,7 +523,7 @@ test "reassemble: empty segment list -> MissingSegments" {
 }
 
 test "reassemble: all segments belong to wrong stream -> MissingSegments" {
-    const a = try serializeSegment(testing.allocator, 99, 0, 1, "WRONG", null);
+    const a = try serializeSegment(testing.allocator, 99, 1, 1, "WRONG", null);
     defer testing.allocator.free(a);
     const segs = [_][]const u8{a};
     try testing.expectError(SegError.MissingSegments, reassemble(testing.allocator, &segs, 0));
@@ -557,7 +558,7 @@ test "chunkBytes: 100 bytes max=30 -> 4 segments" {
     for (segs, 0..) |seg, i| {
         const info = try parseSegment(seg);
         try testing.expectEqual(@as(u64, 0), info.stream_id);
-        try testing.expectEqual(@as(u64, i), info.seg_index);
+        try testing.expectEqual(@as(u64, i + 1), info.seg_index);
         try testing.expectEqual(@as(?u64, 4), info.total);
         try testing.expectEqual(sizes[i], info.val.len);
     }
