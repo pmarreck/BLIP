@@ -96,23 +96,40 @@ pub fn encodeEndian(value: u64, buf: []u8, endian: Endian) Error!usize {
         if (buf.len < pos + L) return Error.BufferTooSmall;
     }
 
-    // Write raw value in specified byte order
-    var val = value;
-    switch (endian) {
-        .little => {
-            for (0..L) |i| {
-                buf[pos + i] = @intCast(val & 0xFF);
-                val >>= 8;
-            }
-        },
-        .big => {
-            var i: usize = L;
-            while (i > 0) {
-                i -= 1;
-                buf[pos + i] = @intCast(val & 0xFF);
-                val >>= 8;
-            }
-        },
+    // Write raw value in the specified byte order.
+    //
+    // Fast path (most callers): if the buffer has at least 8 bytes after the
+    // header, do a single u64 store.  Trailing bytes beyond L are overwritten
+    // with garbage but we return only `pos + L`, so the caller never sees them
+    // (and the next BLIP write will overwrite them anyway).
+    //
+    // Slow path: fall back to a per-byte loop only when at the end of a small
+    // buffer.  Replaces an 8-way unrolled loop with branched per-byte stores
+    // (visible in LLVM IR) by a single 64-bit store on the hot path.
+    const tail = buf[pos..];
+    if (tail.len >= 8) {
+        switch (endian) {
+            .little => std.mem.writeInt(u64, tail[0..8], value, .little),
+            .big => std.mem.writeInt(u64, tail[0..8], value << @intCast((8 - L) * 8), .big),
+        }
+    } else {
+        var val = value;
+        switch (endian) {
+            .little => {
+                for (0..L) |i| {
+                    buf[pos + i] = @intCast(val & 0xFF);
+                    val >>= 8;
+                }
+            },
+            .big => {
+                var i: usize = L;
+                while (i > 0) {
+                    i -= 1;
+                    buf[pos + i] = @intCast(val & 0xFF);
+                    val >>= 8;
+                }
+            },
+        }
     }
 
     return pos + L;
@@ -181,19 +198,42 @@ pub fn decode(buf: []const u8) Error!DecodeResult {
 
     if (L > 8) return Error.Overflow; // Can't fit in u64
 
-    // Read value bytes according to endianness
+    // Read value bytes according to endianness.
+    //
+    // Fast path: if there are 8 bytes available from header_bytes, do a single
+    // u64 load and mask off the upper (8 - L) bytes.  Replaces an 8-way
+    // unrolled byte loop with two instructions (load + and).
+    //
+    // Slow path: fall back to per-byte assembly only at end-of-buffer.
+    const tail = buf[header_bytes..];
     var value: u64 = 0;
-    switch (endian) {
-        .little => {
-            for (0..L) |i| {
-                value |= @as(u64, buf[header_bytes + i]) << @intCast(i * 8);
-            }
-        },
-        .big => {
-            for (0..L) |i| {
-                value = (value << 8) | @as(u64, buf[header_bytes + i]);
-            }
-        },
+    if (tail.len >= 8) {
+        // Branchless mask via shift-shift.  For L in [1, 8], shift_bits in [0, 56].
+        // L=8 → shift=0 → no-op; L=1 → shift=56 → keeps low 8 bits.
+        const shift_bits: u6 = @intCast((8 - L) * 8);
+        switch (endian) {
+            .little => {
+                const raw = std.mem.readInt(u64, tail[0..8], .little);
+                value = (raw << shift_bits) >> shift_bits;
+            },
+            .big => {
+                const raw = std.mem.readInt(u64, tail[0..8], .big);
+                value = raw >> shift_bits;
+            },
+        }
+    } else {
+        switch (endian) {
+            .little => {
+                for (0..L) |i| {
+                    value |= @as(u64, buf[header_bytes + i]) << @intCast(i * 8);
+                }
+            },
+            .big => {
+                for (0..L) |i| {
+                    value = (value << 8) | @as(u64, buf[header_bytes + i]);
+                }
+            },
+        }
     }
 
     return DecodeResult{

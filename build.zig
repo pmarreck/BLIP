@@ -192,6 +192,10 @@ pub fn build(b: *std.Build) void {
     static_lib.root_module.linkSystemLibrary("jxl_threads", .{});
     static_lib.root_module.linkSystemLibrary("z", .{});
     if (enable_flac) addFlacSupport(static_lib.root_module, flac_lib);
+    if (b.option(bool, "emit-lib-llvm-ir", "Emit LLVM IR for the static library") orelse false) {
+        const ir_install = b.addInstallFile(static_lib.getEmittedLlvmIr(), "blip-lib.ll");
+        b.getInstallStep().dependOn(&ir_install.step);
+    }
     b.installArtifact(static_lib);
 
     // CLI executable — calls through C FFI (links static lib)
@@ -357,6 +361,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (b.option(bool, "emit-llvm-ir", "Emit LLVM IR for the benchmark binary") orelse false) {
+        _ = bench.getEmittedLlvmIr();
+        const ir_install = b.addInstallFile(bench.getEmittedLlvmIr(), "blip-benchmark.ll");
+        b.getInstallStep().dependOn(&ir_install.step);
+    }
     b.installArtifact(bench);
 
     const bench_run = b.addRunArtifact(bench);
