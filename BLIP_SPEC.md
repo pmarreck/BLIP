@@ -1,6 +1,6 @@
 # BLIP: Byte Length Integer Prefix
 
-A variable-length integer encoding optimized for CPU-friendly decoding of small values, with a built-in sentinel channel for format extensibility and optional padding support for streaming writers.
+A variable-length integer encoding optimized for CPU-friendly decoding, with a built-in sentinel channel for format extensibility and a per-value endianness bit (LE for arithmetic, BE for lexicographic sorting).
 
 **Author:** Peter Marreck
 **Version:** 1.2 (2026-04-26)
@@ -27,72 +27,64 @@ First byte:
 
   Bit 7 = 1: LENGTH-PREFIXED MODE
     ┌─┬─┬─┬─────────────┐
-    │1│C│P│   L bits    │
+    │1│E│C│   L bits    │
     └─┴─┴─┴─────────────┘
-    Bit 6 = C (continuation flag for L)
-    Bit 5 = P (padded flag)
+    Bit 6 = E (endianness): 0 = little-endian payload
+                            1 = big-endian payload
+    Bit 5 = C (continuation flag for L)
+    Bits 4-0 = low 5 bits of L (range 0-31 inline)
 
-    ── When P = 0 (NORMAL): ──────────────────────────────
-      Bits 4-0 = low 5 bits of L (range 0-31 inline)
-      If C = 0: L is complete.
-      If C = 1: following bytes extend L using standard
-                varint continuation (bit 7 = continue,
-                bits 6-0 = next 7 bits of L, LE order).
-      Read L bytes as raw little-endian value. Done.
+    If C = 0: L is complete (5 bits, 0-31).
+    If C = 1: following bytes extend L using standard
+              varint continuation (bit 7 = continue,
+              bits 6-0 = next 7 bits of L, LE order).
 
-    ── When P = 1 (PADDED): ──────────────────────────────
-      ┌─┬─┬─┬─┬─────────┐
-      │1│C│1│I│  L bits  │
-      └─┴─┴─┴─┴─────────┘
-      Bit 4 = I (indirect/overflow flag)
-      Bits 3-0 = low 4 bits of L (range 0-15 inline)
-      If C = 0: L is complete.
-      If C = 1: following bytes extend L (same continuation).
-      Read L bytes as raw little-endian value.
-
-      Then: skip 0 or more 0x00 bytes (padding).
-      Then: read 2-byte PAD_END sentinel (0x81 0x00).
-
-      If I = 0: value is the actual value (direct).
-      If I = 1: value is a signed offset to another BLIP
-                that holds the actual value (overflow).
-                See "Padded BLIPs" section below.
+    Read L payload bytes in the specified endianness.
+    Sign interpretation is the application's choice
+    (raw bytes — no ZigZag, no continuation interleaving).
 ```
 
 ### Bit budget summary
 
-| Mode | Bits 7-0 | Inline L range | Notes |
-|------|----------|----------------|-------|
-| Immediate | `0_xxxxxxx` | N/A | Value IS the byte (0-127) |
-| Normal | `1_C_0_LLLLL` | 0-31 (5 bits) | Common path, no padding overhead |
-| Padded direct | `1_C_1_0_LLLL` | 0-15 (4 bits) | Followed by padding + PAD_END |
-| Padded indirect | `1_C_1_1_LLLL` | 0-15 (4 bits) | Value = offset to real BLIP |
+| Mode | First byte | Inline L range | Notes |
+|------|------------|----------------|-------|
+| Immediate | `0_xxxxxxx` | N/A | Value IS the byte (0-127). Endianness irrelevant. |
+| Length-prefixed (LE) | `1_0_C_LLLLL` | 0-31 (5 bits) | E=0; payload bytes are little-endian. |
+| Length-prefixed (BE) | `1_1_C_LLLLL` | 0-31 (5 bits) | E=1; payload bytes are big-endian (lexicographically sortable). |
 
-All inline L ranges are more than sufficient: L=8 covers u64/i64, L=15 covers u120, L=31 covers u248.
+The 5-bit inline L is more than sufficient for typical use — L=8 covers u64/i64, L=16 covers u128, L=31 covers u248. Continuation (C=1) is exercised only for >248-bit big integers.
+
+### Endianness
+
+The E bit is set per-encoded-value, so a single stream may freely mix LE and BE BLIPs. Decoders read it from bit 6 of the header and cannot guess from context. Use:
+
+- **LE (E=0)** for arithmetic-heavy payloads. On LE hosts (x86, ARM), decoding is a single native load — `std.mem.readInt(u64, bytes, .little)` compiles to one instruction. This is the default and what most callers want.
+- **BE (E=1)** when encoded values must sort lexicographically — e.g., B-tree keys, sorted file formats, naive `memcmp`-based ordering. Big-endian payloads sort byte-wise in the same order as the integers they represent.
+
+Sentinels (overlong L=1 encodings, see §Sentinel Values) are always emitted with E=0 by canonical encoders.
+
+### Signedness
+
+BLIP encodes the **bit width** and the **bytes**. It does not encode signedness. The L payload bytes are raw two's complement; whether they are interpreted as signed or unsigned is entirely the application's choice. `std.mem.readInt(i64, bytes, .little)` and `readInt(u64, ...)` both work on the same payload — same encoding, different interpretation. There is no SLEB128 / ZigZag impedance mismatch because the continuation bits never interleave with data bits.
+
+The **minimum L** for a signed value is the smallest byte width whose two's complement range includes the value (e.g., -128 fits in i8 so L=1; -129 requires i16 so L=2). Encoders MAY choose to round up to a wider L for alignment or fixed-width-field reasons; decoders MUST honor the L on the wire regardless.
 
 ### Decoding pseudocode
 
 ```
-fn decode_blip(stream) -> BlipResult:
+fn decode_blip(stream) -> {value, endian}:
     byte = stream.read_byte()
 
-    // Immediate mode
+    // Immediate mode (bit 7 = 0)
     if byte & 0x80 == 0:
-        return .{ .value = byte }
+        return .{ .value = byte, .endian = LE /* irrelevant */ }
 
     // Length-prefixed mode
-    padded   = (byte & 0x20) != 0
-    indirect = padded and (byte & 0x10) != 0
+    endian = (byte >> 6) & 1                // 0 = LE, 1 = BE
+    L = byte & 0x1F                         // low 5 bits
 
-    if padded:
-        L = byte & 0x0F                     // 4 bits
-        cont_shift = 4
-    else:
-        L = byte & 0x1F                     // 5 bits
-        cont_shift = 5
-
-    if byte & 0x40 != 0:                    // C = 1: more L bytes
-        shift = cont_shift
+    if byte & 0x20 != 0:                    // C = 1: more L bytes
+        shift = 5
         loop:
             next = stream.read_byte()
             L |= (next & 0x7F) << shift
@@ -100,64 +92,34 @@ fn decode_blip(stream) -> BlipResult:
             if next & 0x80 == 0: break
 
     raw = stream.read_bytes(L)
-    value = little_endian_to_int(raw, L)
+    value = bytes_to_int(raw, L, endian)
 
-    // Sentinel check (non-padded, L=1, value 0-127 = overlong)
-    if not padded and L == 1 and 0 <= value and value < 128:
+    // Sentinel check: L=1 with value 0-127 is overlong
+    if L == 1 and value < 128:
         return .{ .sentinel = value }
 
-    // Padding consumption
-    if padded:
-        while stream.peek() == 0x00:
-            stream.advance(1)
-        assert stream.read_bytes(2) == [0x81, 0x00]   // PAD_END
-
-    if indirect:
-        return .{ .indirect_offset = value }   // signed offset to real BLIP
-    else:
-        return .{ .value = value }
+    return .{ .value = value, .endian = endian }
 ```
 
 ### Encoding pseudocode
 
 ```
-fn encode_blip(value, stream):
+fn encode_blip(value, stream, endian = LE):
     if 0 <= value and value < 128:
         stream.write_byte(value)                       // immediate
         return
 
     L = byte_width(value)                              // minimum bytes for value
+    e_bit = endian << 6                                // 0x00 (LE) or 0x40 (BE)
 
     if L < 32:
-        stream.write_byte(0x80 | L)                    // C=0, P=0
+        stream.write_byte(0x80 | e_bit | L)            // C=0, single header byte
     else:
-        first = 0x80 | 0x40 | (L & 0x1F)              // C=1, P=0
+        first = 0x80 | e_bit | 0x20 | (L & 0x1F)       // C=1
         stream.write_byte(first)
         emit_varint_continuation(stream, L >> 5)
 
-    stream.write_bytes(value_to_le_bytes(value, L))
-
-fn encode_blip_padded(value, stream, budget):
-    // budget = total pre-allocated bytes including header, value, padding, PAD_END
-    L = byte_width(value)
-    header_size = 1                                    // may grow with L continuation
-    pad_end_size = 2
-    padding = budget - header_size - L - pad_end_size
-
-    if padding < 0:
-        error("value exceeds padding budget")          // must re-emit container
-
-    if L < 16:
-        stream.write_byte(0x80 | 0x20 | L)            // C=0, P=1, I=0
-    else:
-        first = 0x80 | 0x40 | 0x20 | (L & 0x0F)      // C=1, P=1, I=0
-        stream.write_byte(first)
-        emit_varint_continuation(stream, L >> 4)
-        // recalculate padding with actual header size
-
-    stream.write_bytes(value_to_le_bytes(value, L))
-    stream.write_bytes([0x00] * padding)               // padding
-    stream.write_bytes([0x81, 0x00])                   // PAD_END
+    stream.write_bytes(int_to_bytes(value, L, endian))
 ```
 
 ## Worked Examples
@@ -168,7 +130,7 @@ Value 0:       [0x00]                              1 byte
 Value 42:      [0x2A]                              1 byte
 Value 127:     [0x7F]                              1 byte
 
-── Normal (P=0) ──
+── Length-prefixed, little-endian (E=0) ──
 Value 128:     [0x81, 0x80]                        2 bytes  L=1
 Value 200:     [0x81, 0xC8]                        2 bytes  L=1
 Value 255:     [0x81, 0xFF]                        2 bytes  L=1
@@ -181,21 +143,17 @@ Value 5000000: [0x83, 0x40, 0x4B, 0x4C]            4 bytes  L=3
 Value 2^32-1:  [0x84, 0xFF, 0xFF, 0xFF, 0xFF]      5 bytes  L=4
 Value 2^64-1:  [0x88, 0xFF×8]                      9 bytes  L=8
 
+── Length-prefixed, big-endian (E=1) ──
+Value 256:     [0xC2, 0x01, 0x00]                  3 bytes  L=2  (header has bit 6 set)
+Value 1000:    [0xC2, 0x03, 0xE8]                  3 bytes  L=2
+Value 65535:   [0xC2, 0xFF, 0xFF]                  3 bytes  L=2
+Value 65536:   [0xC3, 0x01, 0x00, 0x00]            4 bytes  L=3
+
 ── Signed (two's complement, application-interpreted) ──
 Value -1 (i8):   [0x81, 0xFF]                      2 bytes  L=1
 Value -1 (i32):  [0x84, 0xFF, 0xFF, 0xFF, 0xFF]    5 bytes  L=4
 Value -128 (i8): [0x81, 0x80]                       2 bytes  L=1
 Value -129 (i16):[0x82, 0x7F, 0xFF]                 3 bytes  L=2
-
-── Padded (P=1, I=0) with 4 bytes of padding ──
-Value 500000:  [0xA3, 0x20, 0xA1, 0x07, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00]
-                ^P=1   ^^^ 3 bytes LE       ^^^^ 4× padding     ^^^ PAD_END
-                I=0, L=3
-
-── Padded indirect (P=1, I=1) ──
-Offset -24:    [0xB1, 0xE8, 0x00, 0x81, 0x00]
-                ^P=1   ^-24 as i8  ^pad  ^PAD_END
-                I=1, L=1
                (signed offset from container start to real BLIP)
 ```
 
@@ -203,7 +161,7 @@ Note: Immediate mode (bit 7 = 0) can only represent unsigned 0-127. Negative val
 
 ## Sentinel Values
 
-When a **non-padded** value in the range 0-127 is encoded in length-prefixed mode rather than immediate mode, the encoding is **overlong** — it uses more bytes than necessary. BLIP reserves these overlong encodings as **sentinels**: special markers that are syntactically distinct from any valid integer.
+When a value in the range 0-127 is encoded in length-prefixed mode rather than immediate mode, the encoding is **overlong** — it uses more bytes than necessary. BLIP reserves these overlong encodings as **sentinels**: special markers that are syntactically distinct from any valid integer.
 
 ```
 Sentinel byte pattern: 0x81 followed by 0x00-0x7F
@@ -214,17 +172,14 @@ These are distinguishable from valid length-prefixed integers because:
   - A sentinel has byte 2 in range 0x00-0x7F (could have been immediate)
 ```
 
-Encoders MUST use the shortest possible encoding for real values (canonical form). Decoders that encounter a non-padded overlong encoding MUST treat it as a sentinel, not as the integer value it would otherwise represent.
+Encoders MUST use the shortest possible encoding for real values (canonical form). Decoders that encounter an overlong encoding MUST treat it as a sentinel, not as the integer value it would otherwise represent.
 
-Padded BLIPs (P=1) with small values are NOT sentinels — they are legitimate padded values (the value really is small; it's just padded for streaming write purposes).
+Sentinels are always emitted with E=0 (header byte = 0x81). The endianness bit is irrelevant for a 1-byte payload, and fixing E=0 keeps sentinel detection a simple `buf[0] == 0x81 && buf[1] < 0x80` check.
 
 ### Reserved sentinel assignments
 
 ```
-0x81 0x00            = PAD_END    End of a padded BLIP's trailing padding.
-                                   Only appears after 0+ padding bytes (0x00)
-                                   following a padded BLIP's value.
-0x81 0x01 - 0x81 0x7B            Available for application-defined types,
+0x81 0x00 - 0x81 0x7B            Available for application-defined types,
                                    version markers, section delimiters, etc.
 0x81 0x7C            = TRUE       Boolean true scalar (v1.2).
 0x81 0x7D            = FALSE      Boolean false scalar (v1.2).
@@ -241,80 +196,16 @@ The TRUE, FALSE, and NIL sentinels (`0x81 0x7C`, `0x81 0x7D`, `0x81 0x7E`) are r
 
 **Restricted-position rule.** Decoders MUST NOT silently accept TRUE / FALSE / NIL in positions where the containing format expects only an integer. Each format that wants to permit a scalar sentinel at a given position MUST say so explicitly in its own spec text (e.g., "the `N` field of the SEG attribute MAY be NIL, meaning streaming/unknown-total"). A scalar sentinel encountered in an unprivileged position MUST be rejected as malformed input. This keeps homogeneous container element types (e.g., ARRAY-of-int) tight by default.
 
-**No nesting / no growth.** TRUE, FALSE, and NIL are atomic and exactly 2 bytes. They cannot wrap other values, cannot be padded, and cannot be encoded in a longer form. Encoders MUST emit the canonical 2-byte form.
+**No nesting / no growth.** TRUE, FALSE, and NIL are atomic and exactly 2 bytes. They cannot wrap other values and cannot be encoded in a longer form. Encoders MUST emit the canonical 2-byte form.
 
 **Why the high bytes.** Placing scalar sentinels at the top of the sentinel range (growing downward from 0x7E) keeps the low end stable for existing attribute sigils and application sentinels in the BLIP Container Format. The 0x7F slot is left untouched because the Container Format uses it as the VAL attribute sigil.
-
-## Padded BLIPs
-
-Padded BLIPs solve the **streaming write problem**: when emitting a binary structure sequentially, some values (offsets, lengths) cannot be known until the entire structure is laid out. A padded BLIP pre-allocates space that is later backfilled with the actual value.
-
-### Structure
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ BLIP header (P=1, I=0 or I=1)                                │
-│ L value bytes (the actual or indirect value)                  │
-│ 0x00 × N (padding, N ≥ 0)                                    │
-│ 0x81 0x00 (PAD_END sentinel)                                  │
-└──────────────────────────────────────────────────────────────┘
-Total field size = header + L + N + 2
-```
-
-### Pre-allocation
-
-The writer pre-allocates a fixed budget for the padded field. For example, with a 12-byte budget:
-
-```
-Initial (value unknown):
-  [0xA0] [0x00×9] [0x81, 0x00]
-   ^P=1, I=0, L=0  ^padding   ^PAD_END
-   (L=0 means "no value yet")
-
-Backfilled (value = 500000, needs L=3):
-  [0xA3] [0x20, 0xA1, 0x07] [0x00×6] [0x81, 0x00]
-   ^L=3   ^^^ value LE        ^pad     ^PAD_END
-```
-
-A 12-byte budget accommodates values up to 2^64 (L=8: 1 header + 8 value + 1 padding + 2 PAD_END).
-
-### Overflow via Indirection
-
-If the actual value exceeds what fits in the pre-allocated padding budget, the writer sets the **indirect flag** (I=1). The value bytes then contain a **signed offset** (from the containing container's start byte) to another BLIP that holds the actual value.
-
-```
-Padded field (I=1, value = offset 40 to scratch pool):
-  [0xB1] [0x28] [0x00×7] [0x81, 0x00]
-   ^P=1,  ^40    ^padding  ^PAD_END
-    I=1,
-    L=1
-
-At container_start + 40:
-  [0x84] [0xF0, 0x49, 0x02, 0x00]    ← normal BLIP, value = 150000
-```
-
-The indirect BLIP at the target location can itself be padded (and potentially indirect), forming an overflow chain. In practice, one hop suffices — the chain exists for formal completeness.
-
-### When to Use Padded BLIPs
-
-Padded BLIPs exist specifically for values that are written to a stream or file **before their final value is known**, in contexts where rewriting the container would be prohibitively expensive (e.g., multi-terabyte archives). They are a streaming-writer optimization, not a general encoding feature.
-
-For in-memory construction (where the full structure is built in RAM and serialized once), padded BLIPs are unnecessary — the writer knows all values before emitting any bytes.
-
-**The indirect overflow mechanism** is a theoretical correctness guarantee. In practice, generous pre-allocation (12 bytes covers offsets up to 2^64) makes overflow astronomically unlikely. The mechanism exists so that the spec is formally complete — no container of any size can be in a state where it cannot express a required offset. But implementations that never produce multi-hundred-terabyte containers MAY omit indirect overflow support and instead re-emit the container if padding is exceeded.
-
-### Scratch Pool Convention
-
-Containers that use padded BLIPs MAY reserve a **scratch pool** — a pre-allocated block of 0x00 bytes near the beginning of the container's value area. If a padded BLIP overflows, the indirect offset points into the scratch pool, where the actual value is written as a normal (non-padded) BLIP.
-
-The scratch pool is a container-format convention, not a BLIP-level feature. See the BLIP Container Format spec for details.
 
 ## Offset and Length Convention
 
 When BLIP integers represent offsets or lengths within a container format:
 
 - **All offsets are measured from the start of the containing container** (the first byte of the container's Type sentinel). This is universal — it does not vary by container type.
-- **Offsets MAY be negative** (signed two's complement) when pointing into a scratch pool or other pre-container data. The BLIP payload is type-agnostic, so signed offsets work natively.
+- **Offsets MAY be negative** (signed two's complement) when pointing into pre-container data. The BLIP payload is type-agnostic, so signed offsets work natively.
 - **Lengths are always non-negative** but use the same signed-capable encoding for consistency.
 - **If containers shift** (e.g., during compaction or re-emission), all offsets within them must be recomputed.
 
@@ -345,16 +236,16 @@ BLIP value 300:    [0x82, 0x2C, 0x01]
 - **Signed integers for free** — payload bytes are raw, so two's complement just works (`readInt(i64, ...)` instead of `readInt(u64, ...)`). LEB128 requires a separate SLEB128 variant (DWARF) or ZigZag encoding (protobuf) because continuation bits are interleaved with data bits, making sign-extension complex.
 - **Sentinel space** — 128 reserved overlong patterns for free. LEB128 also has overlong encodings but no standard defines what to do with them (most specs say "reject").
 - **Bounded branch count** — BLIP decode has a maximum of 2 branches for any value (for the common case of L < 32). LEB128 branches once per byte, so a 64-bit value requires up to 10 branches.
-- **Padding support** — built into the encoding for streaming writers. LEB128 has no equivalent.
+- **Per-value endianness** — the E bit lets a single encoding format serve both arithmetic-heavy uses (LE) and lexicographic-sort uses (BE). LEB128 is LE-only.
 
 **Cons of BLIP vs LEB128:**
 - **1 byte larger for values 256-16383** — BLIP's main space penalty. In distributions where these mid-range values are common (e.g., Unicode codepoints, small packet lengths), this adds up.
 - **Not yet battle-tested** — LEB128 has decades of implementations, fuzzing, edge-case discovery. BLIP is new.
 - **More complex first-byte parsing** — multiple modes vs LEB128's uniform byte-at-a-time loop.
 
-**When to prefer LEB128:** If your value distribution has many values in the 256-16383 range and you don't need sentinels or padding, LEB128 is more compact. Also if ecosystem compatibility matters (DWARF, Wasm, protobuf interop).
+**When to prefer LEB128:** If your value distribution has many values in the 256-16383 range and you don't need sentinels or BE-mode sortability, LEB128 is more compact. Also if ecosystem compatibility matters (DWARF, Wasm, protobuf interop).
 
-**When to prefer BLIP:** If your value distribution is bimodal (many small values <128 and some large values >16383, with few in between), BLIP is both more compact and faster to decode. Also if you want built-in sentinel/type-tag support or streaming write padding.
+**When to prefer BLIP:** If your value distribution is bimodal (many small values <128 and some large values >16383, with few in between), BLIP is both more compact and faster to decode. Also if you want built-in sentinels or per-value endianness.
 
 ### VLQ (Variable-Length Quantity)
 
@@ -363,15 +254,14 @@ Used by MIDI file format and Git packfiles.
 **Encoding:** Identical to LEB128 but **big-endian** — the most significant 7-bit group comes first. Continuation bit (bit 7) has the same meaning.
 
 **Pros over BLIP:**
-- Big-endian ordering allows lexicographic comparison of encoded values without decoding — encoded bytes sort in the same order as the values they represent.
 - Same compactness as LEB128 (1 byte better for 256-16383 range).
 
 **Cons vs BLIP:**
 - Same branch-per-byte decode cost as LEB128.
-- Big-endian payload requires byte-swapping on LE architectures (x86, ARM) even after reassembly from 7-bit groups.
-- No sentinel space. No padding support.
+- BE-only — no way to opt into native-load LE decoding when sorting isn't needed.
+- No sentinel space.
 
-**When to prefer VLQ:** When you need encoded values to sort lexicographically (e.g., B-tree keys, sorted file formats).
+**When to prefer VLQ:** When interoperating with MIDI or Git packfiles. (For new BE-sortable encodings, BLIP with E=1 covers the same use case with native-load decoding.)
 
 ### Protocol Buffers Varint
 
@@ -387,7 +277,7 @@ Note: Protobuf uses ZigZag encoding for signed integers because LEB128's continu
 
 **Cons vs BLIP:**
 - Same decode performance characteristics as LEB128 (branch-per-byte, shift-and-OR reassembly).
-- No sentinel space. No padding support.
+- No sentinel space. LE-only payload (no BE-sort variant).
 
 **When to prefer Protobuf varint:** When interoperating with protobuf-based systems.
 
@@ -407,9 +297,8 @@ BLIP is structurally similar to ASN.1 length encoding. Key differences:
 | Byte order of payload | Big-endian | Little-endian |
 | Max L value | 126 (7 bits minus reserved 0x7F) | Unlimited (varint continuation) |
 | Overlong encodings | DER forbids them; BER allows but discourages | Explicitly reserved as sentinels |
-| Indefinite length | 0x80 = start, 0x00 0x00 = end | Not supported (use padded BLIP instead) |
+| Indefinite length | 0x80 = start, 0x00 0x00 = end | Not supported |
 | Standalone use | Always part of TLV (Type-Length-Value) | Self-contained integer encoding |
-| Padding/streaming | Not supported | Built-in padded mode |
 
 **Pros of ASN.1 over BLIP:**
 - Decades of implementation experience, extensive test vectors, well-understood security properties.
@@ -424,7 +313,7 @@ BLIP is structurally similar to ASN.1 length encoding. Key differences:
 
 **When to prefer ASN.1:** When interoperating with X.509, TLS, or other ASN.1-based protocols. When you need a full TLV framework, not just integer encoding.
 
-**When to prefer BLIP:** When you want a standalone integer encoding with native LE decode performance, unlimited integer size, built-in sentinels, and streaming write padding. BLIP can be thought of as "ASN.1 length encoding, but LE, with unlimited L, overlong encodings repurposed as sentinels, and padding for streaming."
+**When to prefer BLIP:** When you want a standalone integer encoding with native LE decode performance, unlimited integer size, built-in sentinels. BLIP can be thought of as "ASN.1 length encoding, but LE, with unlimited L, overlong encodings repurposed as sentinels."
 
 ### SQLite Varint
 
@@ -446,12 +335,11 @@ Used internally by SQLite for record headers and page pointers.
 - **Big-endian payload** for larger values — byte-swap needed on LE hardware.
 - **Fixed maximum** — 9 bytes encodes up to 2^64. Not unlimited (though 2^64 suffices for all practical uses).
 - **No sentinel space** — all byte patterns are valid values.
-- **No padding support** — no streaming write mechanism.
 - **Asymmetric ranges** make mental arithmetic difficult when debugging hex dumps.
 
 **When to prefer SQLite varint:** When you're implementing a database engine and every byte matters at scale, and you can tolerate the decode complexity. When your value distribution peaks below 240.
 
-**When to prefer BLIP:** When decode speed matters more than squeezing out 113 extra values in the immediate range. When you need sentinels, padding, or unlimited integer width. When implementation simplicity and auditability are priorities.
+**When to prefer BLIP:** When decode speed matters more than squeezing out 113 extra values in the immediate range. When you need sentinels, or unlimited integer width. When implementation simplicity and auditability are priorities.
 
 ### UTF-8 Prefix Coding
 
@@ -468,7 +356,6 @@ Not a general integer encoding, but worth mentioning because BLIP shares the "fi
 - **Continuation bytes waste 2 bits each** (the `10` prefix) — less dense than BLIP's raw LE payload.
 - **Not little-endian** — data bits are big-endian across bytes.
 - **No sentinel space** — overlong encodings are explicitly invalid per the Unicode standard.
-- **No padding support.**
 
 **When to prefer UTF-8:** When you need self-synchronizing properties (e.g., text streams where you might seek to arbitrary byte positions). When encoding Unicode codepoints.
 
@@ -496,21 +383,20 @@ Used by some Google internal systems and proposed as a successor to LEB128.
 **Cons vs BLIP:**
 - **Payload straddles byte boundary** — bits 6-0 of byte 1 are the high bits, remaining bytes are the low bits. This requires a shift and OR to combine (vs BLIP's clean "first byte is header, remaining bytes are raw LE").
 - **No sentinel space** — all bit patterns encode valid values.
-- **No padding support.**
 - **Not widely adopted** — proposed but not standardized or broadly deployed.
 - **Hardware `clz` dependency** — the "single branch" advantage depends on CPU instructions that aren't universally fast.
 
-**When to prefer PrefixVarint:** When you need LEB128's compactness without its per-byte branching, and don't need sentinels or padding.
+**When to prefer PrefixVarint:** When you need LEB128's compactness without its per-byte branching, and don't need sentinels.
 
-**When to prefer BLIP:** When your multi-byte values benefit from being raw LE (single load instruction), and when sentinels or padding matter for format extensibility and streaming writes.
+**When to prefer BLIP:** When your multi-byte values benefit from being raw LE (single load instruction), and when sentinels matter for format extensibility and streaming writes.
 
 ## Summary Comparison Table
 
-| Encoding | 0-127 | 128-255 | 256-16383 | 16384-65535 | Branches | Raw LE | Sentinels | Unlimited | Signed | Padding |
+| Encoding | 0-127 | 128-255 | 256-16383 | 16384-65535 | Branches | Raw LE | Sentinels | Unlimited | Signed | Endian |
 |----------|-------|---------|-----------|-------------|----------|--------|-----------|-----------|--------|---------|
-| **BLIP** | 1B | 2B | 3B | 3B | 1-2 | Yes | 128 free | Yes | Yes | Yes |
-| LEB128 | 1B | 2B | **2B** | 3B | N/byte | No | No* | Yes | SLEB128 | No |
-| VLQ | 1B | 2B | **2B** | 3B | N/byte | No | No | Yes | No | No |
+| **BLIP** | 1B | 2B | 3B | 3B | 1-2 | Yes | 128 free | Yes | Yes | LE/BE |
+| LEB128 | 1B | 2B | **2B** | 3B | N/byte | No | No* | Yes | SLEB128 | LE |
+| VLQ | 1B | 2B | **2B** | 3B | N/byte | No | No | Yes | No | BE |
 | Protobuf | 1B | 2B | **2B** | 3B | N/byte | No | No | Yes† | ZigZag | No |
 | ASN.1 | 1B | 2B | 3B | 3B | 2 | No (BE) | No‡ | No (L≤126) | Yes | No |
 | SQLite | **1B (0-240)** | **1B** | **2B** | 3B | 3-5 | No (BE) | No | No (≤64b) | No | No |
@@ -525,13 +411,12 @@ Used by some Google internal systems and proposed as a successor to LEB128.
 
 | Property | BLIP |
 |----------|------|
-| Byte order of payload | Little-endian |
+| Byte order of payload | Selectable per-value: little-endian (E=0) or big-endian (E=1) |
 | Maximum value | Unlimited (L is varint-encoded) |
 | Self-synchronizing | No (same as LEB128) |
-| Canonical form | Shortest encoding required; non-padded overlong = sentinel |
+| Canonical form | Shortest encoding required; overlong L=1 reserved as sentinel |
 | Signed integers | Yes — payload bytes are raw two's complement (no ZigZag needed) |
 | Streamable | Yes (decode without knowing total message length) |
-| Padding support | Yes — padded mode with optional indirect overflow |
 | Random-access friendly | No (must parse sequentially within a BLIP stream) |
 
 ## Implementation Notes
@@ -543,31 +428,22 @@ On LE hardware, the entire decode for values 0-127 is:
 if (byte & 0x80 == 0) return byte;
 ```
 
-For normal (non-padded) values 128+ with L < 32:
+For length-prefixed values with L < 32 and E=0:
 ```
 L = byte & 0x1F;
 return std.mem.readInt(u64, buffer[1..][0..L], .little);
 ```
 
-Two branches, one memory load. The L continuation path (L ≥ 32) and the padded path exist for completeness but are rarely exercised — L=8 already covers 2^64.
+Two branches, one memory load. The L continuation path (L ≥ 32) exists for completeness but is rarely exercised — L=8 already covers 2^64. For E=1, swap to `.big` (or use the host-endian load + `@byteSwap`).
 
 ### Sentinel detection
 
-After decoding a 2-byte non-padded sequence with L=1:
+After decoding a 2-byte sequence with L=1 and E=0:
 ```
 if (value < 128) → this is a sentinel, not a regular value
 ```
 
 This check is only needed when the application uses sentinels. Formats that don't use sentinels can skip it and treat overlong encodings as their face value (though this is discouraged for forward compatibility).
-
-### Padded BLIP detection
-
-Check bit 5 of the first byte:
-```
-if (byte & 0x20 != 0) → this is a padded BLIP; consume padding + PAD_END after value
-```
-
-Only relevant in contexts where padded BLIPs are expected (offset/length fields in container formats with streaming write support).
 
 ## License
 
