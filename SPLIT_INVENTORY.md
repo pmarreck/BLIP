@@ -89,5 +89,5 @@ All shell tests reference the `blar`/`miniblar` binaries; none drive BLIP direct
 
 - BLIP retains no shell tests. Coverage is via `nix develop -c zig build test` (the Zig unit tests in each module — currently ~841 tests, of which the codec/archive subset is going away with the deleted modules; expect ~500-600 tests post-trim).
 - `printable_binary` remains an external dep of BLIP (decision (a) in Task 1.4a) so the FFI exports `blip_decode_printable_binary`/`blip_encode_printable_binary` survive.
-- `dict.zig` STAYS but is split (FILE/DIR archive types extracted in Task 1.5).
+- `dict.zig` STAYS in full. The original PLAN's Task 1.5 anticipated extracting `FileEntry`/`DirEntry`/`computeMerkleHash` helpers from `dict.zig`, but those helpers actually lived in `mini_blar.zig` (already removed). What remains in `dict.zig` is the DIR/MAP/DICT byte-layout serializers plus a small `validateDirRequiredKeys("pa","xh")` helper — DIR is a BLIP v2 container type-id per the spec, so keeping its serializer in BLIP is correct. blar can layer its own archive-shaped wrappers on top.
 - `LICENSE`, `inbox/` and the spec markdowns are project-wide and trivially stay.

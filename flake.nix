@@ -1,5 +1,5 @@
 {
-  description = "BLIP: Byte Length Integer Prefix encoding";
+  description = "BLIP: Byte Length Integer Prefix encoding + LP envelope + generic containers + SEGMENT";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,46 +11,14 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         pname = "blip";
-        version = "0.2.0";
+        version = "3.0.0";
         isDarwin = pkgs.stdenv.isDarwin;
-
-        zigDepsHash = "sha256-+eu0L3pehap4NzTz3i8ftauwghIM0dUeKR5QJtBVVVk=";
-
-        zigDeps = pkgs.stdenv.mkDerivation {
-          pname = "${pname}-zig-deps";
-          inherit version;
-          src = self;
-          nativeBuildInputs = with pkgs; [ zig git cacert ];
-          outputHashMode = "recursive";
-          outputHashAlgo = "sha256";
-          outputHash = zigDepsHash;
-          dontPatchShebangs = true;
-          buildPhase = ''
-            export HOME=$TMPDIR
-            export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
-            mkdir -p $ZIG_GLOBAL_CACHE_DIR
-            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
-            export GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
-            zig build --fetch=all
-          '';
-          installPhase = ''
-            mkdir -p $out
-            cp -r $TMPDIR/zig-cache/p $out/p
-          '';
-          dontFixup = true;
-        };
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             zig
             hyperfine
-            libjxl
-            zlib
           ];
-          shellHook = ''
-            export JXL_INCLUDE_PATH="${pkgs.libjxl.dev}/include"
-            export JXL_LIB_PATH="${pkgs.libjxl}/lib"
-          '';
         };
 
         packages.default = pkgs.stdenv.mkDerivation {
@@ -61,7 +29,6 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
-          buildInputs = [ pkgs.libjxl pkgs.zlib ];
           dontConfigure = true;
           dontInstall = true;
           dontFixup = true;
@@ -69,11 +36,7 @@
             export HOME="$TMPDIR"
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
-            cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
-            chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            zig build --prefix $out -Doptimize=ReleaseFast \
-              -Djxl-include-path=${pkgs.libjxl.dev}/include \
-              -Djxl-lib-path=${pkgs.libjxl}/lib
+            zig build --prefix $out -Doptimize=ReleaseFast
           '';
         };
 
@@ -86,19 +49,13 @@
               pkgs.darwin.cctools
               pkgs.apple-sdk
             ];
-          buildInputs = [ pkgs.libjxl pkgs.zlib ];
           dontConfigure = true;
           dontFixup = true;
           buildPhase = ''
             export HOME="$TMPDIR"
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
-            cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
-            chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            timeout 600 zig build test \
-              -Djxl-include-path=${pkgs.libjxl.dev}/include \
-              -Djxl-lib-path=${pkgs.libjxl}/lib \
-              || { echo "Tests failed"; exit 1; }
+            timeout 600 zig build test || { echo "Tests failed"; exit 1; }
           '';
           installPhase = ''
             mkdir -p $out
