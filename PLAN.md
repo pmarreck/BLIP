@@ -233,9 +233,13 @@
 
 # Project Split: BLIP / blar / mini_blar (2026-05-04)
 
+> **You are the BLIP agent.** Your working directory is `/Users/pmarreck/Documents-CloudManaged/BLIP/` and your remote is `pmarreck/BLIP`. **Execute Phase 1 only.** Phases 2 and 3 are for sibling agents in `/Users/pmarreck/Documents-CloudManaged/blar/` and `/Users/pmarreck/Documents-CloudManaged/mini_blar/` respectively — they're already running independently and will pick up Phase 2/3 once Phase 1 is done and BLIP `v3.0.0` is published.
+>
 > **For agentic workers:** Use **superpowers:subagent-driven-development** (recommended) or **superpowers:executing-plans** to execute this plan. Steps use checkbox (`- [ ]`) syntax.
 >
 > **Skip everything above this line.** The historical log is reference only — start reading at this section.
+>
+> **Phase 1 ends at Task 1.12 (BLIP v3.0.0 tagged and pushed).** Once that's done, your job is finished — Phases 2 and 3 belong to the sibling agents and they're documented here only as context for the overall split.
 
 **Goal:** Split the BLIP umbrella into three independent Zig/C projects: `BLIP` (pure spec + length-prefix encoding + LP envelope + generic containers + SEGMENT + sigil registry), `blar` (the archiver), `mini_blar` (constrained subset of blar). Each becomes a separately-versioned, separately-CI'd, separately-published project with a clean dependency graph.
 
