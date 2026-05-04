@@ -3,41 +3,7 @@
     .fingerprint = 0x159c7302186ec3ad,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.0",
-    .dependencies = .{
-        .z7z = .{
-            .url = "https://github.com/pmarreck/z7z/archive/d839d9fd18bedf7749f86c4cadaaada5dbc1f723.tar.gz",
-            .hash = "z7z-0.1.0-rkKuFwmuBgCU6yaAXj2eBMpGJme0nxUbD7MpLsMJvUs8",
-            .lazy = true,
-        },
-        .bzip2z = .{
-            .url = "https://github.com/pmarreck/bzip2z/archive/76d3ca8f35dad2c1393eb35d97332d5a8e9da2bb.tar.gz",
-            .hash = "bzip2z-0.1.0-m5NdlvkqAwCEafj8KkeEu4fIXSTRp-sKQewGM28tYrcr",
-            .lazy = true,
-        },
-        .lz4 = .{
-            .url = "https://github.com/pmarreck/lz4/archive/675532cbcc0609ddfc44a6e13240902574579a25.tar.gz",
-            .hash = "lz4-1.10.0-TtaqjVLWBwDiQxASdpBmT-44zoqcVnVkA9kQGAonGWDf",
-            .lazy = true,
-        },
-        .zstdz = .{
-            .url = "https://github.com/pmarreck/zstdz/archive/c79c202b8d6512a72a5b0b65ad771adfda66d301.tar.gz",
-            .hash = "zstdz-1.6.0-yDWjzshaNABOkMCYfrjAhKjPt46sKjdR9cLB-XgzeTt4",
-            .lazy = true,
-        },
-        .progrez = .{
-            .url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz",
-            .hash = "progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp",
-        },
-        .libmagic = .{
-            .url = "https://github.com/pmarreck/libmagic/archive/refs/tags/zig-0.15.0.tar.gz",
-            .hash = "libmagic-5.46.0-RysxHD9fCACu5caBjXS-x3qQnQM3nRfosCyktdVRzv-R",
-        },
-        .flac = .{
-            .url = "https://github.com/pmarreck/flac/archive/2ab4000.tar.gz",
-            .hash = "flac-0.0.0-AAAAAJIyAAAxIkuFSoeswLGASPNcGGpN604qoJ3z4qHT",
-            .lazy = true,
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

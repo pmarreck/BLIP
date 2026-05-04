@@ -1061,40 +1061,18 @@ test "encodeScalar: integer encoding matches plain encode" {
 // ---------------------------------------------------------------------------
 pub const encoding = @import("encoding.zig");
 pub const bignum_mod = @import("bignum.zig");
-pub const mini_blar_mod = @import("mini_blar.zig");
 pub const array_mod = @import("array.zig");
-// data_mod removed: data functionality merged into leaf.zig (v2 migration)
+pub const dict_mod = @import("dict.zig");
+pub const leaf_mod = @import("leaf.zig");
+pub const checksum_mod = @import("checksum.zig");
+pub const container_mod = @import("container.zig");
+pub const container_types = @import("container_types.zig");
 pub const peek_mod = @import("peek.zig");
-pub const poke_mod = @import("poke.zig");
-pub const json_serde = @import("json_serde.zig");
-pub const lzma2_mod = @import("lzma2.zig");
-pub const build_options = @import("build_options");
-pub const compression_mod = if (build_options.enable_compression)
-    @import("compression.zig")
-else
-    @import("compression_stub.zig");
-pub const encryption = @import("encryption.zig");
-pub const zip_mod = @import("zip.zig");
-pub const jxl_mod = @import("jxl.zig");
-pub const pdf_mod = @import("pdf.zig");
-pub const png_mod = @import("png.zig");
-pub const bmp_mod = @import("bmp.zig");
-pub const tar_mod = @import("tar.zig");
-pub const tiff_mod = @import("tiff.zig");
-pub const gif_mod = @import("gif.zig");
-pub const tga_mod = @import("tga.zig");
-pub const wav_mod = @import("wav.zig");
-pub const flac_mod = @import("flac.zig");
-pub const nifti_mod = @import("nifti.zig");
-pub const dicom_mod = @import("dicom.zig");
-pub const expansion_mod = @import("expansion.zig");
-pub const streaming_mod = @import("streaming.zig");
 pub const segmentation_mod = @import("segmentation.zig");
-pub const fits_mod = @import("fits.zig");
-pub const aiff_mod = @import("aiff.zig");
+pub const build_options = @import("build_options");
 
 // ---------------------------------------------------------------------------
-// Pull in tests from other encoding modules
+// Pull in tests from BLIP-side modules
 // ---------------------------------------------------------------------------
 test {
     _ = @import("leb128.zig");
@@ -1110,33 +1088,7 @@ test {
     _ = @import("leaf.zig");
     _ = @import("array.zig");
     _ = @import("dict.zig");
-    // data.zig removed: functionality merged into leaf.zig
     _ = @import("peek.zig");
-    _ = @import("poke.zig");
-    _ = @import("mini_blar.zig");
-    _ = @import("json_serde.zig");
-    _ = @import("lzma2.zig");
-    _ = if (build_options.enable_compression)
-        @import("compression.zig")
-    else
-        @import("compression_stub.zig");
-    _ = @import("encryption.zig");
     _ = @import("checksum.zig");
-    _ = @import("zip.zig");
-    _ = @import("jxl.zig");
-    _ = @import("pdf.zig");
-    _ = @import("png.zig");
-    _ = @import("bmp.zig");
-    _ = @import("tar.zig");
-    _ = @import("tiff.zig");
-    _ = @import("gif.zig");
-    _ = @import("tga.zig");
-    _ = @import("wav.zig");
-    _ = @import("flac.zig");
-    _ = @import("aiff.zig");
-    _ = @import("fits.zig");
-    _ = @import("dicom.zig");
-    _ = @import("expansion.zig");
-    _ = @import("streaming.zig");
     _ = @import("segmentation.zig");
 }

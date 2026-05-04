@@ -1,6 +1,8 @@
 # BLIP Split Inventory (temporary, delete after Phase 1)
 
 > Snapshot of the carve-out classification for every file under `src/` and `tests/` plus top-level build/spec/meta files. Used during Phase 1 only; deleted in Task 1.11.
+>
+> **Revision note (2026-05-04):** the original PLAN classification under-estimated how deeply archive types are woven into `poke.zig` and `json_serde.zig`. Both turn out to be archive-coupled (every function takes `mini_blar.FileEntry` / `ArchiveEntry` / `ArchiveReader`). Likewise, every shell test in `tests/` invokes `blar` / `miniblar` binaries — there is no BLIP-only CLI test surface. Reclassified accordingly.
 
 ## STAYS in BLIP
 
@@ -12,10 +14,8 @@
 - leaf.zig                  # UTF8 + DATA leaf containers
 - array.zig                 # ARRAY container
 - dict.zig                  # DICT only — split out FILE/DIR (Task 1.5)
-- peek.zig                  # BLIP navigation API
-- poke.zig                  # BLIP mutation API
+- peek.zig                  # generic LP envelope path traversal (no archive coupling)
 - segmentation.zig          # SEGMENT transport-fragmentation primitive
-- json_serde.zig            # generic LP-envelope <-> JSON (part of BLIP library API)
 - encoding.zig              # comparison varint interface (used by benchmarks)
 - leb128.zig                # comparison varint
 - protobuf_varint.zig       # comparison varint
@@ -35,18 +35,11 @@
 - BLIP_CONTAINER_SPEC.md
 - docs/transport_embedding.md
 
-### Tests (tests/)
-- peek_test.sh              # tests BLIP peek navigation
-- poke_test.sh              # tests BLIP poke mutation
-- segmentation_test.sh      # KEEP only the segment-arbitrary-bytes tests; split in Task 1.6
-- text_roundtrip_test.sh    # tests BLIP text format roundtrip
-- binary_format_test.sh     # tests BLIP binary roundtrip
-
 ### Build
 - flake.nix                 # trim to BLIP-only inputs/outputs (Task 1.8)
 - build.zig                 # trim to BLIP-only artifacts (Task 1.7)
 - build.zig.zon             # trim deps
-- ./build, ./test, ./bm     # entry-point scripts
+- ./build, ./test, ./bm     # entry-point scripts (drop shell test loop in `./test`)
 
 ### Meta
 - README.md, CLAUDE.md, AGENTS.md, RULES.md, PROJECT_OVERVIEW.md, CODE_MINIMAP.md, PLAN.md
@@ -66,33 +59,35 @@
 - compression_stub.zig      # archive compression stub
 - lzma2.zig                 # LZMA2 codec
 - encryption.zig            # archive encryption
+- json_serde.zig            # archive↔JSON (depends on `mini_blar.ArchiveEntry`)
+- poke.zig                  # archive-entry mutation (every fn takes `FileEntry`/`DirEntry`)
 - jxl.zig, flac.zig, pdf.zig, png.zig, bmp.zig, tar.zig, tiff.zig, gif.zig, tga.zig, wav.zig, aiff.zig, fits.zig, dicom.zig, nifti.zig, zip.zig
                             # codec expansion adapters
 
 ### Source (src/) — to mini_blar
-- mini_blar.zig             # high-level archive API
+- mini_blar.zig             # high-level archive API (FileEntry, ArchiveReader, etc.)
 - miniblar.c                # mini_blar CLI
 
 ### Other
 - macos-app/                # blar GUI
 
 ### Tests (tests/) — to blar
+All shell tests reference the `blar`/`miniblar` binaries; none drive BLIP directly.
+- peek_test.sh, poke_test.sh
+- binary_format_test.sh, text_roundtrip_test.sh
+- segmentation_test.sh, json_test.sh, tri_representation_test.sh
 - blar_test.sh, blar_full_test.sh
 - compression_test.sh, encryption_test.sh
 - container_expansion_test.sh, container_expansion_dual_test.sh
 - pdf_container_test.sh, png_container_test.sh
-- streaming_test.sh
-- explode_implode_test.sh
-- json_test.sh              # invokes blar/miniblar binaries — moves with blar
-- tri_representation_test.sh # invokes blar binary — moves with blar
+- streaming_test.sh, explode_implode_test.sh
 
 ### Tests (tests/) — to mini_blar
 - miniblar_test.sh
 
 ## Notes
 
-- `json_serde.zig` stays as a generic LP-envelope <-> JSON utility (part of BLIP's library surface). The integration tests that exercise it through `blar`/`miniblar` CLIs (`json_test.sh`, `tri_representation_test.sh`) move with the blar agent, where those binaries continue to exist. If/when BLIP grows its own JSON CLI surface, those tests can be re-added in a smaller form.
-- `printable_binary` is already a separate repo and is not present under `src/` or `tests/` — see Task 1.4a.
-- `LICENSE`, `inbox/` and the spec markdowns are project-wide and trivially stay.
+- BLIP retains no shell tests. Coverage is via `nix develop -c zig build test` (the Zig unit tests in each module — currently ~841 tests, of which the codec/archive subset is going away with the deleted modules; expect ~500-600 tests post-trim).
+- `printable_binary` remains an external dep of BLIP (decision (a) in Task 1.4a) so the FFI exports `blip_decode_printable_binary`/`blip_encode_printable_binary` survive.
 - `dict.zig` STAYS but is split (FILE/DIR archive types extracted in Task 1.5).
-- `segmentation_test.sh` STAYS but is split (archive-level segment/join tests extracted in Task 1.6).
+- `LICENSE`, `inbox/` and the spec markdowns are project-wide and trivially stay.
