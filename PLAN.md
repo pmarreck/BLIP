@@ -1184,11 +1184,134 @@ blip_detect_codec
 blip_zlib_*, blip_gz_*
 ```
 
-These keep the `blip_archive_` / `blip_zip_` / etc. naming for backward compat with existing consumers — though arguably they should be renamed to `blar_*` for clarity. **Decision:** rename to `blar_*` for symbols that are clearly archive-specific (e.g. `blip_archive_create` → `blar_create`). Keep `blip_*` only for symbols that wrap BLIP primitives (e.g. `blip_zlib_decompress` → could stay `blip_*` since zlib decompression is generic).
+**Symbol-rename rule (locked in):** every FFI symbol that moves to blar gets its `blip_` prefix replaced with `blar_`.  Symbols that **stay in BLIP** keep their `blip_` prefix.  This makes the prefix tell you which library a function comes from, with no ambiguity.
 
-Actually for v1 of this split, **keep all symbol names as-is** to minimize churn. Cross-project rename can be a follow-up cleanup.
+| Original (BLIP umbrella) | Renamed (blar) |
+|---|---|
+| `blip_archive_create` | `blar_create` |
+| `blip_archive_create_full` | `blar_create_full` |
+| `blip_archive_create_streaming` | `blar_create_streaming` |
+| `blip_archive_file_count` | `blar_file_count` |
+| `blip_archive_file_path` | `blar_file_path` |
+| `blip_archive_file_content` | `blar_file_content` |
+| `blip_archive_file_content_by_path` | `blar_file_content_by_path` |
+| `blip_archive_file_verify` | `blar_file_verify` |
+| `blip_archive_verify` | `blar_verify` |
+| `blip_archive_verify_merkle` | `blar_verify_merkle` |
+| `blip_archive_entry_type` | `blar_entry_type` |
+| `blip_archive_entry_metadata` | `blar_entry_metadata` |
+| `blip_archive_entry_metadata_full` | `blar_entry_metadata_full` |
+| `blip_archive_entry_xattrs` | `blar_entry_xattrs` |
+| `blip_archive_entry_container_type` | `blar_entry_container_type` |
+| `blip_archive_entry_zip_comp` | `blar_entry_zip_comp` |
+| `blip_archive_entry_pdf_offset` | `blar_entry_pdf_offset` |
+| `blip_archive_entry_pdf_length` | `blar_entry_pdf_length` |
+| `blip_archive_entry_jxl_source` | `blar_entry_jxl_source` |
+| `blip_zip_*` (all) | `blar_zip_*` |
+| `blip_pdf_*` (all) | `blar_pdf_*` |
+| `blip_is_pdf` / `blip_is_zip` | `blar_is_pdf` / `blar_is_zip` |
+| `blip_is_wav` / `blip_is_aiff` / `blip_is_fits` / `blip_is_dicom` / `blip_is_nifti` / `blip_is_gz` | `blar_is_*` (each) |
+| `blip_expand_file` / `blip_collapse_container` | `blar_expand_file` / `blar_collapse_container` |
+| `blip_wav_to_flac` / `blip_flac_to_wav` / `blip_aiff_to_flac` / `blip_flac_to_aiff` | `blar_*` (each) |
+| `blip_fits_parse` / `blip_dicom_parse` | `blar_fits_parse` / `blar_dicom_parse` |
+| `blip_detect_codec` | `blar_detect_codec` |
+| `blip_zlib_decompress` / `blip_zlib_compress` | `blar_zlib_decompress` / `blar_zlib_compress` |
+| `blip_gz_decompress` / `blip_gz_compress` / `blip_gz_compress_level` / `blip_gz_guess_level` | `blar_gz_*` (each) |
+| `blip_free_xattrs` | `blar_free_xattrs` (xattrs are archive metadata) |
+| `blip_archive_*` error string entries in `blip_error_string` | move to a new `blar_error_string` |
 
-Remove BLIP-side exports that came along: `blip_encode`, `blip_decode`, `blip_segment_*`, `blip_xxhash64`, `blip_peek`, `blip_poke`, etc. — these now come from `libblip` via the BLIP dep.
+**Stays `blip_*`** (now lives in BLIP via the dep, not in blar's lib.zig):
+- `blip_encode`, `blip_decode`, `blip_is_sentinel`, `blip_encoded_size`
+- `blip_peek`, `blip_poke`, `blip_container_*`, `blip_peek_display`
+- `blip_to_json`, `blip_from_json`, `blip_decode_printable_binary`, `blip_encode_printable_binary`
+- `blip_is_compressed`, `blip_is_encrypted` (LP envelope-level)
+- `blip_compress_container`, `blip_decompress_container` (LP envelope-level COMP)
+- `blip_encrypt_container`, `blip_decrypt_container` (LP envelope-level ENC)
+- `blip_segment_*` (segmentation primitive)
+- `blip_xxhash64`, `blip_normalize_path`
+- `blip_free`, `blip_free_content`
+- `blip_error_string` (BLIP-only error codes)
+
+- [ ] **Step 3a: Apply the rename across blar's source tree**
+
+```bash
+cd /Users/pmarreck/Documents-CloudManaged/blar
+
+# Source files: rename in lib.zig, blar.h (already renamed), blar.c, blar_common.h, every codec .zig
+# Use a single sed pass with all the substitutions.
+SED_SCRIPT='
+s/\bblip_archive_create_full\b/blar_create_full/g
+s/\bblip_archive_create_streaming\b/blar_create_streaming/g
+s/\bblip_archive_create\b/blar_create/g
+s/\bblip_archive_file_count\b/blar_file_count/g
+s/\bblip_archive_file_path\b/blar_file_path/g
+s/\bblip_archive_file_content_by_path\b/blar_file_content_by_path/g
+s/\bblip_archive_file_content\b/blar_file_content/g
+s/\bblip_archive_file_verify\b/blar_file_verify/g
+s/\bblip_archive_verify_merkle\b/blar_verify_merkle/g
+s/\bblip_archive_verify\b/blar_verify/g
+s/\bblip_archive_entry_type\b/blar_entry_type/g
+s/\bblip_archive_entry_metadata_full\b/blar_entry_metadata_full/g
+s/\bblip_archive_entry_metadata\b/blar_entry_metadata/g
+s/\bblip_archive_entry_xattrs\b/blar_entry_xattrs/g
+s/\bblip_archive_entry_container_type\b/blar_entry_container_type/g
+s/\bblip_archive_entry_zip_comp\b/blar_entry_zip_comp/g
+s/\bblip_archive_entry_pdf_offset\b/blar_entry_pdf_offset/g
+s/\bblip_archive_entry_pdf_length\b/blar_entry_pdf_length/g
+s/\bblip_archive_entry_jxl_source\b/blar_entry_jxl_source/g
+s/\bblip_zip_/blar_zip_/g
+s/\bblip_pdf_/blar_pdf_/g
+s/\bblip_is_pdf\b/blar_is_pdf/g
+s/\bblip_is_zip\b/blar_is_zip/g
+s/\bblip_is_wav\b/blar_is_wav/g
+s/\bblip_is_aiff\b/blar_is_aiff/g
+s/\bblip_is_fits\b/blar_is_fits/g
+s/\bblip_is_dicom\b/blar_is_dicom/g
+s/\bblip_is_nifti\b/blar_is_nifti/g
+s/\bblip_is_gz\b/blar_is_gz/g
+s/\bblip_expand_file\b/blar_expand_file/g
+s/\bblip_collapse_container\b/blar_collapse_container/g
+s/\bblip_wav_to_flac\b/blar_wav_to_flac/g
+s/\bblip_flac_to_wav\b/blar_flac_to_wav/g
+s/\bblip_aiff_to_flac\b/blar_aiff_to_flac/g
+s/\bblip_flac_to_aiff\b/blar_flac_to_aiff/g
+s/\bblip_fits_parse\b/blar_fits_parse/g
+s/\bblip_dicom_parse\b/blar_dicom_parse/g
+s/\bblip_detect_codec\b/blar_detect_codec/g
+s/\bblip_zlib_/blar_zlib_/g
+s/\bblip_gz_/blar_gz_/g
+s/\bblip_free_xattrs\b/blar_free_xattrs/g
+'
+
+# Apply to all relevant source files
+find src tests -type f \( -name "*.zig" -o -name "*.c" -o -name "*.h" -o -name "*.sh" \) \
+  -exec sed -i '' "$SED_SCRIPT" {} \;
+
+# Verify no stray blip_archive_/blip_zip_/etc. left
+grep -rn "blip_archive_\|blip_zip_\|blip_pdf_\|blip_expand_file\|blip_collapse_container" src tests || echo "rename clean"
+```
+
+Expected: "rename clean" message.  If any stragglers, add to the sed script and re-run.
+
+- [ ] **Step 3b: Add a `blar_error_string` and remove blar-specific error codes from BLIP**
+
+In `src/lib.zig` (now blar-only), add:
+```zig
+export fn blar_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
+    return switch (error_code) {
+        // ZIP, PDF, JXL, encryption, etc. error codes
+        ...
+    };
+}
+```
+
+Move all blar-specific cases out of the (now BLIP-resident) `blip_error_string`.  In `src/blar.h`, declare:
+```c
+const char *blar_error_string(int32_t error_code);
+```
+
+Update C callers in `blar.c` to call `blar_error_string` for blar-side error codes and `blip_error_string` for BLIP-side codes.  Or, simpler: have `blar_error_string` fall through to `blip_error_string` for unknown codes.
+
 
 - [ ] **Step 4: Verify the build**
 
@@ -1560,6 +1683,8 @@ A successful completion of this plan means:
 7. ✅ `BLIP/BLIP_SIGIL_REGISTRY.md` cross-references blar/mini_blar for sigil semantics
 8. ✅ Consumer-project inbox notes (validate_gui, entropy_shield) updated to disambiguate
 9. ✅ blip_mp/SPEC.md references the new BLIP repo
+10. ✅ blar's FFI symbols use `blar_*` prefix (not `blip_archive_*`); BLIP's symbols still use `blip_*`. Renaming applied per the table in Task 2.4 Step 3.
+11. ✅ blar's C header is `src/blar.h` (renamed from `src/blip.h`); consumers `#include "blar.h"`.
 
 ---
 
