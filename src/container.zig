@@ -263,7 +263,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
         error.Overflow => return ContainerError.Overflow,
         error.BufferTooSmall => return ContainerError.BufferTooSmall,
     };
-    const type_id = std.meta.intToEnum(ContainerTypeId, @as(u7, @truncate(type_result.value))) catch
+    const type_id = std.enums.fromInt(ContainerTypeId, @as(u7, @truncate(type_result.value))) orelse
         return ContainerError.InvalidContainerType;
     pos += type_result.bytes_read;
 
@@ -320,7 +320,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                     error.Overflow => return ContainerError.Overflow,
                     error.BufferTooSmall => return ContainerError.BufferTooSmall,
                 };
-                comp_id = std.meta.intToEnum(CompressionId, @as(u7, @truncate(comp_result.value))) catch
+                comp_id = std.enums.fromInt(CompressionId, @as(u7, @truncate(comp_result.value))) orelse
                     return ContainerError.InvalidContainerType;
                 pos += comp_result.bytes_read;
             },
@@ -339,7 +339,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                     error.Overflow => return ContainerError.Overflow,
                     error.BufferTooSmall => return ContainerError.BufferTooSmall,
                 };
-                csum_id = std.meta.intToEnum(ChecksumId, @as(u7, @truncate(csum_result.value))) catch
+                csum_id = std.enums.fromInt(ChecksumId, @as(u7, @truncate(csum_result.value))) orelse
                     return ContainerError.InvalidContainerType;
                 pos += csum_result.bytes_read;
             },
@@ -350,7 +350,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                     error.Overflow => return ContainerError.Overflow,
                     error.BufferTooSmall => return ContainerError.BufferTooSmall,
                 };
-                enc_id = std.meta.intToEnum(ct.EncryptionId, @as(u7, @truncate(enc_result.value))) catch
+                enc_id = std.enums.fromInt(ct.EncryptionId, @as(u7, @truncate(enc_result.value))) orelse
                     return ContainerError.InvalidContainerType;
                 pos += enc_result.bytes_read;
 
@@ -360,7 +360,7 @@ pub fn parseLPHeader(buf: []const u8) LPContainerError!LPContainerView {
                     error.Overflow => return ContainerError.Overflow,
                     error.BufferTooSmall => return ContainerError.BufferTooSmall,
                 };
-                kdf_id = std.meta.intToEnum(ct.KdfId, @as(u7, @truncate(kdf_result.value))) catch
+                kdf_id = std.enums.fromInt(ct.KdfId, @as(u7, @truncate(kdf_result.value))) orelse
                     return ContainerError.InvalidContainerType;
                 pos += kdf_result.bytes_read;
 

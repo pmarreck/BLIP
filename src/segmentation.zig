@@ -238,7 +238,7 @@ pub fn reassemble(
     expected_stream_id: u64,
 ) SegError![]u8 {
     // Step 1+2: parse + filter by I, drop CSUM-failing copies
-    var survivors = std.ArrayListUnmanaged(SegInfo){};
+    var survivors: std.ArrayListUnmanaged(SegInfo) = .empty;
     defer survivors.deinit(allocator);
 
     for (segments) |seg_buf| {
@@ -271,7 +271,7 @@ pub fn reassemble(
         }
     }.lt);
 
-    var deduped = std.ArrayListUnmanaged(SegInfo){};
+    var deduped: std.ArrayListUnmanaged(SegInfo) = .empty;
     defer deduped.deinit(allocator);
     var i: usize = 0;
     while (i < survivors.items.len) {

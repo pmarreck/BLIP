@@ -49,10 +49,7 @@ fn genValue(dist: Distribution, rng: std.Random) u64 {
 // Helpers
 // ============================================================================
 
-const WriterType = @TypeOf(blk: {
-    var buf: [1]u8 = undefined;
-    break :blk std.fs.File.stderr().writer(&buf).interface;
-});
+const WriterType = std.Io.Writer;
 
 /// Format a u64 with comma separators (e.g., 1,234,567).
 fn fmtComma(value: u64, buf: []u8) []const u8 {
@@ -106,7 +103,15 @@ fn printNsPerOp(stderr: *WriterType, total_ns: u64, count: u64) !void {
     try stderr.print(" | {d:>4}.{d}", .{ whole, frac });
 }
 
-fn benchThroughput(stderr: *WriterType, allocator: std.mem.Allocator) !void {
+/// Returns the number of nanoseconds elapsed since `start_ts`.
+fn elapsedNs(io: std.Io, start_ts: std.Io.Timestamp) u64 {
+    const now_ts = std.Io.Timestamp.now(io, .awake);
+    const n: i96 = now_ts.nanoseconds - start_ts.nanoseconds;
+    if (n < 0) return 0;
+    return @intCast(n);
+}
+
+fn benchThroughput(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocator) !void {
     try stderr.writeAll("\n--- Throughput (ns/op, 1M values, best of 3) ---\n");
     try stderr.writeAll("Encoding        | Sm enc | Sm dec | Md enc | Md dec | Bi enc | Bi dec | Lg enc | Lg dec\n");
     try stderr.writeAll("----------------+--------+--------+--------+--------+--------+--------+--------+--------\n");
@@ -138,12 +143,12 @@ fn benchThroughput(stderr: *WriterType, allocator: std.mem.Allocator) !void {
             var best_enc_ns: u64 = std.math.maxInt(u64);
             for (0..THROUGHPUT_RUNS) |_| {
                 var enc_pos: usize = 0;
-                var timer = try std.time.Timer.start();
+                const t_start = std.Io.Timestamp.now(io, .awake);
                 for (values) |val| {
                     const n = Enc.encode(val, encoded_buf[enc_pos..]) catch unreachable;
                     enc_pos += n;
                 }
-                const elapsed = timer.read();
+                const elapsed = elapsedNs(io, t_start);
                 doNotOptimizeAway(enc_pos);
                 if (elapsed < best_enc_ns) best_enc_ns = elapsed;
             }
@@ -162,12 +167,12 @@ fn benchThroughput(stderr: *WriterType, allocator: std.mem.Allocator) !void {
             var best_dec_ns: u64 = std.math.maxInt(u64);
             for (0..THROUGHPUT_RUNS) |_| {
                 var checksum: u64 = 0;
-                var timer = try std.time.Timer.start();
+                const t_start = std.Io.Timestamp.now(io, .awake);
                 for (encoded_offsets) |off| {
                     const result = Enc.decode(encoded_buf[off..]) catch unreachable;
                     checksum +%= result.value;
                 }
-                const elapsed = timer.read();
+                const elapsed = elapsedNs(io, t_start);
                 doNotOptimizeAway(checksum);
                 if (elapsed < best_dec_ns) best_dec_ns = elapsed;
             }
@@ -252,7 +257,7 @@ fn blipReencode(payload: []const u8, buf: []u8) !usize {
     return error.BufferTooSmall;
 }
 
-fn benchBignum(stderr: *WriterType) !void {
+fn benchBignum(io: std.Io, stderr: *WriterType) !void {
     try stderr.writeAll("\n--- Bignum Add (ns/op, 100K iterations) ---\n");
     try stderr.print("{s:<15} | {s:>10} | {s:>10}\n", .{ "Encoding", "Roundtrip", "Direct LE" });
     try stderr.writeAll("----------------+------------+------------\n");
@@ -275,7 +280,7 @@ fn benchBignum(stderr: *WriterType) !void {
             var b_buf: [16]u8 = undefined;
             const b_n = Enc.encode(B, &b_buf) catch unreachable;
 
-            var timer = try std.time.Timer.start();
+            const t_start = std.Io.Timestamp.now(io, .awake);
             for (0..BIGNUM_ITERS) |_| {
                 // Decode current A and constant B
                 const da = Enc.decode(cur_buf[0..cur_n]) catch unreachable;
@@ -301,7 +306,7 @@ fn benchBignum(stderr: *WriterType) !void {
                 // Re-encode as the next iteration's A
                 cur_n = Enc.encode(sum, &cur_buf) catch unreachable;
             }
-            const elapsed = timer.read();
+            const elapsed = elapsedNs(io, t_start);
             doNotOptimizeAway(cur_buf);
             if (elapsed < best_rt_ns) best_rt_ns = elapsed;
         }
@@ -325,7 +330,7 @@ fn benchBignum(stderr: *WriterType) !void {
                 var b_buf: [16]u8 = undefined;
                 const b_n = Enc.encode(B, &b_buf) catch unreachable;
 
-                var timer = try std.time.Timer.start();
+                const t_start = std.Io.Timestamp.now(io, .awake);
                 for (0..BIGNUM_ITERS) |_| {
                     // Extract payload directly
                     const pa = blipPayloadSlice(cur_buf[0..cur_n]);
@@ -344,7 +349,7 @@ fn benchBignum(stderr: *WriterType) !void {
                     const trim_len = @min(result_len, 8);
                     cur_n = blipReencode(out[0..trim_len], &cur_buf) catch unreachable;
                 }
-                const elapsed = timer.read();
+                const elapsed = elapsedNs(io, t_start);
                 doNotOptimizeAway(cur_buf);
                 if (elapsed < best_direct_ns) best_direct_ns = elapsed;
             }
@@ -368,7 +373,11 @@ fn benchBignum(stderr: *WriterType) !void {
 // ============================================================================
 
 fn getSparsePath() []const u8 {
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const tmpdir: []const u8 = blk: {
+        const c_tmpdir = std.c.getenv("TMPDIR");
+        if (c_tmpdir == null) break :blk "/tmp";
+        break :blk std.mem.span(c_tmpdir.?);
+    };
     const S = struct {
         var path_buf: [4096]u8 = undefined;
     };
@@ -384,24 +393,24 @@ fn getSparsePath() []const u8 {
     return S.path_buf[0..pos];
 }
 
-fn checkMagic(file_path: []const u8) bool {
-    const file = std.fs.cwd().openFile(file_path, .{}) catch return false;
-    defer file.close();
+fn checkMagic(io: std.Io, file_path: []const u8) bool {
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch return false;
+    defer file.close(io);
     var buf: [8]u8 = undefined;
-    const n = file.pread(&buf, 0) catch return false;
+    const n = file.readPositional(io, &.{&buf}, 0) catch return false;
     if (n < 8) return false;
     return std.mem.eql(u8, buf[0..8], MAGIC);
 }
 
-fn generateSparseFile(file_path: []const u8, stderr: *WriterType, allocator: std.mem.Allocator) !void {
+fn generateSparseFile(io: std.Io, file_path: []const u8, stderr: *WriterType, allocator: std.mem.Allocator) !void {
     try stderr.writeAll("  Generating sparse benchmark file...\n");
     try stderr.flush();
 
-    const file = try std.fs.cwd().createFile(file_path, .{ .read = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .read = true });
+    defer file.close(io);
 
     // Write magic header
-    try file.pwriteAll(MAGIC, 0);
+    try file.writePositionalAll(io, MAGIC, 0);
 
     // Heap-allocate positions array (10K * 8 = 80KB)
     const positions = try allocator.alloc(u64, JUMP_COUNT);
@@ -431,7 +440,7 @@ fn generateSparseFile(file_path: []const u8, stderr: *WriterType, allocator: std
             const next_pos = if (i + 1 < JUMP_COUNT) positions[i + 1] else positions[0];
             var enc_buf: [16]u8 = undefined;
             const n = Enc.encode(next_pos, &enc_buf) catch unreachable;
-            try file.pwriteAll(enc_buf[0..n], positions[i]);
+            try file.writePositionalAll(io, enc_buf[0..n], positions[i]);
         }
     }
 
@@ -439,7 +448,7 @@ fn generateSparseFile(file_path: []const u8, stderr: *WriterType, allocator: std
     try stderr.flush();
 }
 
-fn benchRandomAccess(stderr: *WriterType, allocator: std.mem.Allocator) !void {
+fn benchRandomAccess(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocator) !void {
     try stderr.writeAll("\n--- Random-Access Jumps (jumps/sec, 10K chain) ---\n");
     try stderr.print("{s:<15} | {s:>15}\n", .{ "Encoding", "Jumps/sec" });
     try stderr.writeAll("----------------+-----------------\n");
@@ -447,15 +456,15 @@ fn benchRandomAccess(stderr: *WriterType, allocator: std.mem.Allocator) !void {
 
     const file_path = getSparsePath();
 
-    if (!checkMagic(file_path)) {
-        try generateSparseFile(file_path, stderr, allocator);
+    if (!checkMagic(io, file_path)) {
+        try generateSparseFile(io, file_path, stderr, allocator);
     } else {
         try stderr.writeAll("  Reusing existing benchmark file.\n");
         try stderr.flush();
     }
 
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
 
     // Heap-allocate positions for reconstruction
     const positions = try allocator.alloc(u64, JUMP_COUNT);
@@ -485,15 +494,15 @@ fn benchRandomAccess(stderr: *WriterType, allocator: std.mem.Allocator) !void {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..THROUGHPUT_RUNS) |_| {
             var current_pos: u64 = start_pos;
-            var timer = try std.time.Timer.start();
+            const t_start = std.Io.Timestamp.now(io, .awake);
             for (0..JUMP_COUNT) |_| {
                 var read_buf: [16]u8 = undefined;
-                const bytes_read = file.pread(&read_buf, current_pos) catch break;
+                const bytes_read = file.readPositional(io, &.{&read_buf}, current_pos) catch break;
                 if (bytes_read == 0) break;
                 const result = Enc.decode(read_buf[0..bytes_read]) catch break;
                 current_pos = result.value;
             }
-            const elapsed = timer.read();
+            const elapsed = elapsedNs(io, t_start);
             doNotOptimizeAway(current_pos);
             if (elapsed < best_ns) best_ns = elapsed;
         }
@@ -511,9 +520,11 @@ fn benchRandomAccess(stderr: *WriterType, allocator: std.mem.Allocator) !void {
 // Main
 // ============================================================================
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     var stderr_buf: [8192]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
     const allocator = std.heap.page_allocator;
@@ -521,13 +532,13 @@ pub fn main() !void {
     try stderr.writeAll("\n=== BLIP Benchmark Suite ===\n");
     try stderr.flush();
 
-    try benchThroughput(stderr, allocator);
+    try benchThroughput(io, stderr, allocator);
     try stderr.flush();
 
-    try benchBignum(stderr);
+    try benchBignum(io, stderr);
     try stderr.flush();
 
-    try benchRandomAccess(stderr, allocator);
+    try benchRandomAccess(io, stderr, allocator);
     try stderr.flush();
 
     try stderr.writeByte('\n');

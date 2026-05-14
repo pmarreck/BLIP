@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.linkLibrary(static_lib);
+    exe.root_module.linkLibrary(static_lib);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

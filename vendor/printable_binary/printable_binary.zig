@@ -719,7 +719,7 @@ pub fn decode(allocator: std.mem.Allocator, input: []const u8, options: DecodeOp
 /// Format encoded output into groups for readability.
 /// Caller owns the returned slice and must free it with the same allocator.
 pub fn format(allocator: std.mem.Allocator, input: []const u8, options: FormatOptions) ![]u8 {
-    var result: std.ArrayListUnmanaged(u8) = .{};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
     const separator: u8 = if (options.use_tabs) '\t' else ' ';
@@ -1471,7 +1471,7 @@ test "decode: mixed known and unknown UTF-8" {
     defer allocator.free(world_encoded);
 
     // Interleave with snowman
-    var mixed: std.ArrayListUnmanaged(u8) = .{};
+    var mixed: std.ArrayListUnmanaged(u8) = .empty;
     defer mixed.deinit(allocator);
     try mixed.appendSlice(allocator, hello_encoded);
     try mixed.appendSlice(allocator, "\xe2\x98\x83"); // snowman
@@ -1510,7 +1510,7 @@ test "decode: strip whitespace option" {
     defer allocator.free(encoded);
 
     // Insert whitespace
-    var with_ws: std.ArrayListUnmanaged(u8) = .{};
+    var with_ws: std.ArrayListUnmanaged(u8) = .empty;
     defer with_ws.deinit(allocator);
     try with_ws.appendSlice(allocator, encoded);
     try with_ws.insertSlice(allocator, 2, "\n  \t");

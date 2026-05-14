@@ -115,7 +115,7 @@ pub fn attrSentinel(attr: AttributeSigil) [2]u8 {
 pub fn parseAttrSigil(buf: []const u8) ?AttributeSigil {
     if (buf.len < 2) return null;
     if (buf[0] != SENTINEL_BYTE) return null;
-    return std.meta.intToEnum(AttributeSigil, @as(u7, @truncate(buf[1]))) catch null;
+    return std.enums.fromInt(AttributeSigil, @as(u7, @truncate(buf[1])));
 }
 
 // =============================================================================

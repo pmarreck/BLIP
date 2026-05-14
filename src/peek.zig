@@ -49,7 +49,7 @@ pub const PathError = error{
 /// Parse a path string like "[1][0][pa].keys" into segments + accessor.
 /// Caller owns the returned segment array (allocated with the provided allocator).
 pub fn parsePath(allocator: Allocator, path_str: []const u8) PathError!ParsedPath {
-    var segments: std.ArrayListUnmanaged(PathSegment) = .{};
+    var segments: std.ArrayListUnmanaged(PathSegment) = .empty;
     errdefer segments.deinit(allocator);
 
     var accessor: Accessor = .none;
@@ -449,9 +449,9 @@ pub fn peekDisplay(
     path: []const u8,
     flags: PeekFlags,
 ) !PeekResult {
-    var stdout_list: std.ArrayListUnmanaged(u8) = .{};
+    var stdout_list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer stdout_list.deinit(allocator);
-    var stderr_list: std.ArrayListUnmanaged(u8) = .{};
+    var stderr_list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer stderr_list.deinit(allocator);
 
     // Parse path into segments + accessor

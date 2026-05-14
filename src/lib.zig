@@ -277,7 +277,7 @@ export fn blip_segment_chunk(
     out_segments: *[*]CSegment,
     out_count: *usize,
 ) callconv(.c) i32 {
-    const cid: ?ct.ChecksumId = if (csum_id == 0) null else std.meta.intToEnum(ct.ChecksumId, @as(u7, @truncate(csum_id))) catch return -50;
+    const cid: ?ct.ChecksumId = if (csum_id == 0) null else (std.enums.fromInt(ct.ChecksumId, @as(u7, @truncate(csum_id))) orelse return -50);
     const segs = segmentation_mod.chunkBytes(page_allocator, data[0..data_len], max_payload, stream_id, cid) catch |e| return segErrorCode(e);
     const arr = page_allocator.alloc(CSegment, segs.len) catch {
         for (segs) |s| page_allocator.free(s);

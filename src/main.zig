@@ -17,24 +17,26 @@ fn osName() []const u8 {
     return @tagName(builtin.os.tag);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
     if (builtin.mode == .Debug) {
         try stderr.print("\x1b[33mWARNING: debug build \xe2\x80\x94 benchmarks will not be representative\x1b[0m\n", .{});
     }
 
-    // Parse args
-    var args = std.process.args();
-    _ = args.next(); // skip program name
+    // Parse args via Juicy Main
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.next()) |arg| {
+    if (args.len >= 2) {
+        const arg = args[1];
         if (std.mem.eql(u8, arg, "--about")) {
             try stdout.print("BLIP v0.1.0 {s}-{s}\n", .{ archName(), osName() });
             try stdout.flush();
