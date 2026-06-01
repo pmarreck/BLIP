@@ -390,8 +390,9 @@ pub const DictReader = struct {
         return null;
     }
 
-    /// Verify keys are in canonical non-decreasing order — the invariant that
-    /// findKey's binary search relies on. Returns KeysNotSorted on violation.
+    /// Verify keys are in strictly ascending order — the invariant that
+    /// findKey's binary search relies on. Returns KeysNotSorted if a key is
+    /// greater than its successor, or DuplicateKey if two adjacent keys are equal.
     /// O(n); used as a Debug-only self-check in init and directly in tests.
     pub fn verifyKeysSorted(self: DictReader) LPContainerError!void {
         if (self.count < 2) return;
@@ -399,7 +400,11 @@ pub const DictReader = struct {
         var i: u64 = 1;
         while (i < self.count) : (i += 1) {
             const cur = try extractKeyBytes(try self.keyAt(i));
-            if (compareKeys(prev, cur) == .gt) return ContainerError.KeysNotSorted;
+            switch (compareKeys(prev, cur)) {
+                .gt => return ContainerError.KeysNotSorted,
+                .eq => return ContainerError.DuplicateKey,
+                .lt => {},
+            }
             prev = cur;
         }
     }
@@ -959,8 +964,18 @@ test "DictReader.verifyKeysSorted flags out-of-order keys" {
     const bytes = try serializeDictLike(allocator, &pairs, .dict, .{});
     defer allocator.free(bytes);
 
-    const reader = try DictReader.init(bytes); // init's Debug check is off in ReleaseFast test build
+    const reader = try DictReader.init(bytes); // init triggers verifyKeysSorted only in Debug builds; in ReleaseFast (default) this succeeds
     try testing.expectError(ContainerError.KeysNotSorted, reader.verifyKeysSorted());
+
+    // Equal adjacent keys are rejected as DuplicateKey.
+    const dup_pairs = [_]KeyValue{
+        .{ .key = k_alpha, .value = v },
+        .{ .key = k_alpha, .value = v },
+    };
+    const dup_bytes = try serializeDictLike(allocator, &dup_pairs, .dict, .{});
+    defer allocator.free(dup_bytes);
+    const dup_reader = try DictReader.init(dup_bytes);
+    try testing.expectError(ContainerError.DuplicateKey, dup_reader.verifyKeysSorted());
 
     // A sorted dict passes.
     const sorted = [_]KeyValue{
