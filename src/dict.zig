@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const blip = @import("blip.zig");
 const container = @import("container.zig");
@@ -276,13 +277,15 @@ pub const DictReader = struct {
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
         };
 
-        return DictReader{
+        const reader = DictReader{
             .lp_view = lp,
             .index_offset = index_offset,
             .count = n_result.value,
             .header_size = header_size,
             .index_start = idx_start + n_result.bytes_read,
         };
+        if (builtin.mode == .Debug) try reader.verifyKeysSorted();
+        return reader;
     }
 
     /// Returns the number of key-value pairs in the dictionary.
@@ -367,26 +370,38 @@ pub const DictReader = struct {
     }
 
     /// Find a key by its bytes; returns the pair index or null.
-    /// Complexity: O(n^2) overall — `keyAt(i)` walks the variable-width BLIP
-    /// offset list from the start (O(i) per call), summed over a linear scan.
-    /// This is intentionally fine for the only callers: small fixed-schema
-    /// metadata dicts (a handful of 2-char keys). Note ARRAY access is *also*
-    /// O(index) (variable-width offsets are walked, not indexed) — it is not a
-    /// faster substitute here. Keys are guaranteed sorted (see validateKeyOrder),
-    /// and the spec (Container Spec, Dict section) already anticipates binary
-    /// search for many-key dicts: that is the drop-in upgrade (O(n log n) over
-    /// keyAt, or O(n) one-time offset parse + O(log n) probes) if a large-DICT
-    /// lookup ever becomes a real (measured) hot path. See
-    /// docs/2026-06-01-index-access-and-boundary-notes.md.
+    /// Binary search over the canonically-sorted key list: O(n log n) via
+    /// keyAt (each keyAt probe is O(index) — variable-width BLIP offset walk),
+    /// but probe count is O(log n) so the total work is O(n log n) in the worst
+    /// case. Correctness relies on the sorted invariant enforced by serializeDict
+    /// (validateKeyOrder) and guarded by verifyKeysSorted in Debug builds.
     pub fn findKey(self: DictReader, key_bytes: []const u8) LPContainerError!?u64 {
-        for (0..self.count) |i| {
-            const key_container = try self.keyAt(i);
-            const extracted = try extractKeyBytes(key_container);
-            if (std.mem.eql(u8, extracted, key_bytes)) {
-                return i;
+        var lo: u64 = 0;
+        var hi: u64 = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const stored = try extractKeyBytes(try self.keyAt(mid));
+            switch (compareKeys(stored, key_bytes)) {
+                .eq => return mid,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
             }
         }
         return null;
+    }
+
+    /// Verify keys are in canonical non-decreasing order — the invariant that
+    /// findKey's binary search relies on. Returns KeysNotSorted on violation.
+    /// O(n); used as a Debug-only self-check in init and directly in tests.
+    pub fn verifyKeysSorted(self: DictReader) LPContainerError!void {
+        if (self.count < 2) return;
+        var prev = try extractKeyBytes(try self.keyAt(0));
+        var i: u64 = 1;
+        while (i < self.count) : (i += 1) {
+            const cur = try extractKeyBytes(try self.keyAt(i));
+            if (compareKeys(prev, cur) == .gt) return ContainerError.KeysNotSorted;
+            prev = cur;
+        }
     }
 
     /// Verify the checksum of this dict container.
@@ -547,6 +562,44 @@ test "DictReader.findKey returns null for missing key" {
     const reader = try DictReader.init(result);
     const found = try reader.findKey("missing");
     try testing.expectEqual(@as(?u64, null), found);
+}
+
+test "DictReader.findKey resolves every key and rejects absent ones (set-based)" {
+    const allocator = testing.allocator;
+    // Zero-padded names sort lexicographically == numeric order, so they are
+    // already in canonical order for serializeDict.
+    const N = 500;
+    var keys: [N][]u8 = undefined;
+    var vals: [N][]u8 = undefined;
+    var pairs: [N]KeyValue = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| {
+        allocator.free(keys[i]);
+        allocator.free(vals[i]);
+    };
+    for (0..N) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "k{d:0>6}", .{i});
+        keys[i] = try leaf.serializeUtf8(allocator, name);
+        vals[i] = try leaf.serializeData(allocator, "v");
+        pairs[i] = .{ .key = keys[i], .value = vals[i] };
+        made += 1;
+    }
+
+    const dict = try serializeDict(allocator, &pairs);
+    defer allocator.free(dict);
+    const reader2 = try DictReader.init(dict);
+
+    // Every present key resolves to its own index.
+    for (0..N) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "k{d:0>6}", .{i});
+        try testing.expectEqual(@as(?u64, @intCast(i)), try reader2.findKey(name));
+    }
+    // Swept absent keys: before-first, between pairs, after-last.
+    try testing.expectEqual(@as(?u64, null), try reader2.findKey("k!!!!!!")); // sorts before "k000000"
+    try testing.expectEqual(@as(?u64, null), try reader2.findKey("k0000005zzz")); // between
+    try testing.expectEqual(@as(?u64, null), try reader2.findKey("zzzzzzz")); // after-last
 }
 
 test "DictReader.keyAt and valueAt for each pair in multi-pair dict" {
@@ -888,6 +941,36 @@ test "total_length matches buffer length" {
     const lp = try container.parseLPHeader(result);
     try testing.expectEqual(@as(u64, result.len), lp.total_length);
     try testing.expectEqual(ContainerTypeId.dict, lp.type_id);
+}
+
+test "DictReader.verifyKeysSorted flags out-of-order keys" {
+    const allocator = testing.allocator;
+    // "beta" then "alpha" is descending — serializeDictLike does NOT validate.
+    const k_beta = try leaf.serializeUtf8(allocator, "beta");
+    defer allocator.free(k_beta);
+    const k_alpha = try leaf.serializeUtf8(allocator, "alpha");
+    defer allocator.free(k_alpha);
+    const v = try leaf.serializeData(allocator, "x");
+    defer allocator.free(v);
+    const pairs = [_]KeyValue{
+        .{ .key = k_beta, .value = v },
+        .{ .key = k_alpha, .value = v },
+    };
+    const bytes = try serializeDictLike(allocator, &pairs, .dict, .{});
+    defer allocator.free(bytes);
+
+    const reader = try DictReader.init(bytes); // init's Debug check is off in ReleaseFast test build
+    try testing.expectError(ContainerError.KeysNotSorted, reader.verifyKeysSorted());
+
+    // A sorted dict passes.
+    const sorted = [_]KeyValue{
+        .{ .key = k_alpha, .value = v },
+        .{ .key = k_beta, .value = v },
+    };
+    const ok_bytes = try serializeDictLike(allocator, &sorted, .dict, .{});
+    defer allocator.free(ok_bytes);
+    const ok_reader = try DictReader.init(ok_bytes);
+    try ok_reader.verifyKeysSorted();
 }
 
 // =============================================================================
