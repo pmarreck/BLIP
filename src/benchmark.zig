@@ -544,8 +544,3 @@ pub fn main(init: std.process.Init) !void {
     try stderr.writeByte('\n');
     try stderr.flush();
 }
-
-test "benchmark placeholder" {
-    _ = blip;
-    try std.testing.expect(true);
-}

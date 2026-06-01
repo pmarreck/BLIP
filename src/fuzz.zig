@@ -14,6 +14,7 @@ fn fuzzRoundtrip(comptime Enc: type, seed: u64) !void {
     const random = prng.random();
     var buf: [16]u8 = undefined;
 
+    var fired: usize = 0; // count of values that actually reached the roundtrip assertions
     for (0..100_000) |_| {
         const v = random.int(u64);
         const n = Enc.encode(v, &buf) catch continue; // skip values this encoding can't handle
@@ -22,7 +23,11 @@ fn fuzzRoundtrip(comptime Enc: type, seed: u64) !void {
         };
         try testing.expectEqual(v, result.value);
         try testing.expectEqual(n, result.bytes_read);
+        fired += 1;
     }
+    // Guard against vacuous pass: if the encoder regressed to always-error, every
+    // iteration would `catch continue` and the test would pass with zero assertions.
+    try testing.expect(fired > 1000);
 }
 
 test "fuzz BLIP roundtrip 100K" {
@@ -54,13 +59,16 @@ test "fuzz SLEB128 roundtrip 100K" {
     const random = prng.random();
     var buf: [16]u8 = undefined;
 
+    var fired: usize = 0;
     for (0..100_000) |_| {
         const v = random.int(i64);
         const n = leb128.signedEncode(v, &buf) catch continue;
         const result = leb128.signedDecode(buf[0..n]) catch return error.TestUnexpectedResult;
         try testing.expectEqual(v, result.value);
         try testing.expectEqual(n, result.bytes_read);
+        fired += 1;
     }
+    try testing.expect(fired > 1000);
 }
 
 test "fuzz Protobuf ZigZag roundtrip 100K" {
@@ -68,11 +76,14 @@ test "fuzz Protobuf ZigZag roundtrip 100K" {
     const random = prng.random();
     var buf: [16]u8 = undefined;
 
+    var fired: usize = 0;
     for (0..100_000) |_| {
         const v = random.int(i64);
         const n = protobuf.signedEncode(v, &buf) catch continue;
         const result = protobuf.signedDecode(buf[0..n]) catch return error.TestUnexpectedResult;
         try testing.expectEqual(v, result.value);
         try testing.expectEqual(n, result.bytes_read);
+        fired += 1;
     }
+    try testing.expect(fired > 1000);
 }
