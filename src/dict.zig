@@ -422,6 +422,80 @@ pub const DictReader = struct {
 
 };
 
+/// Opt-in accelerator over a DictReader: parses the variable-width BLIP offset
+/// table once into a flat []u64 so random access is O(1) and findKey is a true
+/// O(log n) binary search with O(1) probes. Borrows the reader's buffer; owns
+/// only the decoded offsets.
+pub const DictIndex = struct {
+    buf: []const u8, // borrowed — must outlive the index
+    total: usize,
+    offsets: []u64, // owned — 2*count entries: [key0, val0, key1, val1, ...]
+    count: u64,
+
+    /// Single O(n) pass decoding all 2*count BLIP offsets from the index section.
+    pub fn build(allocator: Allocator, reader: DictReader) (Allocator.Error || LPContainerError)!DictIndex {
+        const buf = reader.lp_view.buf;
+        const total: usize = @intCast(reader.lp_view.total_length);
+        const n: usize = @intCast(reader.count);
+        const offsets = try allocator.alloc(u64, n * 2);
+        errdefer allocator.free(offsets);
+
+        var pos: usize = reader.index_start;
+        for (0..n * 2) |i| {
+            const r = blip.decode(buf[pos..total]) catch |e| switch (e) {
+                error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
+                error.Overflow => return ContainerError.Overflow,
+                error.BufferTooSmall => return ContainerError.BufferTooSmall,
+            };
+            offsets[i] = r.value;
+            pos += r.bytes_read;
+        }
+        return DictIndex{ .buf = buf, .total = total, .offsets = offsets, .count = reader.count };
+    }
+
+    pub fn deinit(self: *DictIndex, allocator: Allocator) void {
+        allocator.free(self.offsets);
+        self.offsets = &.{};
+    }
+
+    pub fn pairCount(self: DictIndex) u64 {
+        return self.count;
+    }
+
+    fn sliceAt(self: DictIndex, offset: u64) LPContainerError![]const u8 {
+        const off: usize = @intCast(offset);
+        if (off >= self.total) return ContainerError.IndexOutOfBounds;
+        const view = try container.parseLPHeader(self.buf[off..self.total]);
+        const t: usize = @intCast(view.total_length);
+        return self.buf[off .. off + t];
+    }
+
+    pub fn keyAt(self: DictIndex, index: u64) LPContainerError![]const u8 {
+        if (index >= self.count) return ContainerError.IndexOutOfBounds;
+        return self.sliceAt(self.offsets[@intCast(index * 2)]);
+    }
+
+    pub fn valueAt(self: DictIndex, index: u64) LPContainerError![]const u8 {
+        if (index >= self.count) return ContainerError.IndexOutOfBounds;
+        return self.sliceAt(self.offsets[@intCast(index * 2 + 1)]);
+    }
+
+    pub fn findKey(self: DictIndex, key_bytes: []const u8) LPContainerError!?u64 {
+        var lo: u64 = 0;
+        var hi: u64 = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const stored = try extractKeyBytes(try self.keyAt(mid));
+            switch (compareKeys(stored, key_bytes)) {
+                .eq => return mid,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return null;
+    }
+};
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1186,3 +1260,41 @@ test "verifyChecksum with corrupted checksum bytes in dict" {
     try testing.expect(!valid);
 }
 
+
+test "DictIndex matches DictReader (oracle) and binary-search findKey" {
+    const allocator = testing.allocator;
+    const N = 300;
+    var keys: [N][]u8 = undefined;
+    var vals: [N][]u8 = undefined;
+    var pairs: [N]KeyValue = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| {
+        allocator.free(keys[i]);
+        allocator.free(vals[i]);
+    };
+    for (0..N) |i| {
+        var nb: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "k{d:0>6}", .{i});
+        keys[i] = try leaf.serializeUtf8(allocator, name);
+        vals[i] = try leaf.serializeData(allocator, "v");
+        pairs[i] = .{ .key = keys[i], .value = vals[i] };
+        made += 1;
+    }
+    const dict = try serializeDict(allocator, &pairs);
+    defer allocator.free(dict);
+
+    const reader = try DictReader.init(dict);
+    var index = try DictIndex.build(allocator, reader);
+    defer index.deinit(allocator);
+
+    try testing.expectEqual(reader.pairCount(), index.pairCount());
+    for (0..N) |i| {
+        try testing.expectEqualSlices(u8, try reader.keyAt(@intCast(i)), try index.keyAt(@intCast(i)));
+        try testing.expectEqualSlices(u8, try reader.valueAt(@intCast(i)), try index.valueAt(@intCast(i)));
+        var nb: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "k{d:0>6}", .{i});
+        try testing.expectEqual(try reader.findKey(name), try index.findKey(name));
+    }
+    try testing.expectEqual(@as(?u64, null), try index.findKey("zzzzzzz"));
+    try testing.expectError(ContainerError.IndexOutOfBounds, index.keyAt(N));
+}
