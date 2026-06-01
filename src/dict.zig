@@ -366,8 +366,18 @@ pub const DictReader = struct {
         return self.lp_view.buf[val_offset .. val_offset + val_total];
     }
 
-    /// Linear scan to find a key by its value bytes.
-    /// Returns the pair index or null if not found.
+    /// Find a key by its bytes; returns the pair index or null.
+    /// Complexity: O(n^2) overall — `keyAt(i)` walks the variable-width BLIP
+    /// offset list from the start (O(i) per call), summed over a linear scan.
+    /// This is intentionally fine for the only callers: small fixed-schema
+    /// metadata dicts (a handful of 2-char keys). Note ARRAY access is *also*
+    /// O(index) (variable-width offsets are walked, not indexed) — it is not a
+    /// faster substitute here. Keys are guaranteed sorted (see validateKeyOrder),
+    /// and the spec (Container Spec, Dict section) already anticipates binary
+    /// search for many-key dicts: that is the drop-in upgrade (O(n log n) over
+    /// keyAt, or O(n) one-time offset parse + O(log n) probes) if a large-DICT
+    /// lookup ever becomes a real (measured) hot path. See
+    /// docs/2026-06-01-index-access-and-boundary-notes.md.
     pub fn findKey(self: DictReader, key_bytes: []const u8) LPContainerError!?u64 {
         for (0..self.count) |i| {
             const key_container = try self.keyAt(i);
