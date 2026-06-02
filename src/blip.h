@@ -92,16 +92,17 @@ int32_t blip_container_key_at(const uint8_t *buf, size_t len, uint64_t index,
 
 /* ---- DictIndex: opt-in fast DICT access (opaque handle) ---- */
 /* Build over a DICT/MAP/DIR container. Caller MUST keep `buf` alive until
-   blip_dict_index_free. *out_handle receives an opaque handle. */
+   blip_dict_index_free. *out_handle receives an opaque handle on success.
+   *out_handle is set to NULL on error. */
 int32_t blip_dict_index_build(const uint8_t *buf, size_t len, void **out_handle);
-int32_t blip_dict_index_count(void *handle, uint64_t *out_count);
+int32_t blip_dict_index_count(const void *handle, uint64_t *out_count);
 /* out_found = 1 if found (out_index set), else 0 (out_index set to 0). Return 0=ok, negative=error. */
-int32_t blip_dict_index_find(void *handle, const uint8_t *key, size_t key_len,
+int32_t blip_dict_index_find(const void *handle, const uint8_t *key, size_t key_len,
                              uint8_t *out_found, uint64_t *out_index);
 /* out_ptr aliases the caller's buf (no copy); valid while handle and buf live. */
-int32_t blip_dict_index_key_at(void *handle, uint64_t index,
+int32_t blip_dict_index_key_at(const void *handle, uint64_t index,
                                const uint8_t **out_ptr, size_t *out_len);
-int32_t blip_dict_index_value_at(void *handle, uint64_t index,
+int32_t blip_dict_index_value_at(const void *handle, uint64_t index,
                                  const uint8_t **out_ptr, size_t *out_len);
 void blip_dict_index_free(void *handle);
 

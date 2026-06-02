@@ -374,6 +374,7 @@ export fn blip_xxhash64(data: [*]const u8, data_len: usize) callconv(.c) u64 {
 /// Build a DictIndex over a DICT/MAP/DIR container. Caller MUST keep `buf`
 /// alive until blip_dict_index_free. On success *out_handle is an opaque handle.
 export fn blip_dict_index_build(buf: [*]const u8, len: usize, out_handle: *?*anyopaque) callconv(.c) i32 {
+    out_handle.* = null;
     const reader = dict_mod.DictReader.init(buf[0..len]) catch |e| return containerErrorCode(e);
     const handle = page_allocator.create(dict_mod.DictIndex) catch return -13;
     handle.* = dict_mod.DictIndex.build(page_allocator, reader) catch |e| {
@@ -494,9 +495,20 @@ test "FFI blip_dict_index_* roundtrip" {
 
     // Null-handle guard returns the dedicated code (not a misleading one).
     try testing.expectEqual(@as(i32, -16), blip_dict_index_count(null, &count));
-    // Out-of-bounds index returns IndexOutOfBounds (-8).
     var oob_ptr: [*]const u8 = undefined;
     var oob_len: usize = 0;
+    try testing.expectEqual(@as(i32, -16), blip_dict_index_find(null, "x", 1, &found, &idx));
+    try testing.expectEqual(@as(i32, -16), blip_dict_index_key_at(null, 0, &oob_ptr, &oob_len));
+    try testing.expectEqual(@as(i32, -16), blip_dict_index_value_at(null, 0, &oob_ptr, &oob_len));
+    // Out-of-bounds index returns IndexOutOfBounds (-8).
     try testing.expectEqual(@as(i32, -8), blip_dict_index_key_at(handle, 99, &oob_ptr, &oob_len));
     try testing.expectEqual(@as(i32, -8), blip_dict_index_value_at(handle, 99, &oob_ptr, &oob_len));
+}
+
+test "FFI blip_dict_index_build rejects malformed input" {
+    var handle: ?*anyopaque = null;
+    const bad = [_]u8{ 0xff, 0xff, 0xff };
+    const rc = blip_dict_index_build(&bad, bad.len, &handle);
+    try testing.expect(rc < 0); // negative error code
+    try testing.expectEqual(@as(?*anyopaque, null), handle); // out_handle nulled on error
 }
