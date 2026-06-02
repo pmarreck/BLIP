@@ -93,6 +93,7 @@ export fn blip_error_string(error_code: i32) callconv(.c) [*:0]const u8 {
         -13 => "allocation failure",
         -14 => "not found",
         -15 => "invalid path",
+        -16 => "null handle",
         -25 => "missing attribute sigil",
         -26 => "invalid attribute sigil order",
         -27 => "missing decompressed length",
@@ -377,6 +378,8 @@ export fn blip_dict_index_build(buf: [*]const u8, len: usize, out_handle: *?*any
     const handle = page_allocator.create(dict_mod.DictIndex) catch return -13;
     handle.* = dict_mod.DictIndex.build(page_allocator, reader) catch |e| {
         page_allocator.destroy(handle);
+        // Inline mapping (not containerErrorCode) because build() returns
+        // Allocator.Error || LPContainerError; containerErrorCode covers only the latter.
         return switch (e) {
             error.OutOfMemory => -13,
             error.InvalidContainerType => -1,
@@ -401,15 +404,15 @@ export fn blip_dict_index_build(buf: [*]const u8, len: usize, out_handle: *?*any
 }
 
 export fn blip_dict_index_count(handle: ?*anyopaque, out_count: *u64) callconv(.c) i32 {
-    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -16));
     out_count.* = idx.pairCount();
     return 0;
 }
 
-/// out_found = 1 if the key exists (and out_index is set), 0 otherwise.
+/// out_found = 1 if the key exists (and out_index is set), 0 otherwise (out_index set to 0).
 /// Return value: 0 = ok, negative = error. Absence is not an error.
 export fn blip_dict_index_find(handle: ?*anyopaque, key: [*]const u8, key_len: usize, out_found: *u8, out_index: *u64) callconv(.c) i32 {
-    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -16));
     const found = idx.findKey(key[0..key_len]) catch |e| return containerErrorCode(e);
     if (found) |i| {
         out_found.* = 1;
@@ -423,7 +426,7 @@ export fn blip_dict_index_find(handle: ?*anyopaque, key: [*]const u8, key_len: u
 
 /// Returns a pointer INTO buf (no copy) — valid while handle and buf live.
 export fn blip_dict_index_key_at(handle: ?*anyopaque, index: u64, out_ptr: *[*]const u8, out_len: *usize) callconv(.c) i32 {
-    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -16));
     const s = idx.keyAt(index) catch |e| return containerErrorCode(e);
     out_ptr.* = s.ptr;
     out_len.* = s.len;
@@ -432,7 +435,7 @@ export fn blip_dict_index_key_at(handle: ?*anyopaque, index: u64, out_ptr: *[*]c
 
 /// Returns a pointer INTO buf (no copy) — valid while handle and buf live.
 export fn blip_dict_index_value_at(handle: ?*anyopaque, index: u64, out_ptr: *[*]const u8, out_len: *usize) callconv(.c) i32 {
-    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -16));
     const s = idx.valueAt(index) catch |e| return containerErrorCode(e);
     out_ptr.* = s.ptr;
     out_len.* = s.len;
@@ -488,4 +491,12 @@ test "FFI blip_dict_index_* roundtrip" {
     var vlen: usize = 0;
     try testing.expectEqual(@as(i32, 0), blip_dict_index_value_at(handle, 1, &vptr, &vlen));
     try testing.expectEqualSlices(u8, v2, vptr[0..vlen]);
+
+    // Null-handle guard returns the dedicated code (not a misleading one).
+    try testing.expectEqual(@as(i32, -16), blip_dict_index_count(null, &count));
+    // Out-of-bounds index returns IndexOutOfBounds (-8).
+    var oob_ptr: [*]const u8 = undefined;
+    var oob_len: usize = 0;
+    try testing.expectEqual(@as(i32, -8), blip_dict_index_key_at(handle, 99, &oob_ptr, &oob_len));
+    try testing.expectEqual(@as(i32, -8), blip_dict_index_value_at(handle, 99, &oob_ptr, &oob_len));
 }

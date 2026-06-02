@@ -24,6 +24,7 @@
 #define BLIP_ERR_ALLOC              -13
 #define BLIP_ERR_NOT_FOUND          -14
 #define BLIP_ERR_INVALID_PATH       -15
+#define BLIP_ERR_NULL_HANDLE        -16
 #define BLIP_ERR_MISSING_SIGIL      -25
 #define BLIP_ERR_INVALID_SIGIL_ORD  -26
 #define BLIP_ERR_MISSING_DECOMP_LEN -27
@@ -94,7 +95,7 @@ int32_t blip_container_key_at(const uint8_t *buf, size_t len, uint64_t index,
    blip_dict_index_free. *out_handle receives an opaque handle. */
 int32_t blip_dict_index_build(const uint8_t *buf, size_t len, void **out_handle);
 int32_t blip_dict_index_count(void *handle, uint64_t *out_count);
-/* out_found = 1 if found (out_index set), else 0. Return 0=ok, negative=error. */
+/* out_found = 1 if found (out_index set), else 0 (out_index set to 0). Return 0=ok, negative=error. */
 int32_t blip_dict_index_find(void *handle, const uint8_t *key, size_t key_len,
                              uint8_t *out_found, uint64_t *out_index);
 /* out_ptr aliases the caller's buf (no copy); valid while handle and buf live. */
