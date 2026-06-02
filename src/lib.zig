@@ -6,6 +6,9 @@ const peek_mod = blip.peek_mod;
 const segmentation_mod = blip.segmentation_mod;
 const container_mod = blip.container_mod;
 const ct = blip.container_types;
+const dict_mod = blip.dict_mod;
+const leaf_mod = blip.leaf_mod;
+const testing = std.testing;
 
 const page_allocator = std.heap.page_allocator;
 
@@ -361,4 +364,128 @@ export fn blip_segment_header(
 /// Compatible with `xxhsum -H64`.
 export fn blip_xxhash64(data: [*]const u8, data_len: usize) callconv(.c) u64 {
     return std.hash.XxHash64.hash(0, data[0..data_len]);
+}
+
+// ---------------------------------------------------------------------------
+// DictIndex — opt-in fast DICT access (opaque handle)
+// ---------------------------------------------------------------------------
+
+/// Build a DictIndex over a DICT/MAP/DIR container. Caller MUST keep `buf`
+/// alive until blip_dict_index_free. On success *out_handle is an opaque handle.
+export fn blip_dict_index_build(buf: [*]const u8, len: usize, out_handle: *?*anyopaque) callconv(.c) i32 {
+    const reader = dict_mod.DictReader.init(buf[0..len]) catch |e| return containerErrorCode(e);
+    const handle = page_allocator.create(dict_mod.DictIndex) catch return -13;
+    handle.* = dict_mod.DictIndex.build(page_allocator, reader) catch |e| {
+        page_allocator.destroy(handle);
+        return switch (e) {
+            error.OutOfMemory => -13,
+            error.InvalidContainerType => -1,
+            error.InvalidLength => -2,
+            error.LengthExceedsBounds => -3,
+            error.MissingRequiredKey => -4,
+            error.DuplicateKey => -5,
+            error.KeysNotSorted => -6,
+            error.HashMismatch => -7,
+            error.IndexOutOfBounds => -8,
+            error.InvalidMagic => -9,
+            error.BufferTooSmall => -10,
+            error.UnexpectedEndOfInput => -11,
+            error.Overflow => -12,
+            error.MissingSigil => -25,
+            error.InvalidSigilOrder => -26,
+            error.MissingDecompLen => -27,
+        };
+    };
+    out_handle.* = @ptrCast(handle);
+    return 0;
+}
+
+export fn blip_dict_index_count(handle: ?*anyopaque, out_count: *u64) callconv(.c) i32 {
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    out_count.* = idx.pairCount();
+    return 0;
+}
+
+/// out_found = 1 if the key exists (and out_index is set), 0 otherwise.
+/// Return value: 0 = ok, negative = error. Absence is not an error.
+export fn blip_dict_index_find(handle: ?*anyopaque, key: [*]const u8, key_len: usize, out_found: *u8, out_index: *u64) callconv(.c) i32 {
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const found = idx.findKey(key[0..key_len]) catch |e| return containerErrorCode(e);
+    if (found) |i| {
+        out_found.* = 1;
+        out_index.* = i;
+    } else {
+        out_found.* = 0;
+        out_index.* = 0;
+    }
+    return 0;
+}
+
+/// Returns a pointer INTO buf (no copy) — valid while handle and buf live.
+export fn blip_dict_index_key_at(handle: ?*anyopaque, index: u64, out_ptr: *[*]const u8, out_len: *usize) callconv(.c) i32 {
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const s = idx.keyAt(index) catch |e| return containerErrorCode(e);
+    out_ptr.* = s.ptr;
+    out_len.* = s.len;
+    return 0;
+}
+
+/// Returns a pointer INTO buf (no copy) — valid while handle and buf live.
+export fn blip_dict_index_value_at(handle: ?*anyopaque, index: u64, out_ptr: *[*]const u8, out_len: *usize) callconv(.c) i32 {
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return -2));
+    const s = idx.valueAt(index) catch |e| return containerErrorCode(e);
+    out_ptr.* = s.ptr;
+    out_len.* = s.len;
+    return 0;
+}
+
+export fn blip_dict_index_free(handle: ?*anyopaque) callconv(.c) void {
+    const idx: *dict_mod.DictIndex = @ptrCast(@alignCast(handle orelse return));
+    idx.deinit(page_allocator);
+    page_allocator.destroy(idx);
+}
+
+test "FFI blip_dict_index_* roundtrip" {
+    const allocator = testing.allocator;
+    const k_alpha = try leaf_mod.serializeUtf8(allocator, "alpha");
+    defer allocator.free(k_alpha);
+    const k_beta = try leaf_mod.serializeUtf8(allocator, "beta");
+    defer allocator.free(k_beta);
+    const v1 = try leaf_mod.serializeData(allocator, "one");
+    defer allocator.free(v1);
+    const v2 = try leaf_mod.serializeData(allocator, "two");
+    defer allocator.free(v2);
+    const pairs = [_]dict_mod.KeyValue{
+        .{ .key = k_alpha, .value = v1 },
+        .{ .key = k_beta, .value = v2 },
+    };
+    const dict = try dict_mod.serializeDict(allocator, &pairs);
+    defer allocator.free(dict);
+
+    var handle: ?*anyopaque = null;
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_build(dict.ptr, dict.len, &handle));
+    defer blip_dict_index_free(handle);
+
+    var count: u64 = 0;
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_count(handle, &count));
+    try testing.expectEqual(@as(u64, 2), count);
+
+    var found: u8 = 0;
+    var idx: u64 = 99;
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_find(handle, "beta", 4, &found, &idx));
+    try testing.expectEqual(@as(u8, 1), found);
+    try testing.expectEqual(@as(u64, 1), idx);
+
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_find(handle, "zzz", 3, &found, &idx));
+    try testing.expectEqual(@as(u8, 0), found);
+
+    var kptr: [*]const u8 = undefined;
+    var klen: usize = 0;
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_key_at(handle, 0, &kptr, &klen));
+    try testing.expectEqualSlices(u8, k_alpha, kptr[0..klen]);
+
+    var vptr: [*]const u8 = undefined;
+    var vlen: usize = 0;
+    try testing.expectEqual(@as(i32, 0), blip_dict_index_value_at(handle, 1, &vptr, &vlen));
+    try testing.expectEqualSlices(u8, v2, vptr[0..vlen]);
 }
