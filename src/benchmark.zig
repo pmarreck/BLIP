@@ -517,6 +517,79 @@ fn benchRandomAccess(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocat
 }
 
 // ============================================================================
+// Benchmark 4: Dict findKey scaling
+// ============================================================================
+
+fn benchDictFindKey(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocator) !void {
+    try stderr.writeAll("\n--- DICT findKey (ns/lookup) ---\n");
+    try stderr.print("{s:>8} | {s:>18} | {s:>18}\n", .{ "keys", "Reader (binary)", "DictIndex (O(1))" });
+    try stderr.writeAll("---------+--------------------+--------------------\n");
+    try stderr.flush();
+
+    const dict_mod = blip.dict_mod;
+    const leaf_mod = blip.leaf_mod;
+    const sizes = [_]usize{ 10, 100, 1000, 10000 };
+    const LOOKUPS: usize = 100_000;
+
+    inline for (sizes) |N| {
+        // Heap-allocate to avoid ~480KB of stack at N=10000
+        // ([]u8 = 16 bytes, KeyValue = 32 bytes on 64-bit)
+        const keys = try allocator.alloc([]u8, N);
+        defer allocator.free(keys);
+        const vals = try allocator.alloc([]u8, N);
+        defer allocator.free(vals);
+        const pairs = try allocator.alloc(dict_mod.KeyValue, N);
+        defer allocator.free(pairs);
+
+        for (0..N) |i| {
+            var nb: [24]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{i});
+            keys[i] = try leaf_mod.serializeUtf8(allocator, name);
+            vals[i] = try leaf_mod.serializeData(allocator, "v");
+            pairs[i] = .{ .key = keys[i], .value = vals[i] };
+        }
+        defer for (0..N) |i| {
+            allocator.free(keys[i]);
+            allocator.free(vals[i]);
+        };
+
+        const dict = try dict_mod.serializeDict(allocator, pairs);
+        defer allocator.free(dict);
+        const reader = try dict_mod.DictReader.init(dict);
+        var index = try dict_mod.DictIndex.build(allocator, reader);
+        defer index.deinit(allocator);
+
+        var prng = std.Random.DefaultPrng.init(SEED +% N);
+        const rng = prng.random();
+
+        // Reader (binary search)
+        {
+            const t_start = std.Io.Timestamp.now(io, .awake);
+            for (0..LOOKUPS) |_| {
+                var nb: [24]u8 = undefined;
+                const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{rng.intRangeLessThan(usize, 0, N)});
+                const r = try reader.findKey(name);
+                doNotOptimizeAway(r);
+            }
+            const ns_reader = elapsedNs(io, t_start) / LOOKUPS;
+
+            // DictIndex (O(log n) binary search with O(1) probes)
+            const t_start2 = std.Io.Timestamp.now(io, .awake);
+            for (0..LOOKUPS) |_| {
+                var nb: [24]u8 = undefined;
+                const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{rng.intRangeLessThan(usize, 0, N)});
+                const r = try index.findKey(name);
+                doNotOptimizeAway(r);
+            }
+            const ns_index = elapsedNs(io, t_start2) / LOOKUPS;
+
+            try stderr.print("{d:>8} | {d:>18} | {d:>18}\n", .{ N, ns_reader, ns_index });
+            try stderr.flush();
+        }
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -539,6 +612,9 @@ pub fn main(init: std.process.Init) !void {
     try stderr.flush();
 
     try benchRandomAccess(io, stderr, allocator);
+    try stderr.flush();
+
+    try benchDictFindKey(io, stderr, allocator);
     try stderr.flush();
 
     try stderr.writeByte('\n');
