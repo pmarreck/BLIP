@@ -428,7 +428,7 @@ pub const DictReader = struct {
 /// only the decoded offsets.
 pub const DictIndex = struct {
     buf: []const u8, // borrowed — must outlive the index
-    total: usize,
+    total: usize, // narrowed from u64 total_length; build() @intCasts (panics in Debug before any 32-bit truncation)
     offsets: []u64, // owned — 2*count entries: [key0, val0, key1, val1, ...]
     count: u64,
 
@@ -470,16 +470,22 @@ pub const DictIndex = struct {
         return self.buf[off .. off + t];
     }
 
+    /// O(1) random access to the key container slice at a pair index.
     pub fn keyAt(self: DictIndex, index: u64) LPContainerError![]const u8 {
         if (index >= self.count) return ContainerError.IndexOutOfBounds;
-        return self.sliceAt(self.offsets[@intCast(index * 2)]);
+        const i: usize = @intCast(index); // index < count <= usize.max/2 (build allocated 2*count)
+        return self.sliceAt(self.offsets[i * 2]);
     }
 
+    /// O(1) random access to the value container slice at a pair index.
     pub fn valueAt(self: DictIndex, index: u64) LPContainerError![]const u8 {
         if (index >= self.count) return ContainerError.IndexOutOfBounds;
-        return self.sliceAt(self.offsets[@intCast(index * 2 + 1)]);
+        const i: usize = @intCast(index);
+        return self.sliceAt(self.offsets[i * 2 + 1]);
     }
 
+    /// O(log n) binary search with O(1) probes (contrast DictReader.findKey,
+    /// which is O(n log n) because its keyAt walks the offset list per probe).
     pub fn findKey(self: DictIndex, key_bytes: []const u8) LPContainerError!?u64 {
         var lo: u64 = 0;
         var hi: u64 = self.count;
@@ -1295,6 +1301,8 @@ test "DictIndex matches DictReader (oracle) and binary-search findKey" {
         const name = try std.fmt.bufPrint(&nb, "k{d:0>6}", .{i});
         try testing.expectEqual(try reader.findKey(name), try index.findKey(name));
     }
+    try testing.expectEqual(@as(?u64, null), try index.findKey("aaaaaaa")); // sorts before "k000000"
     try testing.expectEqual(@as(?u64, null), try index.findKey("zzzzzzz"));
     try testing.expectError(ContainerError.IndexOutOfBounds, index.keyAt(N));
+    try testing.expectError(ContainerError.IndexOutOfBounds, index.valueAt(N));
 }
