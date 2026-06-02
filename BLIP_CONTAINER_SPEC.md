@@ -373,6 +373,7 @@ Keys are either UTF8 (0x81 0x03) or RAW (0x81 0x04) containers. Keys MUST be uni
 **Data layout:** Keys and values are interleaved in the data section in canonical key order (key₀, val₀, key₁, val₁, ...). Parsers MUST use the index for access — the interleaving is required for determinism but parsers should not rely on sequential layout for correctness.
 
 **Key ordering enables binary search:** Because keys are sorted, lookup is O(log N) via binary search on the key offsets in the index section, rather than O(N) sequential scan. This is significant for dictionaries with many keys (e.g., extended attributes, large metadata sets).
+The reference implementation realizes this: `DictReader.findKey` binary-searches the sorted keys (O(n log n)), and an opt-in `DictIndex` accelerator parses the offset table once for O(1) random access and O(log n) lookup (Zig + C FFI `blip_dict_index_*`). See docs/superpowers/specs/2026-06-01-dict-fast-access-design.md.
 
 ### Directory (0x81 0x07)
 

@@ -34,6 +34,9 @@ project split (BLIP / blar / mini_blar).
 - **leaf.zig** — UTF8 + DATA leaf containers (serialize/parse).
 - **array.zig** — ARRAY container (fixpoint iteration, index tables, xxHash64).
 - **dict.zig** — DICT/MAP/DIR containers (sorted keys, interleaved index, xxHash64).
+  - `DictReader.findKey` — binary search over sorted keys (O(n log n)).
+  - `DictReader.verifyKeysSorted` — invariant check (Debug-only in init; testable; rejects unsorted + duplicate keys).
+  - `DictIndex` — opt-in accelerator: parse offsets once → O(1) keyAt/valueAt, O(log n) findKey.
 
 ### Navigation & transport
 
@@ -43,6 +46,7 @@ project split (BLIP / blar / mini_blar).
 ### C FFI surface
 
 - **lib.zig** — `export fn` declarations for every BLIP C-callable function (varint, peek, segment, printable-binary, xxhash, free, error_string).
+  - `blip_dict_index_build/count/find/key_at/value_at/free` — opaque-handle FFI for DictIndex (O(1) access, O(log n) lookup).
 - **blip.h** — matching C declarations consumed by downstream projects.
 
 ### Other

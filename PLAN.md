@@ -112,6 +112,13 @@
 - [x] 19 container expansion integration tests (all passing)
 - [x] All existing tests still pass (27 blar + 144 compression + Zig unit tests)
 
+## Opt-in fast DICT access (completed 2026-06-01 EST)
+- [x] binary-search findKey + sorted-invariant guard (verifyKeysSorted)
+- [x] DictIndex accelerator (Zig)
+- [x] DictIndex C FFI (blip_dict_index_*) + blip.h
+- [x] findKey scaling benchmark (benchDictFindKey)
+- [x] spec + docs updated
+
 ## Future
 - [ ] Arbitrary-width encode/decode (values > u64)
 - [ ] Streaming writes with padded BLIPs for containers
