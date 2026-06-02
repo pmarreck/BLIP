@@ -522,7 +522,7 @@ fn benchRandomAccess(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocat
 
 fn benchDictFindKey(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocator) !void {
     try stderr.writeAll("\n--- DICT findKey (ns/lookup) ---\n");
-    try stderr.print("{s:>8} | {s:>18} | {s:>18}\n", .{ "keys", "Reader (binary)", "DictIndex (O(1))" });
+    try stderr.print("{s:>8} | {s:>18} | {s:>18}\n", .{ "keys", "Reader (binary)", "DictIndex (O(log n))" });
     try stderr.writeAll("---------+--------------------+--------------------\n");
     try stderr.flush();
 
@@ -541,17 +541,19 @@ fn benchDictFindKey(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocato
         const pairs = try allocator.alloc(dict_mod.KeyValue, N);
         defer allocator.free(pairs);
 
+        var made: usize = 0;
+        defer for (0..made) |i| {
+            allocator.free(keys[i]);
+            allocator.free(vals[i]);
+        };
         for (0..N) |i| {
             var nb: [24]u8 = undefined;
             const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{i});
             keys[i] = try leaf_mod.serializeUtf8(allocator, name);
             vals[i] = try leaf_mod.serializeData(allocator, "v");
             pairs[i] = .{ .key = keys[i], .value = vals[i] };
+            made += 1;
         }
-        defer for (0..N) |i| {
-            allocator.free(keys[i]);
-            allocator.free(vals[i]);
-        };
 
         const dict = try dict_mod.serializeDict(allocator, pairs);
         defer allocator.free(dict);
@@ -574,10 +576,13 @@ fn benchDictFindKey(io: std.Io, stderr: *WriterType, allocator: std.mem.Allocato
             const ns_reader = elapsedNs(io, t_start) / LOOKUPS;
 
             // DictIndex (O(log n) binary search with O(1) probes)
+            // Re-seed with the same seed so both loops see identical key sequences (fair comparison).
+            prng = std.Random.DefaultPrng.init(SEED +% N);
+            const rng2 = prng.random();
             const t_start2 = std.Io.Timestamp.now(io, .awake);
             for (0..LOOKUPS) |_| {
                 var nb: [24]u8 = undefined;
-                const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{rng.intRangeLessThan(usize, 0, N)});
+                const name = try std.fmt.bufPrint(&nb, "k{d:0>10}", .{rng2.intRangeLessThan(usize, 0, N)});
                 const r = try index.findKey(name);
                 doNotOptimizeAway(r);
             }
