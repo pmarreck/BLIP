@@ -489,7 +489,29 @@ When BLIP is the transport between a frontend and a backend, two things are need
 
 **Universal lossless guarantee.** Because printable-binary can represent *any* byte sequence as valid UTF-8, it is the universal escape hatch: any value — a subtree, or the entire frame — that lacks a clean or agreed structural mapping degrades to a printable-binary string of its **raw BLIP bytes**, tagged (e.g. `{"$blip":"<printable-binary>"}`). The decoder printable-binary-decodes it straight back to the container bytes and splices them in. So **lossless projection is total by construction** — there is always a faithful representation for any binary content, and no format can defeat it. The structural mapping above is the *readable* path; the escape hatch is the *guarantee*.
 
-The exact typed-JSON tag vocabulary is finalized alongside the RPC expression layer (a call's arguments are exactly this authoring problem) and is intentionally left open here.
+### Pinned tag vocabulary (v1)
+
+Natural JSON is used wherever it is unambiguous and lossless; a **tag** (a single-key object whose sole key is a reserved `$`-name) is used only where it isn't:
+
+| JSON | BLIP | Notes |
+|------|------|-------|
+| object `{…}` | DICT (2) | canonical key order |
+| array `[…]` | ARRAY (1) | |
+| string | UTF8 (3) | known-UTF8 text |
+| number | BLIP integer | only when the value is within JSON's f64-safe range (±2^53); larger → `$int` |
+| `true` / `false` / `null` | TRUE / FALSE / NIL | |
+| `{"$int":"<decimal>"}` | BLIP integer | arbitrary-precision; optional leading `-` for signed (sign is interpretation, not a separate tag) — used when a value exceeds ±2^53 |
+| `{"$b":"<printable-binary>"}` | RAW (4) leaf | the leaf's **value bytes** (no envelope); maps to RAW on re-encode |
+| `{"$blip":"<printable-binary>"}` | any container | **universal escape hatch** — printable-binary of the **full raw BLIP bytes** (type+length envelope included) for any value/subtree/frame the structural codec doesn't descend into; the decoder splices the decoded bytes back as a complete container |
+| `{"$f64":"<printable-binary>"}` | 8 raw IEEE-754 LE bytes | *reserved*; lossless (preserves NaN/Inf/−0.0/full precision) — decimal would be lossy |
+
+**Rules.**
+- `$int` is width- and sign-agnostic (BLIP integers are arbitrary-precision; a decimal string with an optional `-` fully determines the canonical minimum-width encoding). There is no `$u64`/`$i64` split.
+- `$b` carries a leaf's value bytes; `$blip` carries a whole container's bytes — that leaf-vs-subtree distinction is the boundary between the two.
+- **Reserved-key collision:** a `$`-tag is recognized only as the *sole* key of an object. A DICT whose sole key is literally a reserved tag string is represented via `$blip` (or a future `$dict` disambiguator), never as a bare tag object.
+- **Round-trip is the oracle:** for canonical wire (which the RPC layer always emits), `wire → JSON → wire` is byte-identical — a free differential/MFIC control. Author `JSON → wire → serve → wire → JSON` and assert on the JSON.
+
+A separate **pretty/lossy** mode (numbers as numbers, best-effort strings) is permitted as an *addition* for eyeballing — never as the only mode.
 
 **Reference implementation.** blar ships an *archive-specialized* codec — `archiveToJson` / `jsonToArchive` in [`src/json_serde.zig`](https://github.com/pmarreck/blar/blob/yolo/src/json_serde.zig) — which renders paths, ISO-8601 timestamps, and octal modes for the archive use case. A **generic** container↔JSON codec (any message, no archive semantics) is planned as BLIP-side wire tooling, mirroring how the generic container code lives in BLIP while blar consumes it.
 
