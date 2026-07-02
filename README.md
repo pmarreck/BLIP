@@ -157,6 +157,31 @@ nix develop -c zig build -Doptimize=ReleaseFast
 nix develop -c zig build bench -Doptimize=ReleaseFast
 ```
 
+## Command-line tool: `blip`
+
+[`bin/blip`](bin/blip) is a small LuaJIT filter that frames arbitrary binary data on stdin as a single BLIP value — and, because the endianness lives *in the frame*, doubles as a self-describing byte-order transcoder. Put `bin/` on your `PATH` (no build step; needs `luajit`).
+
+```
+blip encode [-b|-l] [-f] < raw   > frame
+blip decode [-b|-l] [-f] < frame > raw
+```
+
+- **`encode`** frames stdin as one BLIP value. `-b`/`--big` (default) or `-l`/`--little` **declare** the input's byte order; the payload is stored **verbatim** and the E bit is stamped. Encode never reverses bytes.
+- **`decode`** unframes stdin. `-b`/`--big` (default) or `-l`/`--little` **require** the *output's* byte order; decode reads the frame's stored order from the E bit and converts (same order ⇒ verbatim, cross order ⇒ reversed).
+
+`encode` is the default verb, so `… | blip` (or `blip -l < raw`) filters straight through it; use `blip decode` for the reverse. Run `blip` interactively with no input for help.
+
+The default output order is **big-endian == stream/network order** (the order bytes are written and transmitted — first byte most significant, à la `htonl`/network byte order). So a bare `decode` **normalizes** any frame to a stable big-endian fixpoint, while `decode -l` hands back genuine little-endian bytes:
+
+```bash
+# a little-endian u32 0xDEADBEEF sits in memory as the bytes ef be ad de
+printf '\xef\xbe\xad\xde' | blip encode -l | xxd -p   # 84efbeadde  (LE stored verbatim + E=LE)
+printf '\xef\xbe\xad\xde' | blip encode -l | blip decode | xxd -p      # deadbeef  (normalized big-endian)
+printf '\xef\xbe\xad\xde' | blip encode -l | blip decode -l | xxd -p   # efbeadde  (round-trips to your LE bytes)
+```
+
+`-l` is for genuine little-endian *numbers*; opaque/non-numeric data should use the default `-b`, which passes through `decode` unchanged. Both commands emit raw binary and **refuse an interactive terminal** (pipe to a file or a tool like `xxd` / `printable-binary`, or pass `-f`/`--force`).
+
 ## Container Format (v2 LP)
 
 BLIP also defines a recursive binary container format for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
@@ -195,6 +220,20 @@ blip_segment_array_free(segments, segment_count);
 ```
 
 The full FFI surface is declared in [src/blip.h](src/blip.h): varint, generic LP-envelope navigation, printable-binary encode/decode, SEGMENT chunk/reassemble, xxHash64.
+
+## Repository layout
+
+A per-file index is maintained as inline **`dirtree` notes** rather than a separate document — run `dirtree` at the repo root for the annotated tree (one line describing every source file). The high-level module groupings:
+
+- **Varint core** — `src/blip.zig` (the spec: encode/decode, sentinels, `encodedSize`). Comparison encodings used only by the benchmarks live alongside (`leb128`, `protobuf_varint`, `asn1_length`, `prefix_varint`, `sqlite_varint`, unified by `encoding.zig`; `bignum.zig` for direct-LE arithmetic).
+- **LP envelope + generic containers** — `container_types.zig`, `container.zig`, `checksum.zig`, `leaf.zig`, `array.zig`, `dict.zig`.
+- **Navigation & transport** — `peek.zig` (path traversal), `segmentation.zig` (Layer 5 SEGMENT).
+- **C FFI surface** — `src/lib.zig` (`export fn`s) + `src/blip.h` (matching C declarations); the real public API.
+- **Binaries & fuzzing** — `main.zig` (FFI smoke-test), `benchmark.zig`, `fuzz.zig`.
+- **CLI** — [`bin/blip`](bin/blip) (LuaJIT encode/decode filter), tested by `tests/cli/blip_cli_test.sh`.
+- **Vendored** — `vendor/printable_binary/` (UTF-8 printable encoding, backing the `blip_*_printable_binary` FFI helpers).
+
+All other BLIP coverage lives in Zig unit tests embedded inside the modules above. Entry-point scripts: `./build`, `./test`, `./bm`.
 
 ## Sister projects
 

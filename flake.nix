@@ -23,6 +23,7 @@
           buildInputs = with pkgs; [
             zig
             hyperfine
+            luajit   # runtime for the `blip` encode/decode CLI + its tests
           ];
         };
 
@@ -49,7 +50,7 @@
           pname = "${pname}-tests";
           inherit version;
           src = self;
-          nativeBuildInputs = [ zig ]
+          nativeBuildInputs = [ zig pkgs.luajit ]
             ++ pkgs.lib.optionals isDarwin [
               pkgs.darwin.cctools
               pkgs.apple-sdk
@@ -61,6 +62,7 @@
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             timeout 600 zig build test || { echo "Tests failed"; exit 1; }
+            BLIP_BIN=$PWD/bin/blip bash tests/cli/blip_cli_test.sh || { echo "blip CLI tests failed"; exit 1; }
           '';
           installPhase = ''
             mkdir -p $out

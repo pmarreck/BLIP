@@ -9,8 +9,6 @@ result
 compile_commands.json
 AGENTS.md
 ZIG_RECENT_API_CHANGES*.md
-macos-app/build/
-macos-app/*.a
 inbox
 CLAUDE.md
 ZIG_0.15_TO_0.16_MIGRATION.md

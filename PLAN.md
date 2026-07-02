@@ -1,6 +1,7 @@
 # BLIP Implementation Plan
 
 ## Completed
+- [x] `bin/blip` CLI: self-describing byte-order transcoder (LuaJIT, in `bin/` for PATH pickup) — `encode`/`decode` BLIP frames over stdin/stdout; `-b`/`-l` *declare* input order on encode / *require* output order on decode (default big-endian == stream/network order, the normalizing fixpoint); encoder stores payload verbatim + stamps E bit, decoder converts from the frame's stored order; immediate mode for lone bytes <0x80 (avoids sentinel collision); `encode` is the default verb (`… | blip` filters through it; bare interactive `blip` shows help); refuses raw binary to a TTY (suggests xxd/printable-binary); 40 bash CLI tests wired into `./test` + Garnix `checks.default`; luajit added to flake. ~2026-07-02 15:31 EST
 - [x] Project scaffolding (flake.nix, build.zig) ~2026-02-22 23:40 EST
 - [x] GitHub repo creation (pmarreck/BLIP) ~2026-02-22 23:42 EST
 - [x] BLIP core encode/decode with 51 spec-verified tests ~2026-02-22 23:47 EST
@@ -223,7 +224,7 @@
 - [x] M6: 44 runtime `std.mem.eql` string comparisons — introduce `CodecId` enum with switch dispatch
 - [x] M7 (acceptable duplication): Duplicated C→Zig metadata conversion in lib.zig (create_full vs streaming, ~80 lines)
 - [x] M8: O(B×E) content ownership transfer after expansion (`blar_common.h:6734`) — use hashset
-- [ ] M9: CODE_MINIMAP.md missing 23 source files
+- [x] M9: CODE_MINIMAP.md missing 23 source files — resolved 2026-07-02 by retiring CODE_MINIMAP.md; per-file index migrated to `dirtree` notes (covers every file, `dirtree orphaned-notes` clean) + a high-level "Repository layout" section in README (fleet standard).
 - [x] M10: `bench_helpers.zig` is orphaned (never imported)
 - [x] M11: Copy-paste "PDF size" comments in non-PDF functions (`expansion.zig:281,610,684`)
 - [x] M12: Flate metadata (predictor/columns/colors/bpc) not propagated from Zig expansion path

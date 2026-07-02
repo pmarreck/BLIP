@@ -21,4 +21,11 @@ nix develop -c zig build -Doptimize=ReleaseFast 2>/dev/null \
 echo ""
 echo "━━━ Zig Unit Tests ━━━"
 nix develop -c zig build test --summary all
-exit $?
+zig_rc=$?
+
+echo ""
+echo "━━━ blip CLI Tests ━━━"
+nix develop -c bash tests/cli/blip_cli_test.sh
+cli_rc=$?
+
+exit $(( zig_rc | cli_rc ))

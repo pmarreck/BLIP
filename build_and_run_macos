@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
-nix develop -c bash macos-app/build.sh
-open "macos-app/build/Blip Archiver.app"
