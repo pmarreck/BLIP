@@ -62,6 +62,9 @@
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             timeout 600 zig build test || { echo "Tests failed"; exit 1; }
+            # The sandbox has no /usr/bin/env, so rewrite bin/blip's `#!/usr/bin/env luajit`
+            # shebang to the absolute luajit store path before running the CLI tests.
+            patchShebangs bin/blip
             BLIP_BIN=$PWD/bin/blip bash tests/cli/blip_cli_test.sh || { echo "blip CLI tests failed"; exit 1; }
           '';
           installPhase = ''
