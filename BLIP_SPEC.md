@@ -445,6 +445,16 @@ if (value < 128) → this is a sentinel, not a regular value
 
 This check is only needed when the application uses sentinels. Formats that don't use sentinels can skip it and treat overlong encodings as their face value (though this is discouraged for forward compatibility).
 
+## Invariants
+
+A conformant BLIP implementation upholds these rules:
+
+1. **Canonical form.** Encoders MUST emit the shortest encoding for real values (immediate for 0–127; minimum L otherwise). Only sentinels are deliberately overlong.
+2. **Sentinel endianness.** Sentinels (`0x81 NN`, `NN < 0x80`) are always emitted with `E = 0`. A 1-byte payload has no meaningful byte order, and fixing `E = 0` keeps detection a simple `buf[0] == 0x81 && buf[1] < 0x80` check.
+3. **Per-value endianness.** The `E` bit is set per encoded value; a single stream may freely interleave LE and BE BLIPs. Decoders read it from bit 6 and never infer it from context.
+4. **No maximum L.** Continuation extends L without bound — BLIP encodes arbitrary-precision integers.
+5. **Malformed input.** There is no defined behavior for malformed input. Decoders MAY reject or attempt recovery at their discretion, but MUST NOT silently produce a value that does not match the encoded bytes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

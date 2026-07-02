@@ -1,5 +1,15 @@
 # BLIP Implementation Plan
 
+## In progress: Spec reorg → wire-format identity (2026-07-02)
+
+Resolving "spec bleed" so BLIP owns the **generic wire vocabulary** and blar owns the **archive application**. North star: a compact wire format with a wide gamut of expression types (function calls + args + return values), visible via printable-binary.
+
+- [x] Merge the two varint specs into one — fold `BLIP_SPEC_CONCISE.md`'s Invariants list into `BLIP_SPEC.md`, delete the concise file. (2026-07-02)
+- [ ] Curate `BLIP_CONTAINER_SPEC.md` → `BLIP_WIRE_SPEC.md`: keep LP envelope + attribute framework, scalar sentinels, ARRAY/DICT/MAP/DATA/UTF8, SEGMENT, and **COMP/CSUM/ENC as documented *optional* attributes** (off by default; on for TCP/UDP transports — cf. validate_gui). Update code-comment + doc refs.
+- [ ] Move archive-specific sections to a new `../blar` spec: FILE, DIR, Archive Format, streaming writes, scratch pool, Merkle directory hashing, tar comparison, archive algorithm defaults (LZMA2/Argon2/codec registry). Cross-repo (reach across).
+- [ ] Trim redundant spec prose from README; link to `BLIP_SPEC.md` / `BLIP_WIRE_SPEC.md` instead.
+- [ ] THEN: draft the RPC-like expression layer (call = ARRAY[UTF8 name, args…], return = tagged value/sentinel) on top of the wire vocabulary. Unix-socket default (no COMP/CSUM); optional CSUM/COMP/ENC + SEGMENT for TCP/UDP.
+
 ## Completed
 - [x] `bin/blip` CLI: self-describing byte-order transcoder (LuaJIT, in `bin/` for PATH pickup) — `encode`/`decode` BLIP frames over stdin/stdout; `-b`/`-l` *declare* input order on encode / *require* output order on decode (default big-endian == stream/network order, the normalizing fixpoint); encoder stores payload verbatim + stamps E bit, decoder converts from the frame's stored order; immediate mode for lone bytes <0x80 (avoids sentinel collision); `encode` is the default verb (`… | blip` filters through it; bare interactive `blip` shows help); refuses raw binary to a TTY (suggests xxd/printable-binary); 40 bash CLI tests wired into `./test` + Garnix `checks.default`; luajit added to flake. ~2026-07-02 15:31 EST
 - [x] Project scaffolding (flake.nix, build.zig) ~2026-02-22 23:40 EST

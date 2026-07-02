@@ -11,8 +11,8 @@ close=[
 
 annotate=[
 	BLIP_CONTAINER_SPEC.md = v2 LP-envelope container format: container types, attribute sigils, scalar sentinels, SEGMENT.
-	BLIP_SPEC.md = Full BLIP varint spec: length-prefix mode, sentinels, endianness (E) bit, signed two's-complement handling.
-	BLIP_SPEC_CONCISE.md = Terse hand-off variant of the BLIP varint spec for LLMs.
+	BLIP_SPEC.md = Canonical BLIP varint spec: length-prefix mode, endianness (E) bit, sentinels + scalar sentinels (TRUE/FALSE/NIL), signed handling, invariants, encoding comparisons. (Concise variant merged in 2026-07-02.)
+	BLIP_SPEC_CONCISE.md = 
 	bin/blip = Self-describing byte-order transcoder CLI (LuaJIT): encode/decode BLIP frames; -b/-l declare (encode) or require (decode) byte order; refuses raw binary to a TTY. Lives in bin/ for PATH pickup.
 	blip = 
 	bm = Benchmark entry-point script (ReleaseFast).
