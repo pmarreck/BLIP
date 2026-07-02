@@ -2,43 +2,32 @@
 # =============================================================================
 # BLIP Benchmark Suite
 # =============================================================================
-# Runs both the Zig microbenchmarks (encoding/decoding) and the archive
-# creation benchmarks (expansion, serialization, streaming).
+# Runs the Zig varint microbenchmarks (encode/decode throughput, bignum,
+# random-access) across all encodings. Always ReleaseFast, never Debug.
 #
-# Results are logged to bench/*.jsonl (git-tracked) for historical comparison.
+# (Archive-creation benchmarks moved out with the blar repo in the v3 split.)
+# TODO: emit a `DEBUG BUILD` announcement from the BLIP binaries so a guard
+#       here can assert release-only, per the benchmark convention.
 # =============================================================================
 
-set -euo pipefail
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    BLIP Benchmark Suite                     ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Build everything optimized
 echo "Building (ReleaseFast)..."
-nix develop -c zig build -Doptimize=ReleaseFast 2>/dev/null
+nix develop -c zig build -Doptimize=ReleaseFast 2>/dev/null \
+    || { echo "FATAL: build failed"; exit 1; }
 
-# Check for DEBUG BUILD
-if zig-out/bin/blar --about 2>&1 | grep -qi "DEBUG BUILD"; then
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  ERROR: DEBUG BUILD detected. Benchmarks require Release.   ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    exit 1
-fi
-
-# Run Zig encoding benchmarks
 echo ""
 echo "━━━ Zig Encoding Benchmarks ━━━"
-nix develop -c zig build bench -Doptimize=ReleaseFast 2>/dev/null || true
-
-# Run archive creation benchmarks
-echo ""
-echo "━━━ Archive Creation Benchmarks ━━━"
-bash bench/archive_bench.sh
+nix develop -c zig build bench -Doptimize=ReleaseFast \
+    || { echo "FATAL: benchmark failed"; exit 1; }
 
 echo ""
-echo "Done. Results in bench/*.jsonl"
+echo "Done."

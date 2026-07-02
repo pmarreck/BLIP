@@ -1,7 +1,0 @@
-{"name":"small_10files_inmem","ns_per_op":118130000,"throughput_mb_s":0.8,"timestamp":1775146482}
-{"name":"small_10files_streaming","ns_per_op":22548000,"throughput_mb_s":4.3,"timestamp":1775146482}
-{"name":"medium_10bmp_inmem_expand","ns_per_op":224052000,"throughput_mb_s":1.3,"timestamp":1775146482}
-{"name":"medium_10bmp_streaming_expand","ns_per_op":58984000,"throughput_mb_s":4.8,"timestamp":1775146482}
-{"name":"medium_10bmp_inmem_noexpand","ns_per_op":118865000,"throughput_mb_s":2.4,"timestamp":1775146482}
-{"name":"large_100files_inmem","ns_per_op":245253000,"throughput_mb_s":39.8,"timestamp":1775146482}
-{"name":"large_100files_streaming","ns_per_op":1192392000,"throughput_mb_s":8.2,"timestamp":1775146482}
