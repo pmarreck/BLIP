@@ -3,7 +3,7 @@
 // =============================================================================
 // SEGMENT containers (TYPE=9) wrap slices of a larger BLIP byte stream.  This
 // module handles the producer-side serializeSegment and consumer-side
-// parseSegment / reassemble routines.  See BLIP_CONTAINER_SPEC.md §Segmentation
+// parseSegment / reassemble routines.  See BLIP_WIRE_SPEC.md §Segmentation
 // for the wire format and reassembly algorithm.
 // =============================================================================
 
@@ -231,7 +231,7 @@ pub fn serializeSegment(
 
 /// Reassemble a list of SEGMENT-container byte slices belonging to stream
 /// `expected_stream_id` into the original concatenated payload.  Caller owns
-/// the returned slice.  See BLIP_CONTAINER_SPEC §Segmentation for the rules.
+/// the returned slice.  See BLIP_WIRE_SPEC §Segmentation for the rules.
 pub fn reassemble(
     allocator: Allocator,
     segments: []const []const u8,

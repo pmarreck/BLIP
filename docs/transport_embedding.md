@@ -1,6 +1,6 @@
 # BLIP Transport Embedding Guide
 
-How to carry a segmented BLIP archive (one or more SEGMENT containers — see [BLIP_CONTAINER_SPEC.md §Segmentation](../BLIP_CONTAINER_SPEC.md)) across various host transports. The container spec deliberately stays transport-agnostic; this document defines the canonical conventions used by the `blar` CLI and recommended for any host adapter.
+How to carry a segmented BLIP stream (one or more SEGMENT containers — see [BLIP_WIRE_SPEC.md §Segmentation](../BLIP_WIRE_SPEC.md)) across various host transports. The wire spec deliberately stays transport-agnostic; this document defines the canonical conventions used by the `blar` CLI and recommended for any host adapter.
 
 **Author:** Peter Marreck
 **Version:** 1.0 (2026-04-26)
@@ -115,7 +115,7 @@ FF EB <length:2B BE>            APP11 marker + length (length includes own 2 byt
 1. Walk APP11 markers from SOI to SOS.
 2. Markers whose payload begins with `"BLIP\0\0"` are BLIP segments.
 3. Strip the identifier, parse the SEGMENT container, collect.
-4. Apply standard reassembly per BLIP_CONTAINER_SPEC §Segmentation.
+4. Apply standard reassembly per BLIP_WIRE_SPEC §Segmentation.
 
 JPEG editors that strip unknown APP markers will destroy embedded BLIP data. Recommend storing parity in `.par2` sidecars when the JPEG might pass through hostile editors (Photoshop legacy modes have been known to drop APP11+).
 

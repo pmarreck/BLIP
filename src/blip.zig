@@ -267,7 +267,7 @@ pub fn endianOf(buf: []const u8) ?Endian {
 // Reserved 2-byte BLIP sentinels at the top of the sentinel range, used to
 // represent nil / boolean values in attribute positions where the surrounding
 // format explicitly permits a scalar sentinel (see SEG attribute in
-// BLIP_CONTAINER_SPEC.md).  Restricted-position rule: callers MUST use
+// BLIP_WIRE_SPEC.md).  Restricted-position rule: callers MUST use
 // decodeScalar() only at positions whose spec allows a sentinel; integer-only
 // positions continue to use decode().
 // ---------------------------------------------------------------------------

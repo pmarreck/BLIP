@@ -182,11 +182,12 @@ printf '\xef\xbe\xad\xde' | blip encode -l | blip decode -l | xxd -p   # efbeadd
 
 `-l` is for genuine little-endian *numbers*; opaque/non-numeric data should use the default `-b`, which passes through `decode` unchanged. Both commands emit raw binary and **refuse an interactive terminal** (pipe to a file or a tool like `xxd` / `printable-binary`, or pass `-f`/`--force`).
 
-## Container Format (v2 LP)
+## Wire format & containers
 
-BLIP also defines a recursive binary container format for archives, dictionaries, and structured data. See [BLIP_CONTAINER_SPEC.md](BLIP_CONTAINER_SPEC.md) for the full specification.
+On top of the varint, BLIP defines a recursive, typed, self-describing **wire format** — the generic expression vocabulary (LP envelope, `ARRAY`/`DICT`/`MAP`/`UTF8`/`DATA`/`RAW`, scalar sentinels, `SEGMENT` transport fragmentation, and *optional* `COMP`/`CSUM`/`ENC` attributes), with end-of-container index tables for O(1) random access, determinism via canonical key ordering, and full round-tripping through printable-binary and JSON.
 
-Container types: ARRAY, DICT, MAP, FILE, DIR, DATA, UTF8. Each container uses the LP (Length-Payload) envelope: `[BLIP(total_length)] [sorted attributes] [VAL payload + checksum]`. Attributes include TYPE (container type ID), COMP (compression algorithm), DECOMP_LEN (decompressed length), CSUM (checksum algorithm), ENC (encryption algorithm + KDF + salt + nonce), and SIG (digital signature). Features include end-of-container index tables for O(1) random access, BLAKE3-128 integrity at the archive level with xxHash64 for inner containers, Merkle hash trees for directories, built-in LZMA2 compression, per-container AEAD encryption (AES-256-GCM or ChaCha20-Poly1305 with Argon2id or PBKDF2-SHA256 key derivation), and canonical key ordering for deterministic output. FILE containers use ARRAY layout with embedded DATA containers for dual-level checksumming. All metadata uses compact 2-character key names.
+- **[BLIP_WIRE_SPEC.md](BLIP_WIRE_SPEC.md)** — the generic wire format (this repo).
+- **[blar's BLAR_ARCHIVE_SPEC.md](https://github.com/pmarreck/blar/blob/yolo/BLAR_ARCHIVE_SPEC.md)** — the archive application built on it (FILE/DIR, Merkle directory hashing, tar-replacement envelope, compression/encryption defaults).
 
 ## C FFI
 
