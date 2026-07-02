@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-nix develop -c zig build blar -Doptimize=ReleaseFast -- "$@"
