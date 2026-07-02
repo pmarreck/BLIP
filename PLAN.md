@@ -9,7 +9,12 @@ Resolving "spec bleed" so BLIP owns the **generic wire vocabulary** and blar own
 - [x] Move archive-specific sections to a new `../blar/BLAR_ARCHIVE_SPEC.md`: FILE, DIR + Merkle, Archive Format, encoding process, metadata key registries, size budget, tar comparison, archive COMP/KDF defaults. **File created in blar's tree but NOT committed** — blar's working copy is dirty + origin-diverged; leave the commit to blar's own session/Peter. (2026-07-02)
 - [x] Trim redundant Container Format prose from README → link to `BLIP_WIRE_SPEC.md` + blar archive spec. (2026-07-02)
 - [ ] Follow-up: further README trim — the `Self-Describing Endianness` bit-diagram + `Signedness` subsections still duplicate `BLIP_SPEC.md`; condense to blurbs + links (deferred — don't gut the marketing prose / CVE list).
-- [ ] Follow-up: generic container↔JSON codec as BLIP-side wire tooling (blar has archive-specialized `json_serde.zig`); finalize the typed-JSON schema alongside the RPC layer.
+- [x] SPEC PIN (owner: BLIP agent; 2026-07-02) — BLIP_WIRE_SPEC v3.2: (1) single binary leaf DATA(4), CSUM optional, killed phantom RAW/type-8; (2) **bare scalar values** (DICT value / ARRAY element may be a bare BLIP integer or TRUE/FALSE/NIL sentinel) with a value classifier → self-describing integers → readable JSON.
+- [ ] CODE CONFORMANCE (spec is truth during dev — [[spec-is-source-of-truth]]): implement bare-scalar values in dict/array serialize + read (`decodeScalar`/`encodeScalar` at value positions; the classifier). The codec depends on this.
+- [ ] BUILD: generic lossless container↔JSON codec ($int/$b/$blip, reserve $f64; bare-scalar/sentinel/container mapping). TDD via the `wire → JSON → wire` byte-identical round-trip oracle (== validate-serve `--verify-mapping`). blar's `json_serde.zig` is archive-specialized prior art.
+- [ ] BUILD: export container-build FFI (`serializeDict/serializeUtf8/serializeData/serializeArray` + scalar encode → `blip_*`) in `blip.h`.
+- [ ] MFIC drift control: test asserting the wire spec's container-type table matches the `ContainerTypeId` enum (this whole episode was spec↔code drift).
+- [ ] Erratum to validate_gui: type 4 = DATA not RAW; no type 8 (their number 4 is fine, rename only); bare-scalar integers confirmed so their number/$int mapping stands.
 - [ ] THEN: draft the RPC-like expression layer (call = ARRAY[UTF8 name, args…], return = tagged value/sentinel) on the wire vocabulary. Unix-socket default (no COMP/CSUM); optional CSUM/COMP/ENC + SEGMENT for TCP/UDP (cf. validate_gui).
 
 ## Completed

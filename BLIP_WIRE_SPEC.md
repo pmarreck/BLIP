@@ -3,8 +3,10 @@
 A recursive, typed, self-describing binary **wire format** built on [BLIP encoding](BLIP_SPEC.md). This is the generic *expression vocabulary* — containers, attributes, and transport segmentation — for compact messages that remain visible via [printable-binary](https://github.com/pmarreck/printable_binary).
 
 **Author:** Peter Marreck
-**Version:** 3.1 (2026-07-02)
+**Version:** 3.2 (2026-07-02)
 **Depends on:** BLIP Spec v1.2
+
+*v3.2 — two structural pins: (1) a single binary leaf `DATA` (type 4) with CSUM as an optional attribute (removed the phantom `RAW`/`type 8` the old container spec carried); (2) **bare scalar values** — a DICT value / ARRAY element may be a bare BLIP integer or a TRUE/FALSE/NIL sentinel, disambiguated by a value classifier (§Scalar values), which is what makes integers self-describing and the JSON projection readable. The reference code must conform to these (bare-scalar support is not yet implemented).*
 
 > **Scope.** This document defines only the *generic* wire vocabulary. The **archive application** built on top of it (the tar-replacement: FILE/DIR containers, the archive envelope, metadata key registries, Merkle directory hashing) lives in **[blar's `BLAR_ARCHIVE_SPEC.md`](https://github.com/pmarreck/blar/blob/yolo/BLAR_ARCHIVE_SPEC.md)**. This split (v3.1) replaces the former `BLIP_CONTAINER_SPEC.md`, which welded the two layers together.
 >
@@ -196,11 +198,10 @@ Sentinel        Type            Layer     Description
 0x81 0x01       ARRAY           wire      Ordered sequence, indexed + hashed
 0x81 0x02       DICT            wire      Sorted key-value pairs, indexed + hashed
 0x81 0x03       UTF8            wire      UTF-8 string
-0x81 0x04       RAW             wire      Raw binary data (untyped)
+0x81 0x04       DATA            wire      Binary leaf (raw bytes; CSUM optional)
 0x81 0x05       FILE            archive   File container (blar)
 0x81 0x06       MAP             wire      Unsorted key-value pairs
 0x81 0x07       DIR             archive   Directory container (blar)
-0x81 0x08       DATA            wire      Checksummed binary data
 0x81 0x09       SEGMENT         wire      Transport segmentation wrapper (v3; LP-only)
 0x81 0x0A - 0x0F               —          Reserved (future container types)
 0x81 0x10 - 0x7F               —          Application-defined types (v1 only)
@@ -216,10 +217,10 @@ DICT containers store key-value pairs in canonical sort order; MAP containers pr
 
 1. Compare keys byte-by-byte using unsigned byte values (`0x00 < 0x01 < … < 0xFF`).
 2. If one key is a prefix of another, the shorter key sorts first.
-3. Applies uniformly to all keys regardless of container type (UTF8 or RAW).
+3. Applies uniformly to all keys regardless of container type (UTF8 or DATA).
 4. UTF8 keys are compared by raw bytes, not Unicode codepoint or collation order.
 
-**Rationale:** Byte ordering is unambiguous, locale-independent, trivial to implement, identical for UTF8 and RAW keys, and keeps index-section keys in a known order — enabling binary search for key lookup.
+**Rationale:** Byte ordering is unambiguous, locale-independent, trivial to implement, identical for UTF8 and DATA keys, and keeps index-section keys in a known order — enabling binary search for key lookup.
 
 Encoders MUST emit key-value pairs in canonical key order for DICT containers. Decoders SHOULD reject DICT containers with out-of-order keys as malformed. MAP containers are exempt.
 
@@ -246,38 +247,48 @@ Example — the string `"hello"` (v1 inline-sentinel form shown for illustration
 0x68 0x65 0x6C 0x6C 0x6F  ← "hello"
 ```
 
-### Raw Binary (type 4)
+### DATA — binary leaf (type 4)
 
-Untyped binary data. Value is raw bytes, no checksum.
-
-```
-┌─────────────────────────────────────┐
-│ Type:   RAW (4)                     │
-│ Length: BLIP(total)                 │
-│ Value:  raw bytes                   │
-└─────────────────────────────────────┘
-```
-
-### Data (type 8)
-
-Checksummed binary data: raw bytes with an embedded xxHash64 suffix for content integrity.
+A binary byte-leaf carrying arbitrary bytes verbatim, no escaping. This is the **only** binary-leaf type: "raw bytes" is simply DATA with no CSUM attribute. Integrity is **opt-in** via the CSUM attribute (see §Optional attributes) — there is no separate always-checksummed leaf type and no type 8.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Type:   DATA (8)                                     │
+│ Type:   DATA (4)                                     │
 │ Length: BLIP(total)                                  │
-│ Value:  [data_bytes][xxHash64(data_bytes) 8B LE]     │
+│ Value:  raw bytes                        (no CSUM)   │
+│      or [raw bytes][checksum]     (with CSUM attr)   │
 └─────────────────────────────────────────────────────┘
 ```
+
+With a CSUM attribute present, the checksum (e.g. xxHash64, 8 bytes LE) is appended to the value; `data_len = value_len − csum_len`, and the hash covers the value bytes (not the type/length prefix). Without CSUM, the value is exactly the raw bytes. Empty content is valid.
 
 - `data_len = value_len - 8`
 - The trailing 8 bytes are `xxHash64(data_bytes)` with seed 0, little-endian.
 - Hash covers only the data bytes, NOT the type/length prefix.
 - Empty content is valid: value = 8-byte hash of the empty input.
 
+### Scalar values (bare integers & sentinels)
+
+At any position that holds a value — a DICT value, an ARRAY element, or anywhere a format says "a value goes here" — the value MAY be, instead of a full LP container, a **bare scalar**:
+
+- a **bare BLIP integer** — a single BLIP varint (LE by default; see [BLIP Spec](BLIP_SPEC.md)), or
+- a **scalar sentinel** — TRUE (`0x81 0x7C`), FALSE (`0x81 0x7D`), or NIL (`0x81 0x7E`).
+
+This keeps small self-describing values compact — an integer costs 1 byte for 0–127, a bool/nil costs 2 — instead of paying the ~5–6 byte LP-container envelope, and it is what lets a generic reader recover a *number* (not an opaque byte-blob) from the wire.
+
+**Value classifier (disambiguation).** Given a value's exact byte span `v` (its length is known from the enclosing ARRAY/DICT index or the surrounding framing), a decoder classifies `v` in this order:
+
+1. If `v` is exactly `0x81 0x7C` / `0x81 0x7D` / `0x81 0x7E` → the **TRUE / FALSE / NIL** sentinel.
+2. Else if `v` is a **well-formed LP container** — `v[0..]` decodes as `BLIP(total)` with `total == v.len`, immediately followed by the TYPE sentinel `0x81 0x01` → an **LP container** (ARRAY/DICT/UTF8/DATA/…).
+3. Else → a **bare BLIP integer**: decode `v` as a single BLIP varint, which MUST consume exactly `v.len` bytes.
+
+The cases are mutually exclusive: an LP container is required to have both `total == v.len` **and** the `0x81 0x01` TYPE sentinel right after its length — neither a bare varint nor a 2-byte sentinel satisfies that, and rule 1 precedes rule 2 so a sentinel is never mis-parsed. Because bare integers appear directly here, encoders MUST emit canonical (immediate) form for 0–127 (a BLIP invariant), so an overlong `L=1,E=0,payload<0x80` encoding is **always** a reserved sentinel, never the integer of that face value.
+
+**Restricted positions.** A format/schema MUST state where a scalar sentinel is permitted (e.g. "the `ok` field may be TRUE/FALSE"); a decoder MUST NOT silently accept TRUE/FALSE/NIL where only an integer or container is expected. Homogeneous containers (e.g. an ARRAY-of-integers) thereby stay tight.
+
 ### Array (type 1)
 
-An ordered sequence of containers with a trailing index for random access and a trailing xxHash64 for integrity.
+An ordered sequence of elements (containers or bare scalars — see §Scalar values) with a trailing index for random access and a trailing xxHash64 for integrity.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -321,7 +332,7 @@ A sorted collection of key-value pairs with a trailing index and hash. Keys must
 
 **Key lookup:** jump to index, read N, **binary search** the sorted pairs (each is a `(key_offset, value_offset)` tuple); dereference `key_offset`, compare; on match the adjacent `value_offset` gives the value. O(log N).
 
-Keys are UTF8 (3) or RAW (4) containers and MUST be unique. Keys and values are interleaved in canonical key order for determinism; parsers MUST use the index for access.
+Keys are UTF8 (3) or DATA (4) containers and MUST be unique. Values may be LP containers **or** bare scalars (§Scalar values). Keys and values are interleaved in canonical key order for determinism; parsers MUST use the index for access.
 
 The reference implementation realizes fast lookup: `DictReader.findKey` binary-searches the sorted keys, and an opt-in `DictIndex` accelerator parses the offset table once for O(1) random access and O(log n) lookup (Zig + C FFI `blip_dict_index_*`).
 
@@ -483,9 +494,9 @@ When BLIP is the transport between a frontend and a backend, two things are need
 | UTF8 | string |
 | BLIP integer | number (or a string when it exceeds JSON's safe-integer range) |
 | TRUE / FALSE / NIL scalar sentinels | `true` / `false` / `null` |
-| DATA / RAW (binary leaf) | printable-binary string (consistent with §Text Transport) — never base64 |
+| DATA (binary leaf) | printable-binary string (consistent with §Text Transport) — never base64 |
 
-**Fidelity note.** A naive mapping is lossy in the JSON→BLIP direction: a JSON string could mean UTF8 *or* a binary leaf; a number hides its BLIP width; `{…}` could be DICT *or* MAP; and JSON's f64 number type cannot hold a `u64 > 2^53`. Faithful round-tripping therefore uses a lightweight **typed form** where ambiguity matters (e.g. `{"$data":"<printable-binary>"}`, `{"$u64":"…"}`, `{"$map":{…}}`), falling back to the natural mapping otherwise.
+**Fidelity note.** A naive mapping is lossy in the JSON→BLIP direction: a JSON string could mean UTF8 *or* a binary leaf; a number hides its BLIP width; `{…}` could be DICT *or* MAP; and JSON's f64 number type cannot hold a `u64 > 2^53`. Faithful round-tripping therefore uses a lightweight **typed form** where ambiguity matters (e.g. `{"$b":"<printable-binary>"}`, `{"$int":"…"}`, `{"$map":{…}}`), falling back to the natural mapping otherwise.
 
 **Universal lossless guarantee.** Because printable-binary can represent *any* byte sequence as valid UTF-8, it is the universal escape hatch: any value — a subtree, or the entire frame — that lacks a clean or agreed structural mapping degrades to a printable-binary string of its **raw BLIP bytes**, tagged (e.g. `{"$blip":"<printable-binary>"}`). The decoder printable-binary-decodes it straight back to the container bytes and splices them in. So **lossless projection is total by construction** — there is always a faithful representation for any binary content, and no format can defeat it. The structural mapping above is the *readable* path; the escape hatch is the *guarantee*.
 
@@ -501,7 +512,7 @@ Natural JSON is used wherever it is unambiguous and lossless; a **tag** (a singl
 | number | BLIP integer | only when the value is within JSON's f64-safe range (±2^53); larger → `$int` |
 | `true` / `false` / `null` | TRUE / FALSE / NIL | |
 | `{"$int":"<decimal>"}` | BLIP integer | arbitrary-precision; optional leading `-` for signed (sign is interpretation, not a separate tag) — used when a value exceeds ±2^53 |
-| `{"$b":"<printable-binary>"}` | RAW (4) leaf | the leaf's **value bytes** (no envelope); maps to RAW on re-encode |
+| `{"$b":"<printable-binary>"}` | DATA (4) leaf | the leaf's **value bytes** (no envelope); maps to DATA on re-encode |
 | `{"$blip":"<printable-binary>"}` | any container | **universal escape hatch** — printable-binary of the **full raw BLIP bytes** (type+length envelope included) for any value/subtree/frame the structural codec doesn't descend into; the decoder splices the decoded bytes back as a complete container |
 | `{"$f64":"<printable-binary>"}` | 8 raw IEEE-754 LE bytes | *reserved*; lossless (preserves NaN/Inf/−0.0/full precision) — decimal would be lossy |
 
