@@ -213,43 +213,53 @@ pub const ArrayReader = struct {
         return self.count;
     }
 
-    /// Random access: read element at the given index.
-    /// Returns an LPContainerView of the element.
-    pub fn elementAt(self: ArrayReader, index: u64) LPContainerError!LPContainerView {
-        if (index >= self.count) return ContainerError.IndexOutOfBounds;
-
+    /// Byte offset (from container start) of element `index`, read from the index table.
+    fn elementOffsetAt(self: ArrayReader, index: u64) LPContainerError!usize {
         const total: usize = @intCast(self.lp_view.total_length);
         var pos: usize = @intCast(self.index_offset);
-
         // Skip past BLIP(N)
-        const n_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
+        pos += (blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
-        };
-        pos += n_result.bytes_read;
-
+        }).bytes_read;
         // Skip `index` offset entries
         for (0..index) |_| {
-            const skip_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
+            pos += (blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
                 error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
                 error.Overflow => return ContainerError.Overflow,
                 error.BufferTooSmall => return ContainerError.BufferTooSmall,
-            };
-            pos += skip_result.bytes_read;
+            }).bytes_read;
         }
-
-        // Decode the target offset
-        const off_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
+        return @intCast((blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
-        };
-        const elem_offset: usize = @intCast(off_result.value);
+        }).value);
+    }
 
-        // Jump to element and parse its LP header
-        if (elem_offset >= total) return ContainerError.IndexOutOfBounds;
-        return container.parseLPHeader(self.lp_view.buf[elem_offset..total]);
+    /// Random access: the raw byte span of element `index`. Works for BOTH LP
+    /// containers and bare-scalar elements (integers / TRUE/FALSE/NIL) — pair it
+    /// with value.classify to interpret. Element i spans [offset[i], boundary),
+    /// where boundary is offset[i+1] for a non-last element, else the index-section
+    /// start (index_offset); elements are contiguous in the data section.
+    pub fn elementBytesAt(self: ArrayReader, index: u64) LPContainerError![]const u8 {
+        if (index >= self.count) return ContainerError.IndexOutOfBounds;
+        const total: usize = @intCast(self.lp_view.total_length);
+        const start = try self.elementOffsetAt(index);
+        const end = if (index + 1 < self.count)
+            try self.elementOffsetAt(index + 1)
+        else
+            @as(usize, @intCast(self.index_offset));
+        if (start >= end or end > total) return ContainerError.InvalidLength;
+        return self.lp_view.buf[start..end];
+    }
+
+    /// Random access: read element `index` and parse it as an LP container.
+    /// ASSUMES the element is a container — errors if it is a bare scalar. For
+    /// scalar-aware access use elementBytesAt + value.classify.
+    pub fn containerAt(self: ArrayReader, index: u64) LPContainerError!LPContainerView {
+        return container.parseLPHeader(try self.elementBytesAt(index));
     }
 
     /// Verify the checksum of this array container.
@@ -497,7 +507,7 @@ test "single UTF8 element round-trip" {
     try testing.expectEqual(@as(u64, 1), reader.elementCount());
 
     // Read back the element
-    const view = try reader.elementAt(0);
+    const view = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, view.type_id);
     try testing.expectEqualSlices(u8, "hello", view.payloadSlice());
 }
@@ -519,7 +529,7 @@ test "multiple mixed elements (UTF8 + DATA) round-trip" {
     try testing.expectEqual(@as(u64, 3), reader.elementCount());
 }
 
-test "elementAt for each index in multi-element array" {
+test "containerAt for each index in multi-element array" {
     const allocator = testing.allocator;
     const elem0 = try leaf.serializeUtf8(allocator, "alpha");
     defer allocator.free(elem0);
@@ -535,22 +545,22 @@ test "elementAt for each index in multi-element array" {
     const reader = try ArrayReader.init(result);
 
     // Element 0: UTF8 "alpha"
-    const v0 = try reader.elementAt(0);
+    const v0 = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
     try testing.expectEqualSlices(u8, "alpha", v0.payloadSlice());
 
     // Element 1: DATA 0xDEADBEEF
-    const v1 = try reader.elementAt(1);
+    const v1 = try reader.containerAt(1);
     try testing.expectEqual(ContainerTypeId.data, v1.type_id);
     try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, v1.payloadSlice());
 
     // Element 2: UTF8 "gamma"
-    const v2 = try reader.elementAt(2);
+    const v2 = try reader.containerAt(2);
     try testing.expectEqual(ContainerTypeId.utf8, v2.type_id);
     try testing.expectEqualSlices(u8, "gamma", v2.payloadSlice());
 }
 
-test "elementAt out of bounds returns IndexOutOfBounds" {
+test "containerAt out of bounds returns IndexOutOfBounds" {
     const allocator = testing.allocator;
     const elem = try leaf.serializeUtf8(allocator, "only");
     defer allocator.free(elem);
@@ -560,8 +570,8 @@ test "elementAt out of bounds returns IndexOutOfBounds" {
     defer allocator.free(result);
 
     const reader = try ArrayReader.init(result);
-    try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementAt(1));
-    try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementAt(100));
+    try testing.expectError(ContainerError.IndexOutOfBounds, reader.containerAt(1));
+    try testing.expectError(ContainerError.IndexOutOfBounds, reader.containerAt(100));
 }
 
 test "verifyChecksum returns true for no checksum (inner container default)" {
@@ -595,11 +605,11 @@ test "array with BLAKE3-128 checksum" {
     try testing.expect(try reader.verifyChecksum());
 
     // Verify elements still accessible
-    const v0 = try reader.elementAt(0);
+    const v0 = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
     try testing.expectEqualSlices(u8, "checked", v0.payloadSlice());
 
-    const v1 = try reader.elementAt(1);
+    const v1 = try reader.containerAt(1);
     try testing.expectEqual(ContainerTypeId.data, v1.type_id);
     try testing.expectEqualSlices(u8, "data", v1.payloadSlice());
 }
@@ -647,12 +657,12 @@ test "nested arrays (array inside array)" {
     try testing.expect(try outer_reader.verifyChecksum());
 
     // Element 0 is UTF8 "outer"
-    const v0 = try outer_reader.elementAt(0);
+    const v0 = try outer_reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
     try testing.expectEqualSlices(u8, "outer", v0.payloadSlice());
 
     // Element 1 is an ARRAY
-    const v1 = try outer_reader.elementAt(1);
+    const v1 = try outer_reader.containerAt(1);
     try testing.expectEqual(ContainerTypeId.array, v1.type_id);
 
     // Parse the inner array from v1's buffer
@@ -660,7 +670,7 @@ test "nested arrays (array inside array)" {
     try testing.expectEqual(@as(u64, 1), inner_reader.elementCount());
     try testing.expect(try inner_reader.verifyChecksum());
 
-    const inner_v0 = try inner_reader.elementAt(0);
+    const inner_v0 = try inner_reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, inner_v0.type_id);
     try testing.expectEqualSlices(u8, "nested", inner_v0.payloadSlice());
 }
@@ -697,10 +707,10 @@ test "large element count (50+ elements)" {
     try testing.expect(try reader.verifyChecksum());
 
     // Spot-check first and last elements
-    const v0 = try reader.elementAt(0);
+    const v0 = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.data, v0.type_id);
 
-    const v49 = try reader.elementAt(49);
+    const v49 = try reader.containerAt(49);
     try testing.expectEqual(ContainerTypeId.data, v49.type_id);
 }
 
@@ -723,7 +733,7 @@ test "serializeArrayLike with .file type" {
     try testing.expect(try reader.verifyChecksum());
 
     // Read back element
-    const view = try reader.elementAt(0);
+    const view = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, view.type_id);
     try testing.expectEqualSlices(u8, "hello", view.payloadSlice());
 }
@@ -771,7 +781,7 @@ test "BLIP boundary crossing (total > 128)" {
 
     // Verify each element
     for (0..25) |i| {
-        const v = try reader.elementAt(@intCast(i));
+        const v = try reader.containerAt(@intCast(i));
         try testing.expectEqual(ContainerTypeId.utf8, v.type_id);
         try testing.expectEqualSlices(u8, "x", v.payloadSlice());
     }
@@ -812,7 +822,7 @@ test "round-trip: serialize N elements then read back and compare" {
     try testing.expect(try reader.verifyChecksum());
 
     for (texts, 0..) |text, i| {
-        const v = try reader.elementAt(@intCast(i));
+        const v = try reader.containerAt(@intCast(i));
         try testing.expectEqual(ContainerTypeId.utf8, v.type_id);
         try testing.expectEqualSlices(u8, text, v.payloadSlice());
     }
@@ -853,20 +863,20 @@ test "five DATA elements round-trip" {
     try testing.expect(try reader.verifyChecksum());
 
     for (data, 0..) |d, i| {
-        const v = try reader.elementAt(@intCast(i));
+        const v = try reader.containerAt(@intCast(i));
         try testing.expectEqual(ContainerTypeId.data, v.type_id);
         try testing.expectEqualSlices(u8, d, v.payloadSlice());
     }
 }
 
-test "elementAt on empty array returns IndexOutOfBounds" {
+test "containerAt on empty array returns IndexOutOfBounds" {
     const allocator = testing.allocator;
     const elements = [_][]const u8{};
     const result = try serializeArray(allocator, &elements);
     defer allocator.free(result);
 
     const reader = try ArrayReader.init(result);
-    try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementAt(0));
+    try testing.expectError(ContainerError.IndexOutOfBounds, reader.containerAt(0));
 }
 
 test "verifyChecksum with corrupted checksum bytes" {
@@ -910,7 +920,7 @@ test "deeply nested arrays (3 levels)" {
     try testing.expectEqual(@as(u64, 1), r3.elementCount());
     try testing.expect(try r3.verifyChecksum());
 
-    const v3 = try r3.elementAt(0);
+    const v3 = try r3.containerAt(0);
     try testing.expectEqual(ContainerTypeId.array, v3.type_id);
 }
 
@@ -929,9 +939,9 @@ test "serializeArrayLike with .file type multi-element round-trip" {
     try testing.expectEqual(@as(u64, 2), reader.elementCount());
     try testing.expect(try reader.verifyChecksum());
 
-    const v0 = try reader.elementAt(0);
+    const v0 = try reader.containerAt(0);
     try testing.expectEqualSlices(u8, "metadata", v0.payloadSlice());
-    const v1 = try reader.elementAt(1);
+    const v1 = try reader.containerAt(1);
     try testing.expectEqualSlices(u8, "content", v1.payloadSlice());
 }
 
@@ -961,7 +971,7 @@ test "array with xxHash64 checksum" {
     try testing.expectEqual(@as(u64, 1), reader.elementCount());
     try testing.expect(try reader.verifyChecksum());
 
-    const v0 = try reader.elementAt(0);
+    const v0 = try reader.containerAt(0);
     try testing.expectEqual(ContainerTypeId.utf8, v0.type_id);
     try testing.expectEqualSlices(u8, "hashed", v0.payloadSlice());
 }
@@ -978,4 +988,25 @@ test "array with CRC32 checksum" {
     const reader = try ArrayReader.init(result);
     try testing.expectEqual(@as(u64, 1), reader.elementCount());
     try testing.expect(try reader.verifyChecksum());
+}
+
+test "elementBytesAt returns exact spans incl. a bare-scalar element" {
+    const allocator = testing.allocator;
+    // element 0: a bare BLIP integer (NOT a container); element 1: a UTF8 container
+    var ibuf: [16]u8 = undefined;
+    const int_elem = ibuf[0..try blip.encode(300, &ibuf)];
+    const utf = try leaf.serializeUtf8(allocator, "hi");
+    defer allocator.free(utf);
+    const arr = try serializeArray(allocator, &.{ int_elem, utf });
+    defer allocator.free(arr);
+
+    const reader = try ArrayReader.init(arr);
+    try testing.expectEqual(@as(u64, 2), reader.elementCount());
+    // raw spans exactly reproduce the original element bytes
+    try testing.expectEqualSlices(u8, int_elem, try reader.elementBytesAt(0));
+    try testing.expectEqualSlices(u8, utf, try reader.elementBytesAt(1));
+    // containerAt errors on the bare scalar, parses the real container
+    try testing.expect(if (reader.containerAt(0)) |_| false else |_| true);
+    _ = try reader.containerAt(1);
+    try testing.expectError(ContainerError.IndexOutOfBounds, reader.elementBytesAt(2));
 }

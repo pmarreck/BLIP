@@ -137,3 +137,20 @@ test "classify: MFIC sweep over 0x81 0xNN (NN < 0x80) — exactly 7C/7D/7E are s
         }
     }
 }
+
+test "classify: end-to-end over ARRAY elements (bare integer + container)" {
+    const a = testing.allocator;
+    var ibuf: [16]u8 = undefined;
+    const int_elem = ibuf[0..try blip.encode(42, &ibuf)];
+    const utf = try leaf.serializeUtf8(a, "x");
+    defer a.free(utf);
+    const arr = try array.serializeArray(a, &.{ int_elem, utf });
+    defer a.free(arr);
+
+    const reader = try array.ArrayReader.init(arr);
+    try testing.expectEqual(ClassifiedValue{ .integer = 42 }, try classify(try reader.elementBytesAt(0)));
+    switch (try classify(try reader.elementBytesAt(1))) {
+        .container => |view| try testing.expectEqual(ct.ContainerTypeId.utf8, view.type_id),
+        else => return error.TestUnexpectedResult,
+    }
+}

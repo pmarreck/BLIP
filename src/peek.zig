@@ -137,7 +137,7 @@ pub fn navigate(buf: []const u8, segments: []const PathSegment) ContainerError![
                 switch (view.type_id) {
                     .array, .file => {
                         const reader = try array_mod.ArrayReader.init(current[0..@intCast(view.total_length)]);
-                        const elem_view = try reader.elementAt(idx);
+                        const elem_view = try reader.containerAt(idx);
                         // Get the element slice from the buffer
                         const elem_offset = @intFromPtr(elem_view.buf.ptr) - @intFromPtr(current.ptr);
                         current = current[elem_offset..][0..@intCast(elem_view.total_length)];
