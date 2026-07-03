@@ -43,6 +43,7 @@ annotate=[
 	src/protobuf_varint.zig = Protocol Buffers varint + ZigZag (benchmark comparison encoding).
 	src/segmentation.zig = Layer 5 SEGMENT primitive: chunkBytes, reassemble, parseSegment.
 	src/sqlite_varint.zig = SQLite varint (benchmark comparison encoding, fixed <=64-bit).
+	src/value.zig = Value classifier at DICT-value/ARRAY-element positions (BLIP_WIRE_SPEC §Scalar values): classify() → bare integer / TRUE-FALSE-NIL sentinel / LP container; 3-rule mutually-exclusive disambiguation.
 	test = Master test runner: zig unit tests + blip CLI tests (tests/cli), accumulates exit code.
 	tests/cli/blip_cli_test.sh = Bash CLI tests for the blip encode/decode tool (34 cases: framing, endian transcode, roundtrip/fixpoint, TTY guard, error paths)
 	vendor/printable_binary/main.zig = Vendored printable-binary CLI main().

@@ -1091,4 +1091,5 @@ test {
     _ = @import("peek.zig");
     _ = @import("checksum.zig");
     _ = @import("segmentation.zig");
+    _ = @import("value.zig");
 }
