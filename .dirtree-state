@@ -14,6 +14,7 @@ annotate=[
 	BLIP_SPEC.md = Canonical BLIP varint spec: length-prefix mode, endianness (E) bit, sentinels + scalar sentinels (TRUE/FALSE/NIL), signed handling, invariants, encoding comparisons. (Concise variant merged in 2026-07-02.)
 	BLIP_SPEC_CONCISE.md = 
 	BLIP_WIRE_SPEC.md = Generic BLIP wire-format spec: LP envelope + attribute framework, scalar sentinels, ARRAY/DICT/MAP/UTF8/DATA/RAW, SEGMENT, optional COMP/CSUM/ENC, streaming/scratch, determinism, printable-binary + JSON human-readable forms. (Archive layer split to blar 2026-07-02.)
+	IDEAS.md = Parking lot for future BLIP-adjacent directions (captured, not committed to) — e.g. the shared-memory SWMR offset-store idea.
 	bin/blip = Self-describing byte-order transcoder CLI (LuaJIT): encode/decode BLIP frames; -b/-l declare (encode) or require (decode) byte order; refuses raw binary to a TTY. Lives in bin/ for PATH pickup.
 	blip = 
 	bm = Benchmark entry-point script (ReleaseFast).
