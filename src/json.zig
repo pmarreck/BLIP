@@ -333,6 +333,88 @@ test "roundtrip: MAP / FILE / DIR / SEGMENT preserve type (lossless via \\$blip)
     try expectRoundTrip(seg);
 }
 
+/// Generate a random canonical BLIP value (for the property-based round-trip sweep).
+/// Leaves at depth 0; arrays/dicts allowed deeper. Keys are lowercase ASCII (unique,
+/// sorted) and avoid the `$` reserved-tag namespace. UTF8 content is ASCII (valid
+/// UTF-8, exercises escaping); DATA content is arbitrary bytes.
+fn genValue(allocator: Allocator, rand: std.Random, depth: u8) anyerror![]u8 {
+    const max_kind: u8 = if (depth == 0) 4 else 6;
+    switch (rand.uintLessThan(u8, max_kind)) {
+        0 => { // bare integer (full u64 range → exercises $int)
+            var buf: [16]u8 = undefined;
+            return allocator.dupe(u8, buf[0..try blip.encode(rand.int(u64), &buf)]);
+        },
+        1 => return allocator.dupe(u8, &[_]u8{ 0x81, 0x7C + rand.uintLessThan(u8, 3) }), // TRUE/FALSE/NIL
+        2 => { // UTF8 (ASCII content)
+            const s = try allocator.alloc(u8, rand.uintLessThan(usize, 12));
+            defer allocator.free(s);
+            for (s) |*c| c.* = rand.uintLessThan(u8, 0x80);
+            return leaf.serializeUtf8(allocator, s);
+        },
+        3 => { // DATA (arbitrary bytes)
+            const s = try allocator.alloc(u8, rand.uintLessThan(usize, 12));
+            defer allocator.free(s);
+            rand.bytes(s);
+            return leaf.serializeData(allocator, s);
+        },
+        4 => { // ARRAY
+            var elems: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (elems.items) |e| allocator.free(e);
+                elems.deinit(allocator);
+            }
+            for (0..rand.uintLessThan(usize, 5)) |_| try elems.append(allocator, try genValue(allocator, rand, depth - 1));
+            return array.serializeArray(allocator, elems.items);
+        },
+        else => { // DICT — unique, canonically-sorted keys
+            var raw_keys: std.ArrayList([]u8) = .empty;
+            defer {
+                for (raw_keys.items) |k| allocator.free(k);
+                raw_keys.deinit(allocator);
+            }
+            for (0..rand.uintLessThan(usize, 5)) |_| {
+                const k = try allocator.alloc(u8, 1 + rand.uintLessThan(usize, 3));
+                for (k) |*c| c.* = 'a' + rand.uintLessThan(u8, 26);
+                try raw_keys.append(allocator, k);
+            }
+            std.sort.pdq([]u8, raw_keys.items, {}, struct {
+                fn lt(_: void, a: []u8, bb: []u8) bool {
+                    return std.mem.lessThan(u8, a, bb);
+                }
+            }.lt);
+            var pairs: std.ArrayList(dict.KeyValue) = .empty;
+            var built: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (built.items) |x| allocator.free(x);
+                built.deinit(allocator);
+                pairs.deinit(allocator);
+            }
+            var prev: ?[]const u8 = null;
+            for (raw_keys.items) |k| {
+                if (prev) |p| if (std.mem.eql(u8, p, k)) continue;
+                prev = k;
+                const kc = try leaf.serializeUtf8(allocator, k);
+                try built.append(allocator, kc);
+                const v = try genValue(allocator, rand, depth - 1);
+                try built.append(allocator, v);
+                try pairs.append(allocator, .{ .key = kc, .value = v });
+            }
+            return dict.serializeDict(allocator, pairs.items);
+        },
+    }
+}
+
+test "roundtrip: property sweep over 3000 random container trees (seeded)" {
+    var prng = std.Random.DefaultPrng.init(0xB11D_5EED_C0DEC);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        const wire = try genValue(testing.allocator, rand, 4);
+        defer testing.allocator.free(wire);
+        try expectRoundTrip(wire);
+    }
+}
+
 test "roundtrip: nested dict/array" {
     const a = testing.allocator;
     // {"a":[true,null], "b": {"c": 9007199254740992}}
