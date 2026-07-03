@@ -120,6 +120,99 @@ fn writeJsonString(allocator: Allocator, out: *std.ArrayList(u8), str: []const u
     try out.append(allocator, '"');
 }
 
+pub const FromJsonError = Allocator.Error || value.ValueError ||
+    error{ InvalidJson, InvalidTag, InvalidNumber, NegativeUnsupported, FloatUnsupported, InvalidPrintableBinary };
+
+/// Build a canonical BLIP value from a JSON string (inverse of toJson). Caller owns it.
+pub fn fromJson(allocator: Allocator, json: []const u8) FromJsonError![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    defer parsed.deinit();
+    return buildValue(allocator, parsed.value);
+}
+
+fn buildValue(allocator: Allocator, v: std.json.Value) FromJsonError![]u8 {
+    return switch (v) {
+        .null => allocator.dupe(u8, &[_]u8{ 0x81, 0x7E }), // NIL
+        .bool => |b| allocator.dupe(u8, if (b) &[_]u8{ 0x81, 0x7C } else &[_]u8{ 0x81, 0x7D }),
+        .integer => |i| if (i < 0) error.NegativeUnsupported else encodeBareInt(allocator, @intCast(i)),
+        .number_string => |s| encodeBareInt(allocator, std.fmt.parseInt(u64, s, 10) catch return error.InvalidNumber),
+        .float => error.FloatUnsupported, // v1: floats travel as UTF8 decimal strings, not raw JSON numbers
+        .string => |s| leaf.serializeUtf8(allocator, s),
+        .array => |arr| buildArray(allocator, arr),
+        .object => |obj| buildObject(allocator, obj),
+    };
+}
+
+fn encodeBareInt(allocator: Allocator, n: u64) FromJsonError![]u8 {
+    var buf: [16]u8 = undefined;
+    const len = try blip.encode(n, &buf);
+    return allocator.dupe(u8, buf[0..len]);
+}
+
+fn buildArray(allocator: Allocator, arr: std.json.Array) FromJsonError![]u8 {
+    var elems: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (elems.items) |e| allocator.free(e);
+        elems.deinit(allocator);
+    }
+    for (arr.items) |item| try elems.append(allocator, try buildValue(allocator, item));
+    return array.serializeArray(allocator, elems.items);
+}
+
+fn keyLessThan(keys: [][]const u8, a: usize, b: usize) bool {
+    return std.mem.lessThan(u8, keys[a], keys[b]);
+}
+
+fn buildObject(allocator: Allocator, obj: std.json.ObjectMap) FromJsonError![]u8 {
+    // Reserved single-key tags (recognized only as the sole key).
+    if (obj.count() == 1) {
+        const k = obj.keys()[0];
+        const val = obj.get(k).?;
+        if (std.mem.eql(u8, k, "$int")) {
+            const s = if (val == .string) val.string else return error.InvalidTag;
+            return encodeBareInt(allocator, std.fmt.parseInt(u64, s, 10) catch return error.InvalidNumber);
+        } else if (std.mem.eql(u8, k, "$b")) {
+            const s = if (val == .string) val.string else return error.InvalidTag;
+            const raw = pb.decode(allocator, s, .{}) catch return error.InvalidPrintableBinary;
+            defer allocator.free(raw);
+            return leaf.serializeData(allocator, raw);
+        } else if (std.mem.eql(u8, k, "$blip")) {
+            const s = if (val == .string) val.string else return error.InvalidTag;
+            return pb.decode(allocator, s, .{}) catch return error.InvalidPrintableBinary; // raw container bytes, spliced in
+        }
+        // else: a genuine single-key dict — fall through
+    }
+
+    // A DICT: build key containers + value wire, then sort by key into canonical order.
+    const n = obj.count();
+    const keys = obj.keys();
+    var order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    for (0..n) |i| order[i] = i;
+    std.sort.pdq(usize, order, keys, keyLessThan);
+
+    var pairs = try allocator.alloc(dict.KeyValue, n);
+    defer allocator.free(pairs);
+    // Track every allocation so we can free after serializeDict copies them.
+    var built: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (built.items) |x| allocator.free(x);
+        built.deinit(allocator);
+    }
+    for (order, 0..) |orig, out_i| {
+        const key_str = keys[orig];
+        const key_c = try leaf.serializeUtf8(allocator, key_str);
+        try built.append(allocator, key_c);
+        const val_wire = try buildValue(allocator, obj.get(key_str).?);
+        try built.append(allocator, val_wire);
+        pairs[out_i] = .{ .key = key_c, .value = val_wire };
+    }
+    return dict.serializeDict(allocator, pairs);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -128,6 +221,92 @@ fn expectJson(expected: []const u8, buf: []const u8) !void {
     const got = try toJson(testing.allocator, buf);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(expected, got);
+}
+
+/// MFIC oracle: for canonical wire, `wire → JSON → wire` must be byte-identical.
+fn expectRoundTrip(wire: []const u8) !void {
+    const a = testing.allocator;
+    const json = try toJson(a, wire);
+    defer a.free(json);
+    const back = try fromJson(a, json);
+    defer a.free(back);
+    try testing.expectEqualSlices(u8, wire, back);
+}
+
+test "roundtrip: bare integers (small and $int-tagged)" {
+    var b: [16]u8 = undefined;
+    const cases = [_]u64{ 0, 1, 42, 127, 128, 65535, 65536, SAFE_INT_MAX, SAFE_INT_MAX + 1, std.math.maxInt(u64) };
+    for (cases) |val| try expectRoundTrip(b[0..try blip.encode(val, &b)]);
+}
+
+test "roundtrip: sentinels" {
+    try expectRoundTrip(&[_]u8{ 0x81, 0x7C });
+    try expectRoundTrip(&[_]u8{ 0x81, 0x7D });
+    try expectRoundTrip(&[_]u8{ 0x81, 0x7E });
+}
+
+test "roundtrip: UTF8 strings incl. escapes" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "", "hello", "a\"b\\c\n\t\r", "unicode: café ☕" }) |s| {
+        const u = try leaf.serializeUtf8(a, s);
+        defer a.free(u);
+        try expectRoundTrip(u);
+    }
+}
+
+test "roundtrip: DATA byte-leaf (arbitrary bytes)" {
+    const a = testing.allocator;
+    const bytes = [_]u8{ 0x00, 0xFF, 0x1F, 0x1E, 0x80, 0x7F, 0x0A };
+    const d = try leaf.serializeData(a, &bytes);
+    defer a.free(d);
+    try expectRoundTrip(d);
+}
+
+test "roundtrip: array of mixed scalars and a container" {
+    const a = testing.allocator;
+    var b: [16]u8 = undefined;
+    const one = b[0..try blip.encode(1, &b)];
+    const ux = try leaf.serializeUtf8(a, "x");
+    defer a.free(ux);
+    const arr = try array.serializeArray(a, &.{ one, ux, &[_]u8{ 0x81, 0x7C }, &[_]u8{ 0x81, 0x7E } });
+    defer a.free(arr);
+    try expectRoundTrip(arr);
+}
+
+test "roundtrip: dict with sorted keys, scalar + string values" {
+    const a = testing.allocator;
+    var b: [16]u8 = undefined;
+    const kn = try leaf.serializeUtf8(a, "n");
+    defer a.free(kn);
+    const ks = try leaf.serializeUtf8(a, "s");
+    defer a.free(ks);
+    const v5 = b[0..try blip.encode(5, &b)];
+    const vs = try leaf.serializeUtf8(a, "hi");
+    defer a.free(vs);
+    // keys "n" < "s" are canonically ordered
+    const d = try dict.serializeDict(a, &.{ .{ .key = kn, .value = v5 }, .{ .key = ks, .value = vs } });
+    defer a.free(d);
+    try expectRoundTrip(d);
+}
+
+test "roundtrip: nested dict/array" {
+    const a = testing.allocator;
+    // {"a":[true,null], "b": {"c": 9007199254740992}}
+    const inner_arr = try array.serializeArray(a, &.{ &[_]u8{ 0x81, 0x7C }, &[_]u8{ 0x81, 0x7E } });
+    defer a.free(inner_arr);
+    var b: [16]u8 = undefined;
+    const kc = try leaf.serializeUtf8(a, "c");
+    defer a.free(kc);
+    const vbig = b[0..try blip.encode(SAFE_INT_MAX + 1, &b)];
+    const inner_dict = try dict.serializeDict(a, &.{.{ .key = kc, .value = vbig }});
+    defer a.free(inner_dict);
+    const ka = try leaf.serializeUtf8(a, "a");
+    defer a.free(ka);
+    const kb = try leaf.serializeUtf8(a, "b");
+    defer a.free(kb);
+    const d = try dict.serializeDict(a, &.{ .{ .key = ka, .value = inner_arr }, .{ .key = kb, .value = inner_dict } });
+    defer a.free(d);
+    try expectRoundTrip(d);
 }
 
 test "toJson: bare integers as JSON numbers" {
