@@ -1069,6 +1069,8 @@ pub const container_mod = @import("container.zig");
 pub const container_types = @import("container_types.zig");
 pub const peek_mod = @import("peek.zig");
 pub const segmentation_mod = @import("segmentation.zig");
+pub const value_mod = @import("value.zig"); // value classifier (bare scalars vs containers)
+pub const json = @import("json.zig"); // lossless container<->JSON codec (toJson / fromJson)
 pub const build_options = @import("build_options");
 
 // ---------------------------------------------------------------------------
