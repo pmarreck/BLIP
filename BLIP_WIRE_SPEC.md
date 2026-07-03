@@ -93,7 +93,7 @@ Each attribute is a 2-byte sentinel (`0x81` + sigil byte) followed by attribute-
 | 1 | ARRAY | wire | Ordered sequence of containers |
 | 2 | DICT | wire | Sorted key-value pairs |
 | 3 | UTF8 | wire | UTF-8 string |
-| 4 | DATA | wire | Checksummed binary data |
+| 4 | DATA | wire | Binary leaf (raw bytes; CSUM optional) |
 | 5 | FILE | **archive** | File container — defined in blar's archive spec |
 | 6 | MAP | wire | Unsorted key-value pairs (insertion order) |
 | 7 | DIR | **archive** | Directory container — defined in blar's archive spec |

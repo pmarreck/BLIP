@@ -66,6 +66,7 @@
             # shebang to the absolute luajit store path before running the CLI tests.
             patchShebangs bin/blip
             BLIP_BIN=$PWD/bin/blip bash tests/cli/blip_cli_test.sh || { echo "blip CLI tests failed"; exit 1; }
+            bash tests/cli/spec_drift_test.sh || { echo "spec drift control failed"; exit 1; }
           '';
           installPhase = ''
             mkdir -p $out

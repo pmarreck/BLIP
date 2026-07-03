@@ -47,6 +47,7 @@ annotate=[
 	src/value.zig = Value classifier at DICT-value/ARRAY-element positions (BLIP_WIRE_SPEC §Scalar values): classify() → bare integer / TRUE-FALSE-NIL sentinel / LP container; 3-rule mutually-exclusive disambiguation.
 	test = Master test runner: zig unit tests + blip CLI tests (tests/cli), accumulates exit code.
 	tests/cli/blip_cli_test.sh = Bash CLI tests for the blip encode/decode tool (34 cases: framing, endian transcode, roundtrip/fixpoint, TTY guard, error paths)
+	tests/cli/spec_drift_test.sh = MFIC drift control: asserts BLIP_WIRE_SPEC.md 'Container Type IDs' table == ContainerTypeId enum (id+name); guards against vacuous pass; proven to bite. Wired into ./test + Garnix checks.
 	vendor/printable_binary/main.zig = Vendored printable-binary CLI main().
 	vendor/printable_binary/printable_binary.zig = Vendored UTF-8 printable-binary encoder/decoder; backs blip_*_printable_binary FFI + printable-binary CLI.
 ]

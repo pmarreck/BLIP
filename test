@@ -28,4 +28,9 @@ echo "━━━ blip CLI Tests ━━━"
 nix develop -c bash tests/cli/blip_cli_test.sh
 cli_rc=$?
 
-exit $(( zig_rc | cli_rc ))
+echo ""
+echo "━━━ Spec Drift Control ━━━"
+nix develop -c bash tests/cli/spec_drift_test.sh
+drift_rc=$?
+
+exit $(( zig_rc | cli_rc | drift_rc ))
