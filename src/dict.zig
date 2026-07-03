@@ -204,6 +204,13 @@ pub fn serializeDirWithOptions(allocator: Allocator, pairs: []const KeyValue, op
     return serializeDictLike(allocator, pairs, .dir, options);
 }
 
+/// Serialize key-value pairs as a MAP container (type_id=6), preserving the given
+/// (insertion) order — keys are NOT required to be sorted (that's the point of MAP
+/// vs DICT). Keys must be unique. Caller owns returned memory.
+pub fn serializeMap(allocator: Allocator, pairs: []const KeyValue) (Allocator.Error || LPContainerError)![]u8 {
+    return serializeDictLike(allocator, pairs, .map, .{});
+}
+
 /// Validate that keys in the pairs array are in canonical byte order and unique.
 fn validateKeyOrder(pairs: []const KeyValue) LPContainerError!void {
     if (pairs.len < 2) return;

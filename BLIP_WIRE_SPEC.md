@@ -536,6 +536,8 @@ A separate **pretty/lossy** mode (numbers as numbers, best-effort strings) is pe
 6. **Padded BLIP overflow.** A parser encountering a padded BLIP with I=1 MUST validate that the target offset falls within the container bounds before following it.
 7. **Encryption.** ENC provides confidentiality + authenticity via AEAD; the auth tag guarantees ciphertext integrity. The LP envelope attributes (TYPE, COMP, CSUM, ENC metadata) are cleartext — an observer sees that a container is encrypted and which algorithms are used, but cannot read the payload. Implementations MUST use a CSPRNG for salt/nonce. Nonce reuse with the same key is catastrophic for AES-GCM; random 96-bit nonces provide adequate collision resistance for typical volumes.
 
+8. **No pointers or handles on the wire — values only.** BLIP has no pointer type; a value is an integer, raw bytes, a scalar sentinel, or a container. Memory is not shared across a process boundary, so a pointer or opaque handle (e.g. an in-process FFI handle, a struct address, a heap pointer) is meaningless — and dangerous — to a peer. The wire MUST carry only self-contained values. Any producer bridging an in-process API (e.g. an RPC server wrapping a C FFI) MUST translate a handle/pointer into either a copied value or a **server-issued opaque token** (an integer the *server* maps back to its own resource, valid only server-side) before encoding it. In-process FFI calling convention (buffer pointers, opaque handles) is a separate concern and never appears in encoded bytes; value-based FFI (bytes in → bytes out, like the container↔JSON codec) is the correct shape for anything that may cross processes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

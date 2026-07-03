@@ -15,6 +15,7 @@ const ct = @import("container_types.zig");
 const leaf = @import("leaf.zig");
 const array = @import("array.zig");
 const dict = @import("dict.zig");
+const segmentation = @import("segmentation.zig");
 const pb = @import("printable_binary");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -53,10 +54,14 @@ fn writeValue(allocator: Allocator, out: *std.ArrayList(u8), v: []const u8) Json
 }
 
 fn writeContainer(allocator: Allocator, out: *std.ArrayList(u8), full: []const u8, view: container.LPContainerView) JsonError!void {
+    // Only descend structurally into the types whose JSON round-trips byte-identically
+    // (ARRAY, DICT, UTF8, DATA). Every other container — MAP (insertion order), FILE/DIR
+    // (archive types), SEGMENT, or any unknown type — is escaped losslessly via $blip so
+    // its exact bytes (and type) survive the round-trip.
     switch (view.type_id) {
         .utf8 => try writeJsonString(allocator, out, try leaf.readUtf8(full)),
         .data => try writeTagged(allocator, out, "$b", try leaf.readData(full)),
-        .array, .file => {
+        .array => {
             var reader = try array.ArrayReader.init(full);
             try out.append(allocator, '[');
             var i: u64 = 0;
@@ -66,7 +71,7 @@ fn writeContainer(allocator: Allocator, out: *std.ArrayList(u8), full: []const u
             }
             try out.append(allocator, ']');
         },
-        .dict, .map, .dir => {
+        .dict => {
             var reader = try dict.DictReader.init(full);
             try out.append(allocator, '{');
             var i: u64 = 0;
@@ -78,7 +83,6 @@ fn writeContainer(allocator: Allocator, out: *std.ArrayList(u8), full: []const u
             }
             try out.append(allocator, '}');
         },
-        // any other container (e.g. SEGMENT) → universal $blip escape
         else => try writeTagged(allocator, out, "$blip", full),
     }
 }
@@ -287,6 +291,46 @@ test "roundtrip: dict with sorted keys, scalar + string values" {
     const d = try dict.serializeDict(a, &.{ .{ .key = kn, .value = v5 }, .{ .key = ks, .value = vs } });
     defer a.free(d);
     try expectRoundTrip(d);
+}
+
+test "roundtrip: MAP / FILE / DIR / SEGMENT preserve type (lossless via \\$blip)" {
+    const a = testing.allocator;
+    var b: [16]u8 = undefined;
+
+    // MAP with UNSORTED keys (z before a) — must NOT collapse to a sorted DICT
+    const kz = try leaf.serializeUtf8(a, "z");
+    defer a.free(kz);
+    const ka = try leaf.serializeUtf8(a, "a");
+    defer a.free(ka);
+    const v9 = b[0..try blip.encode(9, &b)];
+    const map = try dict.serializeMap(a, &.{ .{ .key = kz, .value = v9 }, .{ .key = ka, .value = v9 } });
+    defer a.free(map);
+    try expectRoundTrip(map);
+
+    // FILE (ARRAY layout, type 5) — must NOT collapse to ARRAY
+    const fe = try leaf.serializeUtf8(a, "meta");
+    defer a.free(fe);
+    const file = try array.serializeArrayLike(a, &.{fe}, .file, .{});
+    defer a.free(file);
+    try expectRoundTrip(file);
+
+    // DIR (type 7, required keys pa+xh) — must NOT collapse to DICT
+    const kpa = try leaf.serializeUtf8(a, "pa");
+    defer a.free(kpa);
+    const vpa = try leaf.serializeUtf8(a, "src");
+    defer a.free(vpa);
+    const kxh = try leaf.serializeUtf8(a, "xh");
+    defer a.free(kxh);
+    const vxh = try leaf.serializeData(a, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer a.free(vxh);
+    const dir = try dict.serializeDir(a, &.{ .{ .key = kpa, .value = vpa }, .{ .key = kxh, .value = vxh } });
+    defer a.free(dir);
+    try expectRoundTrip(dir);
+
+    // SEGMENT (type 9) — already escapes via $blip
+    const seg = try segmentation.serializeSegment(a, 1, 1, 1, "payload", null);
+    defer a.free(seg);
+    try expectRoundTrip(seg);
 }
 
 test "roundtrip: nested dict/array" {
