@@ -327,46 +327,40 @@ pub const DictReader = struct {
         return self.lp_view.buf[key_offset .. key_offset + key_total];
     }
 
-    /// Get the value container bytes at the given pair index.
-    /// Returns the full value LP container slice.
-    pub fn valueAt(self: DictReader, index: u64) LPContainerError![]const u8 {
-        if (index >= self.count) return ContainerError.IndexOutOfBounds;
-
+    /// Byte offset of the `k`-th entry in the interleaved index table
+    /// (k even = key offset, k odd = value offset, in pair order).
+    fn offsetEntryAt(self: DictReader, k: u64) LPContainerError!usize {
         const total: usize = @intCast(self.lp_view.total_length);
         var pos: usize = self.index_start;
-
-        // Skip index * 2 BLIP-encoded offsets to get to pair[index]'s key offset
-        const skip_count = index * 2;
-        for (0..skip_count) |_| {
-            const skip_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
+        for (0..k) |_| {
+            pos += (blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
                 error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
                 error.Overflow => return ContainerError.Overflow,
                 error.BufferTooSmall => return ContainerError.BufferTooSmall,
-            };
-            pos += skip_result.bytes_read;
+            }).bytes_read;
         }
-
-        // Skip the key offset
-        const key_skip = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
+        return @intCast((blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
             error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
             error.Overflow => return ContainerError.Overflow,
             error.BufferTooSmall => return ContainerError.BufferTooSmall,
-        };
-        pos += key_skip.bytes_read;
+        }).value);
+    }
 
-        // Decode the value offset
-        const val_off_result = blip.decode(self.lp_view.buf[pos..total]) catch |e| switch (e) {
-            error.UnexpectedEndOfInput => return ContainerError.UnexpectedEndOfInput,
-            error.Overflow => return ContainerError.Overflow,
-            error.BufferTooSmall => return ContainerError.BufferTooSmall,
-        };
-        const val_offset: usize = @intCast(val_off_result.value);
-
-        // Jump to value and parse its LP header to determine extent
-        if (val_offset >= total) return ContainerError.IndexOutOfBounds;
-        const val_view = try container.parseLPHeader(self.lp_view.buf[val_offset..total]);
-        const val_total: usize = @intCast(val_view.total_length);
-        return self.lp_view.buf[val_offset .. val_offset + val_total];
+    /// Get the value's raw byte span at pair `index`. The span runs from the value's
+    /// offset to the next pair's key offset (or the index section for the last pair),
+    /// so it works for BOTH LP-container values and bare-scalar values (integers /
+    /// TRUE/FALSE/NIL) — pair with value.classify to interpret. For a container value
+    /// the span equals the container's exact bytes.
+    pub fn valueAt(self: DictReader, index: u64) LPContainerError![]const u8 {
+        if (index >= self.count) return ContainerError.IndexOutOfBounds;
+        const total: usize = @intCast(self.lp_view.total_length);
+        const val_offset = try self.offsetEntryAt(index * 2 + 1);
+        const end = if (index + 1 < self.count)
+            try self.offsetEntryAt((index + 1) * 2)
+        else
+            @as(usize, @intCast(self.index_offset));
+        if (val_offset >= end or end > total) return ContainerError.InvalidLength;
+        return self.lp_view.buf[val_offset..end];
     }
 
     /// Find a key by its bytes; returns the pair index or null.

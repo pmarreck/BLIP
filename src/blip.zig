@@ -1092,4 +1092,5 @@ test {
     _ = @import("checksum.zig");
     _ = @import("segmentation.zig");
     _ = @import("value.zig");
+    _ = @import("json.zig");
 }
