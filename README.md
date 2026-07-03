@@ -184,10 +184,14 @@ printf '\xef\xbe\xad\xde' | blip encode -l | blip decode -l | xxd -p   # efbeadd
 
 ## Wire format & containers
 
-On top of the varint, BLIP defines a recursive, typed, self-describing **wire format** — the generic expression vocabulary (LP envelope, `ARRAY`/`DICT`/`MAP`/`UTF8`/`DATA`/`RAW`, scalar sentinels, `SEGMENT` transport fragmentation, and *optional* `COMP`/`CSUM`/`ENC` attributes), with end-of-container index tables for O(1) random access, determinism via canonical key ordering, and full round-tripping through printable-binary and JSON.
+On top of the varint, BLIP defines a recursive, typed, self-describing **wire format** — the generic expression vocabulary (LP envelope, `ARRAY`/`DICT`/`MAP`/`UTF8`/`DATA`, bare-scalar values and `TRUE`/`FALSE`/`NIL` sentinels, `SEGMENT` transport fragmentation, and *optional* `COMP`/`CSUM`/`ENC` attributes), with end-of-container index tables for O(1) random access and determinism via canonical key ordering.
 
 - **[BLIP_WIRE_SPEC.md](BLIP_WIRE_SPEC.md)** — the generic wire format (this repo).
 - **[blar's BLAR_ARCHIVE_SPEC.md](https://github.com/pmarreck/blar/blob/yolo/BLAR_ARCHIVE_SPEC.md)** — the archive application built on it (FILE/DIR, Merkle directory hashing, tar-replacement envelope, compression/encryption defaults).
+
+### Human-readable JSON codec
+
+Any BLIP value round-trips losslessly through JSON — for inspection and hand-authoring test fixtures — via `blip.json.toJson(bytes)` / `blip.json.fromJson(text)`. Integers render as JSON numbers (`{"$int":"…"}` past 2⁵³−1), `TRUE`/`FALSE`/`NIL` as `true`/`false`/`null`, byte leaves as `{"$b":"<printable-binary>"}`, and any container the structural mapping can't descend into escapes via `{"$blip":"…"}`. So **`wire → JSON → wire` is byte-identical** for canonical wire (verified over a 3000-tree property sweep), making BLIP a frontend↔backend transport you can eyeball and author fixtures for.
 
 ## C FFI
 
